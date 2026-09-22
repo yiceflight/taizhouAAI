@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "泰州市监测中心智能监测系统 · 浏览器桥接",
+  "version": "0.5.0",
+  "description": "泰州市监测中心智能监测系统的 Chrome 数据采集与 CDP 桥接插件。",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://61.155.4.60:18080/*",
+    "https://fh.dji.com/*",
+    "https://aai.airins.cn/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://61.155.4.60:18080/*",
+        "https://fh.dji.com/*",
+        "https://aai.airins.cn/*"
+      ],
+      "js": [
+        "src/content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "32": "icons/32.png",
+    "128": "icons/128.png"
+  },
+  "minimum_chrome_version": "120",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqqBWdz5YoU2Q2rMF22Tn0LFC0gVCQ3BFEfjN3gpaQO4hTld6uW/Xf2IM6ceU9TQ5+2TNRkY51pII+egAnyS5JCEiig13ngU7e/PFBlqN7OUQyjO7KqKsWFkNxuNgBPOPoYm9L6NSugGkPR17NM+8O6Awhv4V+tBcstBpufQ6kpDmLaafqu2PfpSmij/JjeatVsi14C2vqrftT1YDgQ1fnREliF0R21hPcQPFm4uMkRDW7lhWJ9kgeS8HuI6979nwgZkezibI3xCAR9ie1fe3QJCGWatTgNbyYfDp3aQjTB1Bto+Us0S7nwjRJpdnOqax0rtXhNk8U+mayB3xuxKTJwIDAQAB",
+  "action": {
+    "default_title": "连接桌面客户端"
+  }
+}

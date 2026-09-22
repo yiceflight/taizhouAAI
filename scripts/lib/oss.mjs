@@ -15,10 +15,12 @@ export async function ossConfig() {
   if (env.OSS_BUCKET !== 'taizhou-aai-updates') throw new Error('Refusing to write to another project bucket');
   const domain = env.OSS_DOMAIN.replace(/\/$/, '');
   if (domain !== 'https://taizhou-aai-updates.oss-cn-hangzhou.aliyuncs.com') throw new Error('Unexpected public OSS domain');
+  const timeout = Number(env.OSS_TIMEOUT_MS ?? 120000);
+  if (!Number.isInteger(timeout) || timeout < 30000 || timeout > 600000) throw new Error('Invalid OSS_TIMEOUT_MS');
   return {
-    bucket: env.OSS_BUCKET, domain,
+    bucket: env.OSS_BUCKET, domain, timeout,
     client: new OSS({ accessKeyId: env.OSS_ACCESS_KEY_ID, accessKeySecret: env.OSS_ACCESS_KEY_SECRET,
-      endpoint: env.OSS_ENDPOINT, bucket: env.OSS_BUCKET, secure: true, timeout: 120000 }),
+      endpoint: env.OSS_ENDPOINT, bucket: env.OSS_BUCKET, secure: true, timeout }),
   };
 }
 

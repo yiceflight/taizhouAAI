@@ -73,7 +73,7 @@ try {
     process.exit(0);
   }
 
-  const { client, bucket, domain } = await ossConfig();
+  const { client, bucket, domain, timeout } = await ossConfig();
   const versioning = await client.getBucketVersioning(bucket);
   if (versioning.versionStatus) throw new Error('Publishing lock requires an unversioned bucket; refusing unsafe concurrent publication');
   const lockKey = 'client/publish.lock';
@@ -96,7 +96,7 @@ try {
       const remoteSha256 = existing.res.headers['x-oss-meta-sha256'];
       if (remoteSize !== asset.size || remoteSha256 !== asset.sha256) throw new Error(`Refusing to overwrite immutable object ${key}`);
     } else {
-      await client.put(key, asset.filePath, { timeout: 120000, headers: {
+      await client.put(key, asset.filePath, { timeout, headers: {
         'Cache-Control': 'public, max-age=31536000, immutable',
         'Content-Disposition': `attachment; filename="${asset.name.replace(/[^a-zA-Z0-9._-]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(asset.name)}`,
         'Content-Type': asset.name.endsWith('.exe') ? 'application/vnd.microsoft.portable-executable' : 'application/gzip',
@@ -117,7 +117,7 @@ try {
   const manifest = { version, notes: notes(), pub_date: releaseDate(), platforms };
   const contents = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   const latestKey = 'client/latest.json';
-  await client.put(latestKey, contents, { timeout: 30000, headers: {
+  await client.put(latestKey, contents, { timeout, headers: {
     'Cache-Control': 'no-cache, max-age=0, must-revalidate',
     'Content-Type': 'application/json; charset=utf-8',
     'x-oss-meta-sha256': createHash('sha256').update(contents).digest('hex'),

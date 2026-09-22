@@ -14,6 +14,10 @@ pnpm oss:setup
 
 ## 发布
 
+正式发布走 GitHub Actions：修改 `package.json`、`src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的同一版本号，提交后创建对应 tag（例如 `v0.2.0`）并推送。`.github/workflows/release.yml` 会先运行测试和前端构建，再分别构建 macOS universal updater 包与 Windows x64 NSIS 安装包，最后校验签名并发布到 OSS，同时创建 GitHub Release。
+
+仓库 Actions secrets 需要配置 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`OSS_ENDPOINT`、`OSS_BUCKET`、`OSS_DOMAIN` 和 `TAURI_SIGNING_PRIVATE_KEY`。私钥只在 runner 环境注入，不写入仓库。当前工作流未配置 Apple Developer 证书与 notarization，macOS 包已完成 Tauri updater 签名，但首次安装仍可能需要用户在系统设置中允许打开。
+
 使用 Tauri 的签名环境构建安装包后，把安装包和 `.sig` 放入同一个 staging 目录：
 
 ```bash

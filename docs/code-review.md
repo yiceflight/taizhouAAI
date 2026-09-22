@@ -44,6 +44,10 @@ Chrome 后台恢复遵循 [service worker 生命周期](https://developer.chrome
 - 实际 Mac app 打成临时 tar.gz 后，校验识别为 darwin-aarch64；错误版本被拒绝，临时文件已清理。
 - 没有进行 Windows 实机验收、专业监测结论验收或线上安装升级发布，不能把上述本机结果当作这些环节的验收。
 
+## 0.2.0 正式发布补充（2026-09-22）
+
+GitHub Actions 运行 `35694179017` 已通过校验、macOS universal 构建、Windows x64 NSIS 构建和 OSS 发布。`client/latest.json` 已匿名返回 `0.2.0`，平台为 `darwin-aarch64`、`darwin-x86_64` 和 `windows-x86_64`；GitHub Release 为 `v0.2.0`。Windows/macOS 安装包均完成 Tauri updater 签名校验；macOS 代码签名与 notarization 仍未配置。
+
 最终重载检查追加：Chrome 重新加载插件会清空 storage.session，改用 storage.local 保存浏览器实例 ID，避免重载后的短暂重复页数。
 
 重载复验通过：连续重新加载新版插件后仍为 1 个浏览器实例、4 个业务页面（2/1/1），最终客户端保持已连接与 3 份真实报告。打包插件文件已与最终源码做 SHA-256 一致性核对。

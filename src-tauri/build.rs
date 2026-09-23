@@ -60,7 +60,9 @@ fn main() {
         )
     };
     assert_eq!(
-        fs::read_to_string("../extension/src/bridge-config.js").unwrap(),
+        fs::read_to_string("../extension/src/bridge-config.js")
+            .unwrap()
+            .replace("\r\n", "\n"),
         endpoint("production"),
         "Production extension endpoint must match bridge-config.json"
     );

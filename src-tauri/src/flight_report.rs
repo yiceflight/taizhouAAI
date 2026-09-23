@@ -286,12 +286,14 @@ fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 #[tauri::command]
 pub async fn list_flight_missions(
+    app: tauri::AppHandle,
     bridge: tauri::State<'_, Bridge>,
     session: String,
     tab_id: i64,
     cursor_id: Option<u64>,
     cursor_time: Option<i64>,
 ) -> Result<Value, String> {
+    crate::readiness::require_started(&app)?;
     let v = bridge
         .request(
             session,
@@ -304,9 +306,11 @@ pub async fn list_flight_missions(
 }
 #[tauri::command]
 pub async fn collect_flight_report(
+    app: tauri::AppHandle,
     bridge: tauri::State<'_, Bridge>,
     request: CollectRequest,
 ) -> Result<Collected, String> {
+    crate::readiness::require_started(&app)?;
     let req = request;
     if req.mission.end_time > Utc::now().timestamp_millis() - 60000 {
         return Err("请等待飞行结束并完成上传至少 1 分钟。".into());
@@ -432,8 +436,12 @@ fn block(doc: &mut String, key: &str, value: &str) -> Result<(), String> {
     doc.replace_range(start..end, value);
     Ok(())
 }
-fn build_docx(data: &Collected, charts: &[String; 2], issued: i64) -> Result<Vec<u8>, String> {
+fn build_docx(data: &Collected, charts: &[String; 2], issued: i64, pm25_threshold: f64) -> Result<Vec<u8>, String> {
+    if !pm25_threshold.is_finite() || pm25_threshold <= 0.0 {
+        return Err("PM2.5 报告阈值必须大于 0。".into());
+    }
     let stats = validate(data, issued)?;
+    let above_threshold = data.air.points.iter().filter(|point| point.pm25.is_some_and(|value| value > pm25_threshold)).count();
     let mut src = zip::ZipArchive::new(Cursor::new(TEMPLATE)).map_err(|e| e.to_string())?;
     let mut parts = std::collections::BTreeMap::new();
     for i in 0..src.len() {
@@ -450,7 +458,7 @@ fn build_docx(data: &Collected, charts: &[String; 2], issued: i64) -> Result<Vec
     } else {
         "单航次采样结果不等同于固定站点小时均值或日均值，不能据此判定污染成因。"
     };
-    let fields=[("DATE",date(m.start_time,"%Y年%m月%d日")),("ISSUED",date(issued,"%Y年%m月%d日")),("OVERVIEW",format!("本快报汇总 {} 本次巡飞的司空影像和可飞 PM2.5 数据。PM2.5 有效采样 {} 点，范围 {:.1}—{:.1} μg/m³。{} 未取得同步 K⁺、气象及站点污染过程资料，污染过程特征待复核。",date(m.start_time,"%Y年%m月%d日"),stats.count,stats.min,stats.max,warning)),("MISSION",format!("可飞任务：{}。任务时间：{} 至 {}（北京时间），时长 {:.1} 分钟。区域：{}。航线见图2。",m.mission_name,date(m.start_time,"%Y-%m-%d %H:%M:%S"),date(m.end_time,"%H:%M:%S"),(m.end_time-m.start_time) as f64/60000.0,m.geo_location)),("PHOTO_SUMMARY",format!("从本次司空 Immediate-Media 文件夹导出 {} 张照片，拍摄时间已与可飞任务核对。图片详见附录。影像内容、火点及异常数量尚未人工判读。",data.photos.len())),("PM_SUMMARY",format!("数据来源：可飞任务 {} 的完整原始序列（未应用页面筛选）。采样 {} 点，其中 PM2.5 有效 {} 点、缺测 {} 点；最小值 {:.1}、最大值 {:.1}、采样算术平均值 {:.1} μg/m³；峰值采样时间 {}。",m.mission_id,data.air.points.len(),stats.count,stats.missing,stats.min,stats.max,stats.mean,date(stats.peak_time,"%H:%M:%S"))),("CONCLUSION",warning.to_owned()),("NOTES","建议结合同期站点 K⁺、风向风速以及现场核查，对照片逐张判读后形成污染源结论。本快报未执行 AI 火点识别，异常数量和处理建议需复核后签发。".into())];
+    let fields=[("DATE",date(m.start_time,"%Y年%m月%d日")),("ISSUED",date(issued,"%Y年%m月%d日")),("OVERVIEW",format!("本快报汇总 {} 本次巡飞的司空影像和可飞 PM2.5 数据。PM2.5 有效采样 {} 点，范围 {:.1}—{:.1} μg/m³。{} 未取得同步 K⁺、气象及站点污染过程资料，污染过程特征待复核。",date(m.start_time,"%Y年%m月%d日"),stats.count,stats.min,stats.max,warning)),("MISSION",format!("可飞任务：{}。任务时间：{} 至 {}（北京时间），时长 {:.1} 分钟。区域：{}。航线见图2。",m.mission_name,date(m.start_time,"%Y-%m-%d %H:%M:%S"),date(m.end_time,"%H:%M:%S"),(m.end_time-m.start_time) as f64/60000.0,m.geo_location)),("PHOTO_SUMMARY",format!("从本次司空 Immediate-Media 文件夹导出 {} 张照片，拍摄时间已与可飞任务核对。图片详见附录。影像内容、火点及异常数量尚未人工判读。",data.photos.len())),("PM_SUMMARY",format!("数据来源：可飞任务 {} 的完整原始序列（未应用页面筛选）。采样 {} 点，其中 PM2.5 有效 {} 点、缺测 {} 点；最小值 {:.1}、最大值 {:.1}、采样算术平均值 {:.1} μg/m³；峰值采样时间 {}。本报告 PM2.5 判定阈值为 {} μg/m³，严格大于阈值的采样点 {} 个（占有效采样 {:.1}%）。",m.mission_id,data.air.points.len(),stats.count,stats.missing,stats.min,stats.max,stats.mean,date(stats.peak_time,"%H:%M:%S"),pm25_threshold,above_threshold,above_threshold as f64 / stats.count as f64 * 100.0)),("CONCLUSION",warning.to_owned()),("NOTES","建议结合同期站点 K⁺、风向风速以及现场核查，对照片逐张判读后形成污染源结论。本快报未执行 AI 火点识别，异常数量和处理建议需复核后签发。".into())];
     for (key, value) in fields {
         doc = doc.replace(&format!("{{{{{key}}}}}"), &xml(&value));
     }
@@ -557,10 +565,10 @@ fn build_docx(data: &Collected, charts: &[String; 2], issued: i64) -> Result<Vec
     }
     Ok(zip.finish().map_err(|e| e.to_string())?.into_inner())
 }
-fn persist(root: &Path, data: &Collected, charts: &[String; 2]) -> Result<Summary, String> {
+fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: f64) -> Result<Summary, String> {
     let now = Utc::now().timestamp_millis();
     let stats = validate(data, now)?;
-    let bytes = build_docx(data, charts, now)?;
+    let bytes = build_docx(data, charts, now, pm25_threshold)?;
     let id = Uuid::new_v4().to_string();
     let temp = root.join(format!(".{id}.tmp"));
     let dest = root.join(&id);
@@ -583,6 +591,7 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2]) -> Result<Summar
                 String::new()
             },
         };
+        fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&serde_json::json!({"pm25Threshold": pm25_threshold})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join(&name), bytes).map_err(|e| e.to_string())?;
         fs::write(
             temp.join("source.json"),
@@ -624,7 +633,8 @@ pub async fn save_flight_report(
     charts: [String; 2],
 ) -> Result<Summary, String> {
     let root = root(&app)?;
-    tauri::async_runtime::spawn_blocking(move || persist(&root, &data, &charts))
+    let threshold = crate::settings::read(&crate::monitoring::database(&app)?)?.pm25_threshold;
+    tauri::async_runtime::spawn_blocking(move || persist(&root, &data, &charts, threshold))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -726,8 +736,8 @@ mod tests {
         let d = sample();
         let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
         fs::create_dir_all(&root).unwrap();
-        let a = persist(&root, &d, &[PNG.into(), PNG.into()]).unwrap();
-        let b = persist(&root, &d, &[PNG.into(), PNG.into()]).unwrap();
+        let a = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        let b = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
         assert_ne!(a.path, b.path);
         let mut z = zip::ZipArchive::new(Cursor::new(fs::read(&a.path).unwrap())).unwrap();
         let mut xml = String::new();
@@ -743,6 +753,19 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn report_threshold_is_dynamic_and_strictly_greater() {
+        let data = sample();
+        for (threshold, count) in [(60.0, 1), (65.0, 0), (20.0, 2)] {
+            let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis(), threshold).unwrap();
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut text = String::new();
+            zip.by_name("word/document.xml").unwrap().read_to_string(&mut text).unwrap();
+            assert!(text.contains(&format!("判定阈值为 {} μg/m³", threshold)));
+            assert!(text.contains(&format!("严格大于阈值的采样点 {} 个", count)));
+        }
+        assert!(build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis(), 0.0).is_err());
+    }
+    #[test]
     #[ignore = "requires explicit local live-report fixture"]
     fn renders_live_fixture_when_explicitly_supplied() {
         if let Ok(path) = std::env::var("TAIZHOU_REPORT_QA_INPUT") {
@@ -751,7 +774,7 @@ mod tests {
             let charts: [String; 2] = serde_json::from_value(v["charts"].clone()).unwrap();
             let root = PathBuf::from(std::env::var("TAIZHOU_REPORT_QA_DIR").unwrap());
             fs::create_dir_all(&root).unwrap();
-            let s = persist(&root, &d, &charts).unwrap();
+            let s = persist(&root, &d, &charts, 60.0).unwrap();
             println!("QA report: {}", s.path);
         }
     }

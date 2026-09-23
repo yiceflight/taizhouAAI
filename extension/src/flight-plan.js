@@ -1,4 +1,4 @@
-// Fixed, video-derived preparation recipe. There is deliberately no submit operation.
+// Fixed, video-derived recipe. Submission uses a separate, explicitly authorized job.
 export const PLAN_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 export const PLAN_RECIPE = Object.freeze({
   route: '东南火点巡查航线（已验证）',
@@ -9,20 +9,27 @@ export const PLAN_RECIPE = Object.freeze({
 });
 export function validatePlanJob(job) {
   if (job.type !== 'dji-prepare' || job.submit !== false || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
-      typeof job.name !== 'string' || !/^(钾离子超标巡查|司空填写演练)-\d{8}-\d{2}$/.test(job.name)) {
+      typeof job.name !== 'string' || !/^((钾离子超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name)) {
     throw new Error('司空任务参数无效；只允许填写，禁止提交');
   }
 }
 
-// Executed only by our fixed extension task, on a dedicated plan tab. No API mutation,
-// cookie access, arbitrary selectors/scripts from jobs, or final confirmation clicks.
-export async function fillFlightPlan(recipe, name, expectedUrl) {
+export function validateSubmitJob(job) {
+  if (job.type !== 'dji-submit' || job.submit !== true || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
+      typeof job.name !== 'string' || !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name)) {
+    throw new Error('起飞任务参数无效；演练任务禁止提交');
+  }
+}
+
+// Fixed project/recipe only. Preview always leaves the final confirmation intact.
+export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) {
   const deadline = Date.now() + 55000;
   const check = () => {
     if (![expectedUrl, `${expectedUrl}/create-plan`].includes(location.href)) throw new Error('司空页面不匹配，请登录后重试');
     if (Date.now() >= deadline) throw new Error('司空填写超时；已停止，请检查页面');
   };
   check();
+  if (submit && !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
   const text = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
   const norm = s => s.replace(/\s+/g, '');
@@ -57,6 +64,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl) {
   const toggle = (e, value, label) => { const state = checked(e); if (state === null) throw new Error(`无法核对${label}状态`); if (state !== value) click(e); };
   const nameInputs = () => all('input[placeholder="请输入计划名称"]');
   if (!nameInputs().length) {
+    if (submit) throw new Error('原计划表单已关闭，未提交');
     await wait(() => leaves('新建计划').length === 1, '新建计划入口'); choose('新建计划');
     await wait(() => nameInputs().length === 1, '计划表单');
   }
@@ -65,9 +73,10 @@ export async function fillFlightPlan(recipe, name, expectedUrl) {
   let form = nameInput.parentElement;
   while (form && !(leaves('任务类型', form).length && leaves('媒体存储位置', form).length)) form = form.parentElement;
   if (!form || form === document.body || form === document.documentElement) throw new Error('未能限定新建计划表单范围');
-  choose('普通任务', form);
+  if (!submit) choose('普通任务', form);
   const routeSelected = () => leaves(recipe.selectedRoute, form).length === 1 || leaves(recipe.route, form).length === 1;
   if (!routeSelected()) {
+    if (submit) throw new Error('指定航线已变化，未提交');
     choose('选择航线', form);
     await wait(() => leaves(recipe.route).length || leaves(recipe.selectedRoute).length, '指定航线');
     // Prefer the library name shown in the video, never use the first route.
@@ -81,16 +90,17 @@ export async function fillFlightPlan(recipe, name, expectedUrl) {
       .filter(e => ![...e.children].some(c => text(c).includes(norm(recipe.dock)) && text(c).includes(norm(recipe.device)) && text(c).includes(norm(recipe.aircraft))));
   };
   if (!deviceCards(form).length) {
+    if (submit) throw new Error('指定机场已变化，未提交');
     choose('选择设备', form);
     await wait(() => deviceCards(document).filter(e => !form.contains(e)).length, '指定设备');
     click(unique(deviceCards(document).filter(e => !form.contains(e)), '泰州环境监测 Dock 3'));
     await wait(() => deviceCards(form).length === 1, '选中设备');
   }
-  for (const label of ['多模态识别', '自动断点续飞', '智能规划最佳返航路线']) toggle(field(label, '[role="switch"],input[type="checkbox"]', form), false, label);
-  for (const label of [recipe.precision, recipe.strategy, recipe.lostLink]) choose(label, form);
+  if (!submit) for (const label of ['多模态识别', '自动断点续飞', '智能规划最佳返航路线']) toggle(field(label, '[role="switch"],input[type="checkbox"]', form), false, label);
+  if (!submit) for (const label of [recipe.precision, recipe.strategy, recipe.lostLink]) choose(label, form);
   const height = field('最低返航高度（相对机场）', 'input', form);
-  setInput(height, recipe.returnHeight);
-  choose('编辑', form);
+  if (!submit) setInput(height, recipe.returnHeight);
+  if (!submit) choose('编辑', form);
   const notice = await wait(() => {
     const titles = leaves('告警通知设置'); if (titles.length !== 1) return null;
     let e = titles[0].parentElement;
@@ -99,21 +109,21 @@ export async function fillFlightPlan(recipe, name, expectedUrl) {
   }, '告警通知设置');
   const channels = [['站内通知', true], ['短信', false], ['邮件', false]].map(([label, value]) => {
     const controls = all('input[type="checkbox"],[role="checkbox"]', notice).filter(e => text(e.closest('label') || e.parentElement) === norm(label));
-    const input = unique(controls, label); toggle(input, value, label); return { input, value, label };
+    const input = unique(controls, label); if (!submit) toggle(input, value, label); return { input, value, label };
   });
   const frequencyInputs = all('input', notice).filter(e => e.type !== 'checkbox' && !['搜索', '请输入'].some(s => (e.placeholder || '').includes(s)));
-  const frequency = unique(frequencyInputs, '告警频率'); setInput(frequency, 0);
+  const frequency = unique(frequencyInputs, '告警频率'); if (!submit) setInput(frequency, 0);
   const subscriberRow = unique(all('tr,[role="row"]', notice).filter(e => leaves(recipe.subscriber, e).length), '订阅人员运维');
   const rows = all('tr,[role="row"]', notice).filter(e => all('td,[role="cell"]', e).length);
   for (const row of rows) {
     const controls = all('input[type="checkbox"]', row).length ? all('input[type="checkbox"]', row) : all('[role="checkbox"]', row);
-    if (controls.length) toggle(unique(controls, '订阅人员勾选框'), row === subscriberRow, '订阅人员');
+    if (!submit && controls.length) toggle(unique(controls, '订阅人员勾选框'), row === subscriberRow, '订阅人员');
   }
   // Route/device selection may asynchronously replace the platform's default
   // name. Fill the name last, after all dependent selections have settled.
   await new Promise(resolve => setTimeout(resolve, 300)); check();
   const finalNameInput = unique(nameInputs(), '计划名称');
-  setInput(finalNameInput, name);
+  if (!submit) setInput(finalNameInput, name);
   // Verify after reactive updates. Selected button styles alone are not enough to
   // infer a submitted task: success here always means an unsubmitted form only.
   await new Promise(resolve => setTimeout(resolve, 300)); check();
@@ -144,6 +154,20 @@ export async function fillFlightPlan(recipe, name, expectedUrl) {
   }
   let footer = form;
   while (footer && !leaves('确定', footer).length) footer = footer.parentElement;
-  unique(leaves('确定', footer || form), '最终确定按钮');
-  return { status: 'ready', submitted: false, name, url: location.href, recipe };
+  const confirmation = unique(leaves('确定', footer || form), '最终确定按钮');
+  if (!submit) return { status: 'ready', submitted: false, name, url: location.href, recipe };
+  if (!/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
+  check();
+  const button = confirmation.closest('button,[role="button"]');
+  if (!button || text(button) !== '确定' || button.disabled || button.getAttribute('aria-disabled') === 'true') throw new Error('最终确定按钮不可用，未提交');
+  // This is the sole flight mutation. Never click a follow-up dialog or retry.
+  button.click();
+  const receiptDeadline = Date.now() + 8000;
+  while (Date.now() < receiptDeadline) {
+    if (location.href === expectedUrl && leaves(name).length === 1 && !nameInputs().length) {
+      return { status: 'submitted', submitted: true, name, url: location.href };
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  throw new Error('已点击计划确定，但未收到可核对的计划列表回执');
 }

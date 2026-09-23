@@ -17,8 +17,16 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const ORIGIN: &str = "chrome-extension://knpgppgofegbnimjoahnifpmhgmgnicf";
-const ADDRESS: &str = "127.0.0.1:14520";
+const ORIGIN: &str = if tauri::is_dev() {
+    env!("BRIDGE_DEV_ORIGIN")
+} else {
+    env!("BRIDGE_PROD_ORIGIN")
+};
+const ADDRESS: &str = if tauri::is_dev() {
+    env!("BRIDGE_DEV_ADDRESS")
+} else {
+    env!("BRIDGE_PROD_ADDRESS")
+};
 const TTL: Duration = Duration::from_secs(75);
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -58,18 +66,18 @@ pub struct Bridge(Arc<Mutex<Inner>>);
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabStatus {
-    session: String,
+    pub session: String,
     #[serde(flatten)]
-    tab: BrowserTab,
+    pub tab: BrowserTab,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeStatus {
-    connected: bool,
-    clients: usize,
-    versions: Vec<String>,
-    tabs: Vec<TabStatus>,
-    error: Option<String>,
+    pub connected: bool,
+    pub clients: usize,
+    pub versions: Vec<String>,
+    pub tabs: Vec<TabStatus>,
+    pub error: Option<String>,
 }
 
 pub fn allowed_url(value: &str) -> bool {
@@ -160,11 +168,22 @@ async fn heartbeat(
     inner.clients.insert(
         input.session.clone(),
         Client {
-            version: input.version,
+            version: input.version.clone(),
             tabs,
             last_seen: Instant::now(),
         },
     );
+    // Keep old-version heartbeats visible so the UI can explain the required
+    // upgrade, but never deliver previously queued work to that version.
+    if !crate::readiness::compatible(&input.version) {
+        inner
+            .pending
+            .retain(|_, pending| pending.session != input.session);
+        return Ok(Json(
+            json!({ "ok": true, "jobs": [], "updateRequired": true,
+            "minimumExtensionVersion": crate::readiness::MIN_VERSION }),
+        ));
+    }
     let jobs: Vec<Value> = inner
         .pending
         .iter_mut()
@@ -221,7 +240,7 @@ impl Bridge {
                 Ok(listener) => listener,
                 Err(error) => {
                     bridge.0.lock().unwrap().error = Some(format!(
-                        "本地连接端口 14520 无法启动：{error}。请退出重复运行的客户端后重启。"
+                        "本地连接端口 {ADDRESS} 无法启动：{error}。请退出重复运行的客户端后重启。"
                     ));
                     return;
                 }
@@ -236,6 +255,29 @@ impl Bridge {
                 bridge.0.lock().unwrap().error = Some(format!("本地连接服务停止：{error}"));
             }
         });
+    }
+    pub fn busy(&self) -> bool {
+        !self.0.lock().unwrap().pending.is_empty()
+    }
+    pub fn status(&self) -> BridgeStatus {
+        let mut inner = self.0.lock().unwrap();
+        prune(&mut inner);
+        BridgeStatus {
+            connected: !inner.clients.is_empty(),
+            clients: inner.clients.len(),
+            versions: inner.clients.values().map(|c| c.version.clone()).collect(),
+            tabs: inner
+                .clients
+                .iter()
+                .flat_map(|(session, c)| {
+                    c.tabs.iter().map(move |tab| TabStatus {
+                        session: session.clone(),
+                        tab: tab.clone(),
+                    })
+                })
+                .collect(),
+            error: inner.error.clone(),
+        }
     }
     pub async fn capture(&self, session: String, tab_id: i64) -> Result<Value, String> {
         self.request(session, tab_id, json!({"type": "capture"}))
@@ -252,14 +294,7 @@ impl Bridge {
                     .tabs
                     .iter()
                     .filter(move |tab| {
-                        client
-                            .version
-                            .split('.')
-                            .map(str::parse::<u32>)
-                            .collect::<Result<Vec<_>, _>>()
-                            .is_ok_and(|parts| {
-                                parts.len() == 3 && parts.as_slice() >= [0, 3, 0].as_slice()
-                            })
+                        crate::readiness::compatible(&client.version)
                             && tab.status == "complete"
                             && tab.url.split('?').next() == Some(crate::monitoring::SOURCE_URL)
                     })
@@ -267,44 +302,53 @@ impl Bridge {
             })
             .collect();
         targets.sort();
-        targets
-            .into_iter()
-            .next()
-            .ok_or_else(|| "请连接 v0.3.0 插件，登录江苏大气站并保持时间序列页面打开。".into())
+        targets.into_iter().next().ok_or_else(|| {
+            format!(
+                "请连接 v{} 或以上插件，登录江苏大气站并保持时间序列页面打开。",
+                crate::readiness::MIN_VERSION
+            )
+        })
     }
     pub async fn prepare_flight(&self, event_id: &str, name: &str) -> Result<Value, String> {
+        self.flight_job(event_id, name, false).await
+    }
+    pub async fn submit_flight(&self, event_id: &str, name: &str) -> Result<Value, String> {
+        self.flight_job(event_id, name, true).await
+    }
+    async fn flight_job(&self, event_id: &str, name: &str, submit: bool) -> Result<Value, String> {
         let session = {
             let mut inner = self.0.lock().unwrap();
             prune(&mut inner);
             let mut sessions: Vec<_> = inner
                 .clients
                 .iter()
-                .filter(|(_, client)| {
-                    client
-                        .version
-                        .split('.')
-                        .map(str::parse::<u32>)
-                        .collect::<Result<Vec<_>, _>>()
-                        .is_ok_and(|parts| {
-                            parts.len() == 3 && parts.as_slice() >= [0, 4, 0].as_slice()
-                        })
-                })
+                .filter(|(_, client)| crate::readiness::compatible(&client.version))
                 .map(|(id, _)| id.clone())
                 .collect();
             sessions.sort();
             if sessions.len() != 1 {
-                return Err("请连接且仅保留一个 v0.4.0 或以上 Chrome 桥接插件会话。".into());
+                return Err(format!(
+                    "请连接且仅保留一个 v{} 或以上 Chrome 桥接插件会话。",
+                    crate::readiness::MIN_VERSION
+                ));
             }
             sessions.remove(0)
         };
         self.request(
             session,
             -1,
-            json!({"type":"dji-prepare", "eventId":event_id, "name":name, "submit":false}),
+            json!({"type": if submit { "dji-submit" } else { "dji-prepare" }, "eventId":event_id, "name":name, "submit":submit}),
         )
         .await
     }
     pub async fn request(&self, session: String, tab_id: i64, job: Value) -> Result<Value, String> {
+        let timeout = if job["type"] == "site-health" {
+            // Three checks share one heartbeat and are executed serially by
+            // the extension (up to 15 seconds each, plus heartbeat delivery).
+            55
+        } else {
+            100
+        };
         let (tx, rx) = oneshot::channel();
         let id = Uuid::new_v4().to_string();
         {
@@ -317,19 +361,10 @@ impl Bridge {
                 .clients
                 .get(&session)
                 .ok_or("插件未连接，请打开 Chrome 并重新加载插件。")?;
-            if job["type"]
-                .as_str()
-                .is_some_and(|kind| kind.starts_with("flight-"))
-                && !client
-                    .version
-                    .split('.')
-                    .map(str::parse::<u32>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .is_ok_and(|parts| parts.len() == 3 && parts.as_slice() >= [0, 5, 0].as_slice())
-            {
-                return Err("请在 Chrome 扩展管理页重新加载 v0.5.0 或以上插件。".into());
+            if !crate::readiness::compatible(&client.version) {
+                return Err(format!("浏览器插件必须更新：当前 v{}，需要 v{} 或以上。请在 Chrome 扩展管理页重新加载插件。", client.version, crate::readiness::MIN_VERSION));
             }
-            if job["type"] != "dji-prepare" {
+            if job["type"] != "dji-prepare" && job["type"] != "dji-submit" && job["type"] != "dji-open-prepared" {
                 let tab = client
                     .tabs
                     .iter()
@@ -338,8 +373,8 @@ impl Bridge {
                 if tab.status != "complete" {
                     return Err("页面尚未加载完成，请稍后重试。".into());
                 }
-            } else if tab_id != -1 || job["submit"] != false {
-                return Err("司空任务只允许新页面填写。".into());
+            } else if tab_id != -1 || job["submit"] != (job["type"] == "dji-submit") {
+                return Err("司空任务类型与提交标记不匹配。".into());
             }
             inner.pending.insert(
                 id.clone(),
@@ -352,7 +387,7 @@ impl Bridge {
                 },
             );
         }
-        let result = tokio::time::timeout(Duration::from_secs(100), rx).await;
+        let result = tokio::time::timeout(Duration::from_secs(timeout), rx).await;
         self.0.lock().unwrap().pending.remove(&id);
         match result {
             Ok(Ok(value)) => value,
@@ -363,28 +398,7 @@ impl Bridge {
 }
 #[tauri::command]
 pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
-    let mut inner = bridge.0.lock().unwrap();
-    prune(&mut inner);
-    BridgeStatus {
-        connected: !inner.clients.is_empty(),
-        clients: inner.clients.len(),
-        versions: inner
-            .clients
-            .values()
-            .map(|client| client.version.clone())
-            .collect(),
-        tabs: inner
-            .clients
-            .iter()
-            .flat_map(|(session, client)| {
-                client.tabs.iter().map(move |tab| TabStatus {
-                    session: session.clone(),
-                    tab: tab.clone(),
-                })
-            })
-            .collect(),
-        error: inner.error.clone(),
-    }
+    bridge.status()
 }
 
 #[cfg(test)]
@@ -411,6 +425,30 @@ mod tests {
         headers.insert("host", ADDRESS.parse().unwrap());
         headers.insert("x-taizhou-bridge", "1".parse().unwrap());
         assert!(authorized(&headers));
+        headers.insert(
+            "origin",
+            if tauri::is_dev() {
+                env!("BRIDGE_PROD_ORIGIN")
+            } else {
+                env!("BRIDGE_DEV_ORIGIN")
+            }
+            .parse()
+            .unwrap(),
+        );
+        assert!(!authorized(&headers));
+        headers.insert("origin", ORIGIN.parse().unwrap());
+        headers.insert(
+            "host",
+            if tauri::is_dev() {
+                env!("BRIDGE_PROD_ADDRESS")
+            } else {
+                env!("BRIDGE_DEV_ADDRESS")
+            }
+            .parse()
+            .unwrap(),
+        );
+        assert!(!authorized(&headers));
+        headers.insert("host", ADDRESS.parse().unwrap());
         headers.insert("origin", "https://evil.test".parse().unwrap());
         assert!(!authorized(&headers));
         headers.insert("origin", ORIGIN.parse().unwrap());
@@ -423,13 +461,131 @@ mod tests {
         inner.clients.insert(
             "old".into(),
             Client {
-                version: "0.2.0".into(),
+                version: crate::readiness::MIN_VERSION.into(),
                 tabs: vec![],
                 last_seen: Instant::now() - TTL,
             },
         );
         prune(&mut inner);
         assert!(inner.clients.is_empty());
+    }
+    #[test]
+    fn old_plugin_is_visible_but_cannot_receive_work_and_recovers_after_reload() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let mut headers = HeaderMap::new();
+            headers.insert("origin", ORIGIN.parse().unwrap());
+            headers.insert("host", ADDRESS.parse().unwrap());
+            headers.insert("x-taizhou-bridge", "1".parse().unwrap());
+            let session = Uuid::new_v4().to_string();
+            let input = |version: &str| Heartbeat {
+                session: session.clone(),
+                version: version.into(),
+                tabs: vec![BrowserTab {
+                    id: 1,
+                    title: "fixture".into(),
+                    url: "https://fh.dji.com/".into(),
+                    status: "complete".into(),
+                }],
+            };
+            let response = heartbeat(State(bridge.clone()), headers.clone(), Json(input("0.1.0")))
+                .await
+                .unwrap();
+            assert_eq!(response.0["updateRequired"], true);
+            assert_eq!(response.0["jobs"], json!([]));
+            assert!(bridge.status().connected);
+            for kind in [
+                "capture",
+                "site-health",
+                "jiangsu-hourly",
+                "dji-prepare",
+                "flight-missions",
+            ] {
+                let error = bridge
+                    .request(session.clone(), 1, json!({"type":kind}))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("必须更新"), "{kind}: {error}");
+            }
+            assert!(!bridge.busy());
+            let _ = heartbeat(
+                State(bridge.clone()),
+                headers.clone(),
+                Json(input(crate::readiness::MIN_VERSION)),
+            )
+            .await
+            .unwrap();
+            let pending_bridge = bridge.clone();
+            let pending_session = session.clone();
+            let pending = tauri::async_runtime::spawn(async move {
+                pending_bridge.capture(pending_session, 1).await
+            });
+            for _ in 0..100 {
+                if bridge.busy() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(bridge.busy());
+            // A stale worker appearing while a task is queued must not receive it.
+            let response = heartbeat(State(bridge.clone()), headers, Json(input("0.1.0")))
+                .await
+                .unwrap();
+            assert_eq!(response.0["jobs"], json!([]));
+            assert!(pending.await.unwrap().is_err());
+            assert!(!bridge.busy());
+        });
+    }
+    #[test]
+    fn site_checks_share_one_heartbeat_and_keep_individual_results() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let mut headers = HeaderMap::new();
+            headers.insert("origin", ORIGIN.parse().unwrap());
+            headers.insert("host", ADDRESS.parse().unwrap());
+            headers.insert("x-taizhou-bridge", "1".parse().unwrap());
+            let session = Uuid::new_v4().to_string();
+            let input = || Heartbeat {
+                session: session.clone(),
+                version: crate::readiness::MIN_VERSION.into(),
+                tabs: ["http://61.155.4.60:18080/", "https://fh.dji.com/", "https://aai.airins.cn/sniff"]
+                    .iter().enumerate().map(|(id, url)| BrowserTab {
+                        id: id as i64, title: "fixture".into(), url: (*url).into(), status: "complete".into(),
+                    }).collect(),
+            };
+            let _ = heartbeat(State(bridge.clone()), headers.clone(), Json(input())).await.unwrap();
+            let batch_bridge = bridge.clone();
+            let batch_session = session.clone();
+            let batch = tauri::async_runtime::spawn(async move {
+                tokio::join!(
+                    batch_bridge.request(batch_session.clone(), 0, json!({"type":"site-health"})),
+                    batch_bridge.request(batch_session.clone(), 1, json!({"type":"site-health"})),
+                    batch_bridge.request(batch_session, 2, json!({"type":"site-health"})),
+                )
+            });
+            for _ in 0..100 {
+                if bridge.0.lock().unwrap().pending.len() == 3 { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let delivered = heartbeat(State(bridge.clone()), headers.clone(), Json(input())).await.unwrap();
+            let jobs = delivered.0["jobs"].as_array().unwrap();
+            assert_eq!(jobs.len(), 3, "all sites must be delivered without another heartbeat");
+            for job in jobs {
+                let failed = job["tabId"] == 1;
+                let _ = complete(State(bridge.clone()), headers.clone(), Json(Completion {
+                    session: session.clone(), id: job["id"].as_str().unwrap().into(),
+                    data: (!failed).then(|| json!({"state":"ready"})),
+                    error: failed.then(|| "fixture timeout".into()),
+                })).await.unwrap();
+            }
+            let (map, dji, sniff) = batch.await.unwrap();
+            assert_eq!(map.unwrap()["state"], "ready");
+            assert_eq!(dji.unwrap_err(), "fixture timeout");
+            assert_eq!(sniff.unwrap()["state"], "ready");
+            assert!(!bridge.busy());
+            let repeated = heartbeat(State(bridge.clone()), headers, Json(input())).await.unwrap();
+            assert!(repeated.0["jobs"].as_array().unwrap().is_empty());
+        });
     }
     #[test]
     fn capture_requires_live_client_and_matching_completion() {
@@ -446,7 +602,7 @@ mod tests {
                 headers.clone(),
                 Json(Heartbeat {
                     session: session.clone(),
-                    version: "0.2.0".into(),
+                    version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![BrowserTab {
                         id: 1,
                         title: "page".into(),
@@ -498,7 +654,7 @@ mod tests {
                 headers.clone(),
                 Json(Heartbeat {
                     session: session.clone(),
-                    version: "0.2.0".into(),
+                    version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],
                 }),
             )
@@ -510,7 +666,7 @@ mod tests {
                 headers.clone(),
                 Json(Heartbeat {
                     session: session.clone(),
-                    version: "0.2.0".into(),
+                    version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],
                 }),
             )

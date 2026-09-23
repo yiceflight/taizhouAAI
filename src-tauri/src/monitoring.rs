@@ -26,7 +26,6 @@ pub struct Monitor {
 pub struct HourRow {
     time: String,
     potassium: Option<f64>,
-    pm25: Option<f64>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,6 +52,8 @@ pub struct MonitorView {
     rows: Vec<HourRow>,
     query_through: Option<String>,
     flight: crate::flight::View,
+    weather: crate::weather::View,
+    settings: crate::settings::Settings,
 }
 pub(crate) fn connect(path: &Path) -> Result<Connection, String> {
     let db = Connection::open(path).map_err(|e| e.to_string())?;
@@ -143,7 +144,7 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
         if time < lower
             || time > upper
             || !seen.insert(&row.time)
-            || [row.potassium, row.pm25]
+            || [row.potassium]
                 .iter()
                 .flatten()
                 .any(|v| !v.is_finite() || *v < 0.0)
@@ -157,13 +158,14 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
         tx.execute("INSERT INTO hourly_observations(city_code,observed_at,potassium,pm25,unit,source_url,data_source,common_site_type,synced_at)
             VALUES ('321200',?,?,?,?,?,'A_6','30',?) ON CONFLICT(city_code,observed_at) DO UPDATE SET
             potassium=excluded.potassium,pm25=excluded.pm25,synced_at=excluded.synced_at",
-            params![row.time, row.potassium, row.pm25, batch.unit, SOURCE_URL, synced]).map_err(|e| e.to_string())?;
+            params![row.time, row.potassium, Option::<f64>::None, batch.unit, SOURCE_URL, synced]).map_err(|e| e.to_string())?;
     }
     put(&tx, "query_through", end)?;
     put(&tx, "last_success", &synced)?;
     tx.commit().map_err(|e| e.to_string())
 }
-async fn sync(app: &tauri::AppHandle) -> Result<(), String> {
+async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String> {
+    crate::readiness::require_ready(app)?;
     let monitor = app.state::<Monitor>();
     if monitor.busy.swap(true, Ordering::SeqCst) {
         return Err("小时同步正在进行中".into());
@@ -194,7 +196,7 @@ async fn sync(app: &tauri::AppHandle) -> Result<(), String> {
     }
     .await;
     *monitor.error.lock().unwrap() = result.as_ref().err().cloned();
-    if result.is_ok() {
+    if result.is_ok() && trigger_flight && crate::readiness::require_ready(app).is_ok() {
         // Flight preparation has its own persistent status; a failure must not
         // turn a successful measurement import into a reported sync failure.
         if let Err(error) = crate::flight::after_sync(app).await {
@@ -205,14 +207,19 @@ async fn sync(app: &tauri::AppHandle) -> Result<(), String> {
 }
 pub fn start(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = crate::flight::initialize(&app) {
-            *app.state::<Monitor>().error.lock().unwrap() = Some(error);
-            return;
-        }
         loop {
             match database(&app).and_then(|db| setting(&db, "enabled")) {
                 Ok(value) if value.as_deref() != Some("false") => {
-                    let _ = sync(&app).await;
+                    if app
+                        .state::<crate::readiness::Readiness>()
+                        .started
+                        .load(Ordering::SeqCst)
+                    {
+                        let _ = crate::readiness::refresh(&app).await;
+                        if crate::readiness::require_ready(&app).is_ok() {
+                            let _ = sync(&app, true).await;
+                        }
+                    }
                 }
                 Err(error) => *app.state::<Monitor>().error.lock().unwrap() = Some(error),
                 _ => {}
@@ -227,13 +234,12 @@ pub fn get_monitoring(
     monitor: tauri::State<'_, Monitor>,
 ) -> Result<MonitorView, String> {
     let db = database(&app)?;
-    let mut stmt = db.prepare("SELECT observed_at,potassium,pm25 FROM hourly_observations WHERE city_code='321200' ORDER BY observed_at DESC LIMIT 168").map_err(|e| e.to_string())?;
+    let mut stmt = db.prepare("SELECT observed_at,potassium FROM hourly_observations WHERE city_code='321200' ORDER BY observed_at DESC LIMIT 168").map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
             Ok(HourRow {
                 time: row.get(0)?,
                 potassium: row.get(1)?,
-                pm25: row.get(2)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -255,14 +261,23 @@ pub fn get_monitoring(
         rows,
         query_through: setting(&db, "query_through")?,
         flight: crate::flight::view(&db)?,
+        weather: crate::weather::view(&app),
+        settings: crate::settings::read(&db)?,
     })
+}
+pub async fn verify_first_sync(app: &tauri::AppHandle) -> Result<(), String> {
+    sync(app, false).await
 }
 #[tauri::command]
 pub async fn sync_monitoring(app: tauri::AppHandle) -> Result<(), String> {
-    sync(&app).await
+    crate::readiness::require_started(&app)?;
+    sync(&app, true).await
 }
 #[tauri::command]
 pub fn set_monitoring_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        crate::readiness::require_ready(&app)?;
+    }
     put(
         &database(&app)?,
         "enabled",
@@ -299,6 +314,7 @@ mod tests {
             batch(json!([{"time":"2026-09-18 00:00:00","potassium":1,"pm25":2}]))
         )
         .is_err());
+        assert_eq!(db.query_row("SELECT pm25 FROM hourly_observations", [], |r| r.get::<_, Option<f64>>(0)).unwrap(), None);
         let mut wrong = batch(json!([]));
         wrong.city_code = "320100".into();
         assert!(save(&mut db, wrong).is_err());

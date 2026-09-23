@@ -18,7 +18,7 @@ export async function queryJiangsuHourly(startTime, endTime) {
     queue.push(...(candidate.$children || []));
     if (candidate.$parent) queue.push(candidate.$parent);
   }
-  if (!vm?.$Ajax?.photoTimeSeriesData || !vm.$Ajax.getNormalSixParamData) throw new Error("时间序列页面尚未就绪或平台结构已变化");
+  if (!vm?.$Ajax?.photoTimeSeriesData) throw new Error("时间序列页面尚未就绪或平台结构已变化");
   const check = (response) => {
     if (response?.code !== 0 || !Array.isArray(response.data)) throw new Error("江苏大气站查询失败，请检查登录状态后重试");
     return response.data;
@@ -32,14 +32,11 @@ export async function queryJiangsuHourly(startTime, endTime) {
   const unit = factor.unit?.normalize("NFKC").replace(/μ/g, "u").replace(/\s/g, "");
   if (unit !== "ug/m3") throw new Error("K+ 单位不是 μg/m³，暂停同步以避免错误换算");
   const params = { startTime, endTime, siteCode: "321200", siteType: "CITY", timeType: "HOUR", dataSource: "A_6" };
-  const [particle, normal] = await Promise.all([
-    vm.$Ajax.photoTimeSeriesData({ ...params, queryFactor: factor.factorCode }),
-    vm.$Ajax.getNormalSixParamData({ ...params, commonSiteType: "30" }),
-  ]);
+  const particle = await vm.$Ajax.photoTimeSeriesData({ ...params, queryFactor: factor.factorCode });
   const series = check(particle).filter((item) => item.factorCode === factor.factorCode);
   if (series.length !== 1) throw new Error("K+ 查询未返回唯一时间序列");
   if (location.hash.split("?")[0] !== "#/particle-analysis/feature-analysis/time-series") throw new Error("查询期间页面已跳转，请重新登录并打开时间序列页");
-  return { url: location.href, city: "泰州市", cityCode: "321200", unit: "μg/m³", dataSource: "A_6", commonSiteType: "30", startTime, endTime, potassium: { times: series[0].dataTimes, values: series[0].values }, normal: check(normal).map((row) => ({ time: row.dataTime, pm25: row.pm25 })) };
+  return { url: location.href, city: "泰州市", cityCode: "321200", unit: "μg/m³", dataSource: "A_6", commonSiteType: "30", startTime, endTime, potassium: { times: series[0].dataTimes, values: series[0].values } };
 }
 
 export function normalizeHourly(raw) {
@@ -58,18 +55,17 @@ export function normalizeHourly(raw) {
     if (!Number.isFinite(result) || result < 0) throw new Error("平台返回无效浓度值");
     return result;
   };
-  if (!Array.isArray(raw.potassium?.times) || !Array.isArray(raw.potassium?.values) || raw.potassium.times.length !== raw.potassium.values.length || !Array.isArray(raw.normal)) throw new Error("平台时间与指标数量不匹配");
+  if (!Array.isArray(raw.potassium?.times) || !Array.isArray(raw.potassium?.values) || raw.potassium.times.length !== raw.potassium.values.length) throw new Error("平台时间与指标数量不匹配");
   const rows = new Map();
   const add = (time, key, input) => {
     time = hour(time);
-    const row = rows.get(time) || { time, potassium: null, pm25: null };
+    const row = rows.get(time) || { time, potassium: null };
     if (row[`${key}Seen`]) throw new Error("平台返回重复的小时指标");
     row[key] = value(input); row[`${key}Seen`] = true; rows.set(time, row);
   };
   raw.potassium.times.forEach((time, i) => add(time, "potassium", raw.potassium.values[i]));
-  raw.normal.forEach((row) => add(row.time, "pm25", row.pm25));
   const data = [...rows.values()].sort((a, b) => a.time.localeCompare(b.time));
   // Future/empty trailing slots are not observations. Missing values inside a reported interval remain null.
-  const latest = data.filter((row) => row.potassium !== null || row.pm25 !== null).at(-1)?.time;
-  return { url: raw.url, city: raw.city, cityCode: raw.cityCode, unit: raw.unit, dataSource: raw.dataSource, commonSiteType: raw.commonSiteType, startTime: raw.startTime, endTime: raw.endTime, rows: data.filter((row) => latest && row.time <= latest).map(({time, potassium, pm25}) => ({time, potassium, pm25})) };
+  const latest = data.filter((row) => row.potassium !== null).at(-1)?.time;
+  return { url: raw.url, city: raw.city, cityCode: raw.cityCode, unit: raw.unit, dataSource: raw.dataSource, commonSiteType: raw.commonSiteType, startTime: raw.startTime, endTime: raw.endTime, rows: data.filter((row) => latest && row.time <= latest).map(({time, potassium}) => ({time, potassium})) };
 }

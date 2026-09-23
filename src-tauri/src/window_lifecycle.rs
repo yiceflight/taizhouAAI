@@ -1,8 +1,24 @@
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     App, AppHandle, Manager,
 };
+
+fn application_icon(_app: &App) -> Result<Image<'static>, Box<dyn std::error::Error>> {
+    #[cfg(dev)]
+    {
+        return Ok(Image::from_bytes(include_bytes!("../icons/dev/icon.png"))?);
+    }
+
+    #[cfg(not(dev))]
+    {
+        _app.default_window_icon()
+            .cloned()
+            .map(Image::to_owned)
+            .ok_or_else(|| "Application icon is missing".into())
+    }
+}
 
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -33,9 +49,11 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         None::<&str>,
     )?;
     let menu = Menu::with_items(app, &[&show, &separator, &quit])?;
-    let icon = app
-        .default_window_icon()
-        .ok_or("Application icon is missing")?;
+    let icon = application_icon(app)?;
+
+    if let Some(window) = app.get_webview_window("main") {
+        window.set_icon(icon.clone())?;
+    }
 
     TrayIconBuilder::with_id("main-tray")
         .icon(icon.clone())

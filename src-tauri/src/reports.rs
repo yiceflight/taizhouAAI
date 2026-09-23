@@ -132,6 +132,7 @@ pub async fn generate_report(
     session: String,
     tab_id: i64,
 ) -> Result<ReportSummary, String> {
+    crate::readiness::require_started(&app)?;
     let data = bridge.capture(session, tab_id).await?;
     let snapshot: Snapshot =
         serde_json::from_value(data).map_err(|e| format!("插件数据格式错误：{e}"))?;

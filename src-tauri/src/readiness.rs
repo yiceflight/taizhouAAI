@@ -1,0 +1,427 @@
+use crate::bridge::Bridge;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
+use std::time::{Duration, Instant};
+use tauri::Manager;
+
+pub const MIN_VERSION: &str = env!("BRIDGE_MIN_EXTENSION_VERSION");
+const MAX_AGE: Duration = Duration::from_secs(120);
+const SITES: [(&str, &str); 3] = [
+    ("map", "http://61.155.4.60:18080"),
+    ("dji", "https://fh.dji.com"),
+    ("sniff", "https://aai.airins.cn"),
+];
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteHealth {
+    pub id: String,
+    pub state: String,
+    pub message: String,
+    pub checked_at: Option<String>,
+    pub session: Option<String>,
+    pub tab_id: Option<i64>,
+    pub url: Option<String>,
+}
+struct Cached {
+    health: SiteHealth,
+    at: Instant,
+}
+#[derive(Default)]
+pub struct Readiness {
+    sites: Mutex<Vec<Cached>>,
+    checking: AtomicBool,
+    pub started: AtomicBool,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct View {
+    pub plugin_ready: bool,
+    pub plugin_message: String,
+    pub plugin_update_required: bool,
+    pub minimum_extension_version: &'static str,
+    pub checking: bool,
+    pub sites: Vec<SiteHealth>,
+    pub ready: bool,
+    pub started: bool,
+}
+pub fn compatible(version: &str) -> bool {
+    fn parse(value: &str) -> Option<[u16; 4]> {
+        let parts: Vec<_> = value.split('.').collect();
+        if !(1..=4).contains(&parts.len()) {
+            return None;
+        }
+        let mut result = [0; 4];
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            result[i] = part.parse().ok()?;
+        }
+        Some(result)
+    }
+    matches!((parse(version), parse(MIN_VERSION)), (Some(actual), Some(required)) if actual >= required)
+}
+fn plugin(bridge: &crate::bridge::BridgeStatus) -> (bool, String) {
+    if let Some(error) = &bridge.error {
+        return (false, error.clone());
+    }
+    if !bridge.connected {
+        return (
+            false,
+            "尚未连接插件。请安装或启用插件，并保持 Chrome 运行。".into(),
+        );
+    }
+    if bridge.versions.iter().any(|v| !compatible(v)) {
+        return (false, format!("浏览器插件必须更新：当前 v{}，需要 v{MIN_VERSION} 或以上。请在 Chrome 扩展管理页重新加载插件，完成前无法采集或监测。", bridge.versions.join("、v")));
+    }
+    if bridge.clients != 1 {
+        return (
+            false,
+            "检测到多个 Chrome 插件会话，请只保留一个工作浏览器配置。".into(),
+        );
+    }
+    (true, "插件已连接，版本兼容".into())
+}
+fn empty(id: &str, state: &str, message: &str) -> SiteHealth {
+    SiteHealth {
+        id: id.into(),
+        state: state.into(),
+        message: message.into(),
+        checked_at: None,
+        session: None,
+        tab_id: None,
+        url: None,
+    }
+}
+fn same_origin(url: &str, origin: &str) -> bool {
+    tauri::Url::parse(url).is_ok_and(|u| u.origin().ascii_serialization() == origin)
+}
+pub fn view(app: &tauri::AppHandle) -> View {
+    let state = app.state::<Readiness>();
+    let bridge = app.state::<Bridge>().status();
+    let cache = state.sites.lock().unwrap();
+    evaluate(
+        &bridge,
+        &cache,
+        state.started.load(Ordering::SeqCst),
+        state.checking.load(Ordering::SeqCst),
+    )
+}
+fn evaluate(
+    bridge: &crate::bridge::BridgeStatus,
+    cache: &[Cached],
+    started: bool,
+    checking: bool,
+) -> View {
+    let (plugin_ready, plugin_message) = plugin(&bridge);
+    let sites: Vec<_> = SITES
+        .iter()
+        .map(|(id, origin)| {
+            if !plugin_ready {
+                return empty(id, "blocked", "等待插件连接后检测");
+            }
+            if let Some(cached) = cache.iter().find(|c| c.health.id == *id) {
+                let live = bridge.tabs.iter().any(|t| {
+                    Some(&t.session) == cached.health.session.as_ref()
+                        && Some(t.tab.id) == cached.health.tab_id
+                        && Some(&t.tab.url) == cached.health.url.as_ref()
+                        && t.tab.status == "complete"
+                });
+                if live && cached.at.elapsed() < MAX_AGE {
+                    return cached.health.clone();
+                }
+            }
+            if bridge.tabs.iter().any(|t| same_origin(&t.tab.url, origin)) {
+                empty(id, "unchecked", "等待验证登录与业务访问")
+            } else {
+                empty(id, "not_open", "请打开网站并完成登录")
+            }
+        })
+        .collect();
+    View {
+        ready: plugin_ready && sites.iter().all(|s| s.state == "ready"),
+        plugin_ready,
+        plugin_update_required: bridge.connected && bridge.versions.iter().any(|v| !compatible(v)),
+        minimum_extension_version: MIN_VERSION,
+        plugin_message,
+        checking,
+        started,
+        sites,
+    }
+}
+pub fn require_ready(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = view(app);
+    if !state.plugin_ready {
+        return Err(state.plugin_message);
+    }
+    if !state.ready {
+        return Err("请先完成三个网站的登录和可用性验证，再继续操作。".into());
+    }
+    Ok(())
+}
+pub fn require_started(app: &tauri::AppHandle) -> Result<(), String> {
+    require_ready(app)?;
+    if !app.state::<Readiness>().started.load(Ordering::SeqCst) {
+        return Err("请先完成首批数据读取并开始监测。".into());
+    }
+    Ok(())
+}
+pub async fn refresh(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Readiness>();
+    if state.checking.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    struct Guard<'a>(&'a AtomicBool);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard(&state.checking);
+    let bridge = app.state::<Bridge>();
+    let snapshot = bridge.status();
+    if !plugin(&snapshot).0 {
+        state.sites.lock().unwrap().clear();
+        return Ok(());
+    }
+    // Queue all checks before waiting for the next extension heartbeat. The
+    // extension still executes them serially, preserving its single CDP lock.
+    tokio::join!(
+        check_site(app, &snapshot, SITES[0]),
+        check_site(app, &snapshot, SITES[1]),
+        check_site(app, &snapshot, SITES[2]),
+    );
+    Ok(())
+}
+async fn check_site(
+    app: &tauri::AppHandle,
+    snapshot: &crate::bridge::BridgeStatus,
+    (id, origin): (&str, &str),
+) {
+    let state = app.state::<Readiness>();
+    let bridge = app.state::<Bridge>();
+    // Prefer the required business page over an unrelated/login tab.
+    let mut tabs: Vec<_> = snapshot
+        .tabs
+        .iter()
+        .filter(|t| same_origin(&t.tab.url, origin) && t.tab.status == "complete")
+        .collect();
+    tabs.sort_by_key(|t| {
+        (
+            !t.tab.url.contains(match id {
+                "map" => "time-series",
+                "dji" => "c7ea6bbc-110d-4dc9-ac75-4653ebbbca49",
+                _ => "/sniff",
+            }),
+            t.tab.id,
+        )
+    });
+    let health = if let Some(tab) = tabs.first() {
+        let result = bridge
+            .request(
+                tab.session.clone(),
+                tab.tab.id,
+                json!({"type":"site-health"}),
+            )
+            .await;
+        let mut health = empty(id, "error", "检测失败，请保持业务页面打开后重试");
+        if let Ok(raw) = result {
+            if raw["url"].as_str() == Some(&tab.tab.url) {
+                if let (Some(status), Some(message)) =
+                    (raw["state"].as_str(), raw["message"].as_str())
+                {
+                    if [
+                        "ready",
+                        "login_required",
+                        "forbidden",
+                        "page_required",
+                        "error",
+                    ]
+                    .contains(&status)
+                    {
+                        health.state = status.into();
+                        health.message = message.chars().take(180).collect();
+                    }
+                }
+            }
+        }
+        health.checked_at = Some(
+            crate::monitoring::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+        health.session = Some(tab.session.clone());
+        health.tab_id = Some(tab.tab.id);
+        health.url = Some(tab.tab.url.clone());
+        health
+    } else {
+        empty(id, "not_open", "请打开网站并完成登录，等待页面加载完成")
+    };
+    let mut cache = state.sites.lock().unwrap();
+    cache.retain(|c| c.health.id != id);
+    cache.push(Cached {
+        health,
+        at: Instant::now(),
+    });
+}
+pub fn start(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut next_check = Instant::now();
+        loop {
+            let current = view(&app);
+            if !current.plugin_ready {
+                app.state::<Readiness>().sites.lock().unwrap().clear();
+                // Do not put a newly connected plugin behind a 45-second timer.
+                next_check = Instant::now();
+            } else if !app.state::<Bridge>().busy()
+                && (Instant::now() >= next_check
+                    || current.sites.iter().any(|s| s.state == "unchecked"))
+            {
+                let _ = refresh(&app).await;
+                next_check =
+                    Instant::now() + Duration::from_secs(if view(&app).ready { 45 } else { 10 });
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+#[tauri::command]
+pub fn get_readiness(app: tauri::AppHandle) -> View {
+    view(&app)
+}
+#[tauri::command]
+pub async fn check_readiness(app: tauri::AppHandle) -> Result<View, String> {
+    refresh(&app).await?;
+    Ok(view(&app))
+}
+#[tauri::command]
+pub async fn start_workspace(app: tauri::AppHandle) -> Result<(), String> {
+    require_ready(&app)?;
+    // First read cannot trigger an automatic flight preparation.
+    crate::monitoring::verify_first_sync(&app).await?;
+    require_ready(&app)?;
+    crate::monitoring::set_monitoring_enabled(app.clone(), true)?;
+    app.state::<Readiness>()
+        .started
+        .store(true, Ordering::SeqCst);
+    crate::flight::after_sync(&app).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn version_and_origin_are_exact() {
+        assert!(compatible(MIN_VERSION));
+        assert!(compatible("0.10.0"));
+        for v in [
+            "0.6.0",
+            "0.5.9",
+            "invalid",
+            "0.6.0-beta",
+            "0.6.0.0.1",
+            "0.70000.0",
+        ] {
+            assert!(!compatible(v));
+        }
+        assert!(same_origin("https://fh.dji.com/path", "https://fh.dji.com"));
+        assert!(!same_origin(
+            "https://fh.dji.com.evil.test/path",
+            "https://fh.dji.com"
+        ));
+    }
+    fn fixture() -> (crate::bridge::BridgeStatus, Vec<Cached>) {
+        let tabs: Vec<_> = SITES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, origin))| crate::bridge::TabStatus {
+                session: "session".into(),
+                tab: crate::bridge::BrowserTab {
+                    id: i as i64,
+                    title: "page".into(),
+                    url: format!("{origin}/business"),
+                    status: "complete".into(),
+                },
+            })
+            .collect();
+        let cache = SITES
+            .iter()
+            .zip(tabs.iter())
+            .map(|((id, _), tab)| {
+                let mut health = empty(id, "ready", "verified");
+                health.session = Some(tab.session.clone());
+                health.tab_id = Some(tab.tab.id);
+                health.url = Some(tab.tab.url.clone());
+                Cached {
+                    health,
+                    at: Instant::now(),
+                }
+            })
+            .collect();
+        (
+            crate::bridge::BridgeStatus {
+                connected: true,
+                clients: 1,
+                versions: vec![MIN_VERSION.into()],
+                tabs,
+                error: None,
+            },
+            cache,
+        )
+    }
+    #[test]
+    fn gates_all_sites_and_preserves_started_on_loss_for_recovery() {
+        let (mut bridge, mut cache) = fixture();
+        assert!(evaluate(&bridge, &cache, true, false).ready);
+        cache[1].health.state = "login_required".into();
+        let view = evaluate(&bridge, &cache, true, false);
+        assert!(!view.ready);
+        assert!(view.started);
+        cache[1].health.state = "ready".into();
+        bridge.tabs[1].tab.url.push_str("#/login");
+        assert!(!evaluate(&bridge, &cache, true, false).ready);
+        bridge.tabs.remove(1);
+        assert_eq!(
+            evaluate(&bridge, &cache, true, false).sites[1].state,
+            "not_open"
+        );
+    }
+    #[test]
+    fn rejects_stale_checks_reloads_and_browser_session_replacement() {
+        let (mut bridge, mut cache) = fixture();
+        cache[0].at = Instant::now() - MAX_AGE;
+        assert!(!evaluate(&bridge, &cache, false, false).ready);
+        cache[0].at = Instant::now();
+        bridge.tabs[0].tab.status = "loading".into();
+        assert!(!evaluate(&bridge, &cache, false, false).ready);
+        bridge.tabs[0].tab.status = "complete".into();
+        bridge.tabs[0].session = "different-profile".into();
+        assert!(!evaluate(&bridge, &cache, false, false).ready);
+    }
+    #[test]
+    fn plugin_loss_conflict_or_old_version_cannot_reuse_cached_success() {
+        let (mut bridge, cache) = fixture();
+        bridge.connected = false;
+        assert!(!evaluate(&bridge, &cache, true, false).ready);
+        bridge.connected = true;
+        bridge.clients = 2;
+        assert!(!evaluate(&bridge, &cache, true, false).ready);
+        bridge.clients = 1;
+        bridge.versions = vec!["0.5.0".into()];
+        let view = evaluate(&bridge, &cache, true, false);
+        assert!(!view.ready);
+        assert!(view.plugin_update_required);
+        assert_eq!(view.minimum_extension_version, MIN_VERSION);
+        bridge.versions = vec![MIN_VERSION.into()];
+        let view = evaluate(&bridge, &cache, true, false);
+        assert!(view.ready);
+        assert!(!view.plugin_update_required);
+        bridge.error = Some("port in use".into());
+        assert!(!evaluate(&bridge, &cache, true, false).ready);
+    }
+}

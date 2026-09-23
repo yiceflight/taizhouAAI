@@ -5,10 +5,13 @@
 - 白底 PNG：`public/brand/monitoring-logo.png`
 - 网页图标：`public/brand/favicon.png`
 - 桌面端 PNG / ICNS / ICO：`src-tauri/icons/`
+- 开发环境桌面图标：`src-tauri/icons/dev/icon.png` / `icon.icns`（带 `D` 角标，运行时仅由 `pnpm dev:client` 使用）
 - Chrome 插件图标：`extension/icons/`
 - 系统名称通过界面文字独立排版，保证中文清晰、可访问。
 
 使用内置 image_gen 生成原图，使用 `pnpm tauri icon public/brand/monitoring-logo.png` 导出应用图标。应用标识、升级地址和包名保持稳定，显示名称统一使用中文全称。
+
+开发版图标用 `swift scripts/generate-dev-icon.swift` 重新生成（macOS）。运行时替换 Dock 图标不会自动获得安装版的留白：在 1024 像素画布上，主体为 824 × 824，四边各留 100 像素透明边距。`D` 角标在主体裁剪后单独绘制，避免被圆角裁掉；PNG 与 ICNS 共用同一布局。
 
 ## 生成提示词
 

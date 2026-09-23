@@ -15,7 +15,7 @@ fn extension_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or("无法定位项目目录。")?
-            .join("extension")
+            .join("extension-dev")
     } else {
         app.path()
             .resource_dir()

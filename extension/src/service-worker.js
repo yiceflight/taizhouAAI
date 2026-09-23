@@ -1,8 +1,9 @@
+import { checkSiteHealth } from './site-health.js';
 import { airinsReport, djiReport } from './flight-report.js';
 import { SITE_PATTERNS, allowedUrl, evaluationValue, pageSnapshot } from "./bridge-core.js";
 import { queryJiangsuHourly, normalizeHourly } from "./jiangsu.js";
-import { PLAN_URL, PLAN_RECIPE, validatePlanJob, fillFlightPlan } from "./flight-plan.js";
-const ENDPOINT = "http://127.0.0.1:14520";
+import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan } from "./flight-plan.js";
+import { ENDPOINT } from "./bridge-config.js";
 const sessionReady = (async () => {
   const saved = await chrome.storage.local.get("bridgeSession");
   if (saved.bridgeSession) return saved.bridgeSession;
@@ -34,11 +35,12 @@ async function capture(tabId, job) {
     const flight = job?.type?.startsWith('flight-');
     const expression = flight ? `(${(job.type.startsWith('flight-dji') ? djiReport : airinsReport).toString()})(${JSON.stringify(job)})` : null;
     const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-      expression: expression || (job?.type === "jiangsu-hourly" ? `Promise.race([(${queryJiangsuHourly.toString()})(${JSON.stringify(job.startTime)}, ${JSON.stringify(job.endTime)}), new Promise((_, reject) => setTimeout(() => reject(new Error("江苏大气站查询超时")), 35000))])` : `(${pageSnapshot.toString()})()`), awaitPromise: true, returnByValue: true,
+      expression: (job?.type === "site-health" ? `Promise.race([(${checkSiteHealth.toString()})(), new Promise(resolve => setTimeout(() => resolve({url:location.href,state:"error",message:"验证超时，请检查网络后重试"}), 15000))])` : expression) || (job?.type === "jiangsu-hourly" ? `Promise.race([(${queryJiangsuHourly.toString()})(${JSON.stringify(job.startTime)}, ${JSON.stringify(job.endTime)}), new Promise((_, reject) => setTimeout(() => reject(new Error("江苏大气站查询超时")), 35000))])` : `(${pageSnapshot.toString()})()`), awaitPromise: true, returnByValue: true,
     });
     const data = evaluationValue(response);
     const current = await chrome.tabs.get(tabId);
     if (!allowedUrl(data.url) || current.url !== data.url || new URL(data.url).origin !== new URL(tab.url).origin) throw new Error("采集期间页面发生跳转，请重试");
+    if (job?.type === "site-health") return data;
     if (flight) {
       if (job.type === 'flight-dji-image' && !data.dataUrl) throw new Error('未取得照片原图，请关闭照片预览后重试；若持续失败，请更新司空适配器');
       if (new TextEncoder().encode(JSON.stringify(data)).length > 20000000) throw new Error('巡飞资料超过单次传输限制');
@@ -89,6 +91,47 @@ async function prepareFlight(job) {
     capturing = false;
   }
 }
+async function submitFlight(job) {
+  validateSubmitJob(job);
+  if (capturing) throw new Error('另一个任务正在执行，起飞请求未执行');
+  capturing = true;
+  let tabId;
+  let attached = false;
+  try {
+    const key = `flight-${job.eventId}`;
+    const claim = `flight-submit-${job.eventId}`;
+    const saved = await chrome.storage.local.get([key, claim]);
+    if (saved[claim]) throw new Error('此任务已经尝试提交，请到司空核查，禁止重复提交');
+    const tab = Number.isInteger(saved[key]) ? await chrome.tabs.get(saved[key]).catch(() => null) : null;
+    if (!tab || tab.url !== `${PLAN_URL}/create-plan`) throw new Error('原计划草稿不可用，未提交');
+    tabId = tab.id;
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.debugger.attach({ tabId }, '1.3'); attached = true;
+    // Persist BEFORE any potentially executing script. A lost receipt or worker
+    // restart must never cause another click for the same event.
+    await chrome.storage.local.set({ [claim]: { attemptedAt: Date.now() } });
+    const response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+      expression: `(${fillFlightPlan.toString()})(${JSON.stringify(PLAN_RECIPE)}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)}, true)`,
+      awaitPromise: true, returnByValue: true,
+    });
+    const result = evaluationValue(response);
+    if (result.status !== 'submitted' || result.submitted !== true || result.name !== job.name || result.url !== PLAN_URL) throw new Error('起飞提交回执不匹配');
+    return result;
+  } finally {
+    if (attached) await chrome.debugger.detach({ tabId }).catch(() => {});
+    capturing = false;
+  }
+}
+async function openPreparedFlight(job) {
+  if (!/^[a-f0-9-]{36}$/.test(job.eventId || '') || job.submit !== false) throw new Error('巡查任务编号无效');
+  const key = `flight-${job.eventId}`;
+  const saved = (await chrome.storage.local.get(key))[key];
+  const tab = Number.isInteger(saved) ? await chrome.tabs.get(saved).catch(() => null) : null;
+  if (!tab || ![PLAN_URL, `${PLAN_URL}/create-plan`].includes(tab.url)) throw new Error('原计划草稿页面已关闭或跳转，请在司空中核查；未创建新草稿');
+  await chrome.tabs.update(tab.id, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+  return { opened: true };
+}
 async function heartbeat() {
   if (polling) return;
   polling = true;
@@ -97,9 +140,9 @@ async function heartbeat() {
       .map(({ id, title, url, status }) => ({ id, title: (title || "").slice(0, 1000), url, status }));
     const response = await post("heartbeat", { version: chrome.runtime.getManifest().version, tabs });
     for (const job of response.jobs || []) {
-      if (!["capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image"].includes(job.type) || !Number.isInteger(job.tabId)) continue;
+      if (!["dji-submit", "dji-open-prepared", "site-health", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image"].includes(job.type) || !Number.isInteger(job.tabId)) continue;
       let result;
-      try { result = { data: job.type === "dji-prepare" ? await prepareFlight(job) : await capture(job.tabId, job) }; }
+      try { result = { data: job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : await capture(job.tabId, job) }; }
       catch (error) { result = { error: (error.message || String(error)).split("\n")[0].slice(0, 300) }; }
       await post("complete", { id: job.id, ...result });
     }

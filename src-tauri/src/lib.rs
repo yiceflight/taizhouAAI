@@ -67,6 +67,20 @@ fn open_business_site(url: String) -> Result<(), String> {
     open_in_chrome(&url)
 }
 
+#[cfg(all(dev, target_os = "macos"))]
+fn set_dev_app_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let marker = unsafe { MainThreadMarker::new_unchecked() };
+    let application = NSApplication::sharedApplication(marker);
+    let data = NSData::with_bytes(include_bytes!("../icons/dev/icon.icns"));
+    if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { application.setApplicationIconImage(Some(&icon)); }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -76,10 +90,16 @@ pub fn run() {
         .manage(bridge::Bridge::default())
         .manage(monitoring::Monitor::default())
         .manage(flight::Flight::default())
+        .manage(readiness::Readiness::default())
+        .manage(weather::Weather::default())
         .setup(|app| {
             use tauri::Manager;
             app.state::<bridge::Bridge>().start();
+            readiness::start(app.handle().clone());
+            flight::initialize(app.handle()).map_err(std::io::Error::other)?;
             monitoring::start(app.handle().clone());
+            weather::start(app.handle().clone());
+            flight::start(app.handle().clone());
             window_lifecycle::setup_tray(app)
         })
         .on_window_event(|window, event| {
@@ -100,10 +120,19 @@ pub fn run() {
             extension::get_extension_directory,
             extension::open_extension_directory,
             bridge::get_bridge_status,
+            readiness::get_readiness,
+            readiness::check_readiness,
+            readiness::start_workspace,
             monitoring::get_monitoring,
+            weather::refresh_weather,
+            settings::save_workspace_settings,
             flight::set_flight_enabled,
+            flight::set_flight_delay,
+            flight::cancel_flight,
+            flight::launch_flight,
             flight::prepare_flight,
             flight::dismiss_flight,
+            flight::open_prepared_flight,
             monitoring::sync_monitoring,
             monitoring::set_monitoring_enabled,
             reports::generate_report,
@@ -120,6 +149,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, _event| {
+            #[cfg(all(dev, target_os = "macos"))]
+            if let tauri::RunEvent::Ready = &_event {
+                set_dev_app_icon();
+            }
+
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = _event {
                 window_lifecycle::show_main_window(_app);
@@ -134,7 +168,12 @@ mod reports;
 mod updates;
 
 mod monitoring;
+mod settings;
 
 mod flight;
 
 mod flight_report;
+
+mod readiness;
+
+mod weather;

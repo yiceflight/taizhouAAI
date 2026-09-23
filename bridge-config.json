@@ -1,0 +1,12 @@
+{
+  "minimumExtensionVersion": "0.7.1",
+  "production": {
+    "address": "127.0.0.1:14520",
+    "origin": "chrome-extension://knpgppgofegbnimjoahnifpmhgmgnicf"
+  },
+  "development": {
+    "address": "127.0.0.1:14521",
+    "origin": "chrome-extension://lgallibgppbepolgogkfbebphjiiejkn",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyx+FrhzK5HkzCeV5k7v9+g+FpA1KCN/e5WLKBnhOxn8j1TktTqia10rzs8Ev1FrQzJ14G9grZE0+dVEz2Gw3Sy/npg4GReB21A9JPKQTDtevEp4Od9HSXIbUqtDbdU+y0x++d0J/+yq4s50Vn8mjwkl02dmf4yLST6b/Bpsqp1Afz7SkxidcrWyYau9N2X9VXcSEAI263bFjCXbKHDekvxN5kxmSlYvzNJrWolXTEAkp07rNTm1rXj9Euxf2eNqPogk+c0qvcN8u0fHZqP4L6IYOoeykLAaGyiLN804AGNPFxwC335tSQ+TPcilXlv7Xn9IZ6/8xen3GeoO2oExyLwIDAQAB"
+  }
+}

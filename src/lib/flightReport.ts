@@ -33,7 +33,7 @@ export function flightCharts(data:CollectedFlight):[string,string] {
     ctx.lineWidth=3;ctx.strokeStyle='#15766b';ctx.beginPath();let connected=false;
     for(const p of rows){if(!p){connected=false;continue;}if(connected)ctx.lineTo(x(p.x),y(p.y));else ctx.moveTo(x(p.x),y(p.y));connected=true;}ctx.stroke();
     if(route){for(const [i,color,label] of [[0,'#167c55','起点'],[valid.length-1,'#b5433c','终点']] as const){const p=valid[i];ctx.fillStyle=color;ctx.beginPath();ctx.arc(x(p.x),y(p.y),7,0,2*Math.PI);ctx.fill();ctx.textAlign='left';ctx.fillText(label,x(p.x)+10,y(p.y)+(i===0?28:-12));}}
-    ctx.fillStyle='#55665f';ctx.textAlign='left';ctx.font='19px sans-serif';ctx.fillText(route?'横轴：经度  纵轴：纬度；平台原始坐标，无底图':'北京时间；缺测点断开；未对原始样本平滑或按小时重采样',left,590);
+    ctx.fillStyle='#55665f';ctx.textAlign='left';ctx.font='19px sans-serif';ctx.fillText(route?'横轴：经度  纵轴：纬度；平台原始坐标，无底图':'北京时间；暂无数据时断开；未对原始样本平滑或按小时重采样',left,590);
     return canvas.toDataURL('image/png');
   };
   return [chart(false),chart(true)];

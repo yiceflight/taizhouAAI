@@ -12,8 +12,8 @@ export const targetSites: TargetSite[] = [
   {
     id: "map",
     name: "江苏大气站",
-    description: "泰州市 K+ 与 PM2.5 小时监测",
-    url: "http://61.155.4.60:18080/#/particle-analysis/feature-analysis/time-series",
+    description: "泰州市 K+ 小时监测",
+    url: "http://61.155.4.60:18080/#/home/map",
     hostPattern: "http://61.155.4.60:18080/*",
   },
   {

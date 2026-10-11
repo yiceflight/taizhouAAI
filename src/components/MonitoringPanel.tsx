@@ -1,9 +1,56 @@
-import { weatherPasses } from '../lib/weather';
-import { useState } from 'react';
-import { flightSummary, dataQuality, defaultSettings, hourTime, type WorkspaceSettings, type HourRow, type MonitorView } from '../lib/workspace';
+import { useEffect, useRef, useState } from 'react';
+import { dataQuality, defaultSettings, flightDisplay, hourTime, type WorkspaceSettings, type HourRow, type MonitorView } from '../lib/workspace';
+import { DroneStatus } from './DroneStatus';
 const format = (value: number | null | undefined) => value == null ? '暂无数据' : value.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
 const dateValue = hourTime;
 type ViewMode = 'chart' | 'table';
+type Range = 24 | 72 | 168 | 'today';
+const rangeOptions: Array<{ value: Range; label: string }> = [
+  { value: 'today', label: '今天' },
+  { value: 24, label: '最近 24 小时' },
+  { value: 72, label: '最近 3 天' },
+  { value: 168, label: '最近 7 天' },
+];
+const beijingDateKey = (timestamp: number) => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(new Date(timestamp));
+
+function RangePicker({ value, onChange }: { value: Range; onChange: (value: Range) => void }) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const selected = rangeOptions.find(option => option.value === value) ?? rangeOptions[1];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [open]);
+
+  return <div className="range-picker" ref={pickerRef}>
+    <span className="range-picker-label">时间范围</span>
+    <button type="button" className="range-picker-trigger" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(current => !current)}>
+      <span>{selected.label}</span>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+    </button>
+    {open && <div className="range-picker-menu" role="listbox" aria-label="时间范围">
+      {rangeOptions.map(option => <button type="button" role="option" aria-selected={option.value === value} className={option.value === value ? 'selected' : ''} key={option.value} onClick={() => { onChange(option.value); setOpen(false); }}>
+        <span>{option.label}</span>
+        {option.value === value && <span aria-hidden="true">✓</span>}
+      </button>)}
+    </div>}
+  </div>;
+}
+
 function MonitoringChart({ rows, settings }: { rows: HourRow[]; settings: WorkspaceSettings }) {
   const [activeTime, setActiveTime] = useState<number | null>(null);
   const chartRows = [...rows].sort((a, b) => dateValue(a.time) - dateValue(b.time));
@@ -68,7 +115,7 @@ function MonitoringChart({ rows, settings }: { rows: HourRow[]; settings: Worksp
   </div>;
 }
 
-type Props = { data: MonitorView | null; busy: boolean; ready: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void };
+type Props = { data: MonitorView | null; busy: boolean; ready: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void; onAir?: () => void; reportGenerating?: boolean };
 function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
   return <svg className={`refresh-icon${spinning ? ' is-spinning' : ''}`} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
     <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
@@ -77,56 +124,50 @@ function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
     <path d="M21 20v-5h-5" />
   </svg>;
 }
-export function MonitoringPanel({ data, busy, ready, started, action, onPrepare, onFlight }: Props) {
+export function MonitoringPanel({ data, busy, ready, started, action, onPrepare, onFlight, onAir, reportGenerating }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('chart');
-  const [range, setRange] = useState(24);
+  const [range, setRange] = useState<Range>(24);
   const latest = data?.rows[0];
   const quality = dataQuality(data);
   const settings = data?.settings ?? defaultSettings;
-  const rows = (data?.rows || []).filter(row => !latest || dateValue(row.time) >= dateValue(latest.time) - (range - 1) * 3600000);
-  const plan = data?.flight.event;
-  const pending = plan && !['dismissed', 'canceled'].includes(plan.status);
+  const today = beijingDateKey(Date.now());
+  const rows = (data?.rows || []).filter(row => {
+    if (range === 'today') return row.time.slice(0, 10) === today;
+    return !latest || dateValue(row.time) >= dateValue(latest.time) - (range - 1) * 3600000;
+  });
+  const { event: plan, records } = flightDisplay(data);
+  const pending = plan && !['dismissed', 'canceled', 'completed'].includes(plan.status);
   return <div className="monitoring-workspace">
-    <div className="page-heading"><div><span className="eyebrow">泰州市 · 小时监测</span><h2>最新监测数据</h2><p>江苏大气站 · 城市混合数据 · 北京时间</p></div></div>
+    <div className={`page-heading monitoring-heading ${quality.tone}`}><div>
+      <span className="eyebrow">泰州市 · 小时监测</span>
+      <h2>最新监测数据</h2>
+      <div className="heading-status">
+        <strong>{quality.detail}</strong>
+        <span>最近成功同步：{data?.lastSuccess || '尚未同步'}{latest ? ` · 本机最新记录 ${latest.time.slice(5, 16)}` : ''}</span>
+      </div>
+    </div><div className="sync-action-row"><button className="icon-button" aria-label={data?.syncing ? '正在同步' : '立即同步'} title={data?.syncing ? '正在同步' : '立即同步'} disabled={!ready || !started || busy || data?.syncing} onClick={() => void action('sync_monitoring')}><RefreshIcon spinning={data?.syncing} /></button></div></div>
     <div className="metric-grid">
       <article className={latest?.potassium == null || quality.label === '数据已过期' || latest.potassium > settings.potassiumThreshold ? 'metric-warning' : ''}><span>钾离子 K⁺ <small>μg/m³</small></span><strong>{format(latest?.potassium)}</strong><small>{latest?.potassium == null ? '无法判断是否触发巡查' : `巡查触发阈值 > ${format(settings.potassiumThreshold)}`}</small></article>
       <article className={`time-metric ${quality.tone === 'warning' ? 'metric-warning' : ''}`}><span>数据所属时间</span><strong>{latest?.time.slice(0, 16) || '暂无数据'}</strong><small>{quality.label} · {latest ? '北京时间' : '等待首次读取'}</small></article>
     </div>
-    <div className={`data-summary ${quality.tone}`}><strong>{quality.detail}</strong><p>最近成功同步：{data?.lastSuccess || '尚未同步'}。{latest ? `本机最新记录为 ${latest.time.slice(5,16)}。` : ''}同步成功不代表平台已经发布最新小时数据。</p></div>
-    <div className="sync-action-row"><button className="icon-button" aria-label={data?.syncing ? '正在同步' : '立即同步'} title={data?.syncing ? '正在同步' : '立即同步'} disabled={!ready || !started || busy || data?.syncing} onClick={() => void action('sync_monitoring')}><RefreshIcon spinning={data?.syncing} /></button></div>
-    {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>前往修复工作环境 →</button>}</div>}
-    {pending && <button className="task-callout" onClick={onFlight}><span><strong>{flightSummary(data, ready && started).title}</strong><small>{plan.name}</small></span><span>查看任务 →</span></button>}
-    <section className="data-card"><div className="chart-toolbar"><h3>小时变化趋势</h3><div className="button-row"><label className="range-select">时间范围 <select value={range} onChange={e => setRange(Number(e.target.value))}><option value={24}>最近 24 小时</option><option value={72}>最近 3 天</option><option value={168}>最近 7 天</option></select></label><div className="view-switcher-buttons" role="group" aria-label="数据展示方式"><button className={viewMode === 'chart' ? 'active' : ''} aria-pressed={viewMode === 'chart'} onClick={() => setViewMode('chart')}>图表</button><button className={viewMode === 'table' ? 'active' : ''} aria-pressed={viewMode === 'table'} onClick={() => setViewMode('table')}>表格</button></div></div></div>
-    {!rows.length ? <div className="empty-state"><h3>暂无数据</h3><p>完成准备向导后读取首批数据。</p><button className="secondary-button" onClick={onPrepare}>前往准备</button></div> : viewMode === 'chart' ? <MonitoringChart rows={rows} settings={settings} /> : <div className="hourly-table-wrap"><table className="hourly-table"><thead><tr><th>数据时间</th><th>K⁺（μg/m³）</th><th>数据状态</th></tr></thead><tbody>{rows.map((row, index) => { const older = rows[index + 1]; const gap = older ? (dateValue(row.time) - dateValue(older.time)) / 3600000 - 1 : 0; return <tr key={row.time}><td>{row.time.slice(0,16)}</td><td className={row.potassium != null && row.potassium > settings.potassiumThreshold ? 'missing-value' : ''}>{format(row.potassium)}</td><td className={row.potassium === null || gap > 0 ? 'missing-value' : ''}>{row.potassium === null ? '暂无数据' : '数据齐全'}{gap > 0 ? ` · 此前缺 ${gap} 小时` : ''}</td></tr>; })}</tbody></table></div>}
-    </section><p className="panel-footnote">已保存 {data?.total || 0} 条小时数据 · 保持客户端与 Chrome 运行 · 每 5 分钟检查数据</p>
-  </div>;
-}
-export function FlightPanel({ data, busy, ready, started, action, onPrepare }: Omit<Props, 'onFlight'>) {
-  const flight = data?.flight, plan = flight?.event;
-  const active = plan && !['dismissed', 'canceled'].includes(plan.status);
-  const blocked = !ready || !started || !data;
-  const summary = flightSummary(data, !blocked);
-  const weatherReady = weatherPasses(data?.weather);
-  const cancelable = plan && ['countdown', 'preparing'].includes(plan.status);
-  const archivable = active && !['countdown', 'preparing', 'submitting'].includes(plan.status);
-  const quality = dataQuality(data);
-  return <div className="flight-workspace"><div className="page-heading"><div><span className="eyebrow">无人机巡飞</span><h2>巡查任务</h2><p>自动巡飞在 K⁺ 超标后按设置准备巡查；手动起飞不受超标条件限制。</p></div></div>
-    <section className="setup-card"><div className="section-heading"><div><h3>{summary.title}</h3><p>{summary.detail}</p></div><span className={`badge ${['warning', 'danger'].includes(summary.tone) ? 'warning' : 'success'}`}>{flight?.enabled ? '自动巡飞' : '手动模式'}</span></div>
-      {active && <><p className="capture-help">{plan.name} · {plan.preview ? '填写演练，不起飞' : plan.source === 'manual' ? '手动发起' : `K⁺ ${format(plan.potassium)} μg/m³ · ${plan.observedAt.slice(0,16)}`}</p>{plan.error && <p className="notice warning" role="alert">{plan.error}</p>}</>}
-      {!active && quality.tone === 'warning' && quality.label !== 'K⁺ 超过巡查阈值' && <p className="capture-help">等待有效监测数据：{quality.detail}。工作环境就绪后仍可手动起飞。</p>}
-      <div className="button-row">
-        {cancelable && <button className="secondary-button" onClick={() => void action('cancel_flight', { eventId: plan.id })}>取消任务</button>}
-        {!active && <button className="primary-button" disabled={busy || blocked || !weatherReady} onClick={() => void action('launch_flight')}>手动起飞</button>}
-        {active && !cancelable && <button className="secondary-button" disabled={busy} onClick={() => void action('open_prepared_flight')}>前往司空查看 ↗</button>}
-        {archivable && <button className="secondary-button" disabled={busy} onClick={() => void action('dismiss_flight', { eventId: plan.id })}>已核查司空，归档任务</button>}
-        {blocked && <button className="text-button" onClick={onPrepare}>完成工作准备 →</button>}
-      </div>
-      <p className="capture-help">提交成功仅表示巡飞计划已创建，实际起飞、飞行和返航状态以司空为准。归档不会终止正在执行的飞行。</p>
+    {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>查看运行状态 →</button>}</div>}
+    <section id="monitoring-task-details" className={`task-details ${pending ? 'task-callout' : 'data-card'}`} aria-label="巡查任务详情">
+      <div className="section-heading"><h3>巡查任务</h3><button className="text-button" onClick={onFlight}>查看任务 →</button></div>
+      <DroneStatus data={data} ready={ready} started={started} busy={busy} action={action} onFlight={onFlight} onAir={onAir} reportGenerating={reportGenerating} />
+      {pending && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>
+        {plan.status === 'failed' && <p>本次未发送起飞请求。请人工核验电量、设备状态和平台提示；系统回执不足以确认具体设备故障。</p>}
+        {plan.status === 'restricted' && <p>{plan.error}</p>}
+        {(plan.status === 'failed' || plan.status === 'uncertain' || plan.status === 'flight_error' || plan.status === 'not_flown') && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
+      </div>}
+      {plan && !plan.preview && ['ready', 'submitted', 'uncertain', 'flying', 'paused', 'completed', 'flight_error', 'not_flown'].includes(plan.status) && <div className="task-details-copy" role="status">
+        {plan.statusCheckedAt ? <p>最近核查：{new Date(plan.statusCheckedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间） · {plan.statusCheckError ? '核查未完成' : plan.status === 'uncertain' ? '已读取司空任务，起飞结果仍待核查' : '已更新任务状态'}</p> : <p>尚未取得司空状态核查结果。</p>}
+        {plan.statusCheckError && <p>司空核查：{plan.statusCheckError}</p>}
+        {plan.status === 'uncertain' && <p>手动刷新后，若司空仍未识别到任务状态，将保留历史记录并恢复起飞入口；再次起飞前请核对平台任务。</p>}
+      </div>}
+      {!!records.length && <details className="task-records"><summary>最近巡查记录（{records.length}）</summary><ul>{records.map(record => <li key={record.id}><strong>{record.observedAt.slice(0, 16)}{record.resolvedAt ? ' · 已结束处理' : ''} · {record.status === 'restricted' ? '禁飞时间 · 仅记录' : record.status === 'failed' ? '起飞未完成 · 待人工核验' : record.status === 'completed' ? '巡飞已结束' : record.status === 'uncertain' ? '起飞结果未确认 · 历史记录' : '历史任务'}</strong><p>{record.name}{record.potassium != null ? ` · K⁺ ${format(record.potassium)} μg/m³` : ''}</p>{record.status === 'restricted' ? <p>{record.error}</p> : record.error && <details><summary>查看原始回执</summary><p>{record.error}</p></details>}{record.statusCheckError && <p>司空核查：{record.statusCheckError}</p>}</li>)}</ul></details>}
     </section>
-    <section className="setup-card"><div className="section-heading"><div><h3>自动巡飞设置</h3><p>K⁺ &gt; {flight?.threshold ?? 1} μg/m³ 时{data?.settings?.requireManualConfirmation ? '直接填写计划，等待在司空人工确认。' : '启动倒计时，结束后自动提交，期间可取消任务。'}</p></div><label className="flight-auto-setting"><input type="checkbox" checked={flight?.enabled ?? false} disabled={!data || busy || (blocked && !flight?.enabled)} onChange={e => void action('set_flight_enabled', { enabled: e.target.checked })}/>自动巡飞</label></div>
-      {!data?.settings?.requireManualConfirmation && <p className="flight-delay-setting">起飞延迟：<strong>{data?.settings?.takeoffDelayMinutes ?? 5} 分钟</strong> · 自动提交。可在右上角「设置」中修改。</p>}
-      <p className="capture-help">连续超标只触发一次；取消后本轮不再自动触发。有效 K⁺ 恢复正常后，下一轮超标可重新触发。缺测、过期或未来数据不会自动起飞。修改延迟用于下一次任务。</p>
+    <section className="data-card"><div className="chart-toolbar"><h3>小时变化趋势</h3><div className="button-row"><RangePicker value={range} onChange={setRange} /><div className="view-switcher-buttons" role="group" aria-label="数据展示方式"><button className={viewMode === 'chart' ? 'active' : ''} aria-pressed={viewMode === 'chart'} onClick={() => setViewMode('chart')}>图表</button><button className={viewMode === 'table' ? 'active' : ''} aria-pressed={viewMode === 'table'} onClick={() => setViewMode('table')}>表格</button></div></div></div>
+    {!rows.length ? <div className="empty-state"><h3>暂无数据</h3><p>环境就绪后将自动读取首批数据。</p><button className="secondary-button" onClick={onPrepare}>查看运行状态</button></div> : viewMode === 'chart' ? <MonitoringChart rows={rows} settings={settings} /> : <div className="hourly-table-wrap"><table className="hourly-table"><thead><tr><th>数据时间</th><th>K⁺（μg/m³）</th><th>数据状态</th></tr></thead><tbody>{rows.map((row, index) => { const older = rows[index + 1]; const gap = older ? (dateValue(row.time) - dateValue(older.time)) / 3600000 - 1 : 0; return <tr key={row.time}><td>{row.time.slice(0,16)}</td><td className={row.potassium != null && row.potassium > settings.potassiumThreshold ? 'missing-value' : ''}>{format(row.potassium)}</td><td className={row.potassium === null || gap > 0 ? 'missing-value' : ''}>{row.potassium === null ? '暂无数据' : '数据齐全'}{gap > 0 ? ` · 此前缺 ${gap} 小时` : ''}</td></tr>; })}</tbody></table></div>}
     </section>
-    <details className="advanced-panel"><summary>航线与填写演练</summary><p>东南火点巡查航线 · 泰州环境监测 Dock 3 · Matrice 4TD · 高精度 RTK · 返航高度 110 米</p><p>手动起飞使用同一航线，不要求 K⁺ 超标；司空自身的设备、空域和飞行检查仍然有效。</p><button className="secondary-button" disabled={!data || blocked || !weatherReady || busy || !!active} onClick={() => void action('prepare_flight', { preview: true })}>演练计划填写</button></details>
   </div>;
 }

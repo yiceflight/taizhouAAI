@@ -207,6 +207,11 @@ struct Completion {
     data: Option<Value>,
     error: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelFlight {
+    event_id: String,
+}
 async fn complete(
     State(bridge): State<Bridge>,
     headers: HeaderMap,
@@ -233,7 +238,7 @@ async fn complete(
     Ok(Json(json!({ "ok": true })))
 }
 impl Bridge {
-    pub fn start(&self) {
+    pub fn start(&self, app: tauri::AppHandle) {
         let bridge = self.clone();
         tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(ADDRESS).await {
@@ -248,6 +253,14 @@ impl Bridge {
             let router = Router::new()
                 .route("/heartbeat", post(heartbeat))
                 .route("/complete", post(complete))
+                .route("/cancel-flight", post(move |headers: HeaderMap, Json(input): Json<CancelFlight>| {
+                    let app = app.clone();
+                    async move {
+                        if !authorized(&headers) { return Err(StatusCode::FORBIDDEN); }
+                        crate::flight::cancel_flight(app, input.event_id).map_err(|_| StatusCode::CONFLICT)?;
+                        Ok::<_, StatusCode>(Json(json!({"ok":true})))
+                    }
+                }))
                 .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
                 .layer(middleware::from_fn(cors))
                 .with_state(bridge.clone());
@@ -279,11 +292,28 @@ impl Bridge {
             error: inner.error.clone(),
         }
     }
+    pub fn single_session(&self) -> Result<String, String> {
+        let mut inner = self.0.lock().unwrap();
+        prune(&mut inner);
+        let sessions: Vec<_> = inner
+            .clients
+            .iter()
+            .filter(|(_, client)| crate::readiness::compatible(&client.version))
+            .map(|(session, _)| session.clone())
+            .collect();
+        if sessions.len() != 1 {
+            return Err(format!(
+                "请连接且仅保留一个 v{} 或以上 Chrome 桥接插件会话。",
+                crate::readiness::MIN_VERSION
+            ));
+        }
+        Ok(sessions[0].clone())
+    }
     pub async fn capture(&self, session: String, tab_id: i64) -> Result<Value, String> {
         self.request(session, tab_id, json!({"type": "capture"}))
             .await
     }
-    pub fn hourly_target(&self) -> Result<(String, i64), String> {
+    pub fn hourly_target(&self, verified: &crate::readiness::SiteHealth) -> Result<(String, i64), String> {
         let mut inner = self.0.lock().unwrap();
         prune(&mut inner);
         let mut targets: Vec<_> = inner
@@ -296,7 +326,11 @@ impl Bridge {
                     .filter(move |tab| {
                         crate::readiness::compatible(&client.version)
                             && tab.status == "complete"
-                            && tab.url.split('?').next() == Some(crate::monitoring::SOURCE_URL)
+                            && crate::monitoring::source_page(&tab.url)
+                            && verified.state == "ready"
+                            && verified.session.as_deref() == Some(session.as_str())
+                            && verified.tab_id == Some(tab.id)
+                            && verified.url.as_deref() == Some(tab.url.as_str())
                     })
                     .map(move |tab| (session.clone(), tab.id))
             })
@@ -304,18 +338,29 @@ impl Bridge {
         targets.sort();
         targets.into_iter().next().ok_or_else(|| {
             format!(
-                "请连接 v{} 或以上插件，登录江苏大气站并保持时间序列页面打开。",
+                "请连接 v{} 或以上插件并完成江苏大气站登录，系统会直接验证数据接口；如持续未就绪，请重新验证。",
                 crate::readiness::MIN_VERSION
             )
         })
     }
-    pub async fn prepare_flight(&self, event_id: &str, name: &str) -> Result<Value, String> {
-        self.flight_job(event_id, name, false).await
+    pub async fn prepare_flight(&self, event_id: &str, name: &str, auto_submit: bool) -> Result<Value, String> {
+        self.flight_job(event_id, name, false, auto_submit).await
     }
     pub async fn submit_flight(&self, event_id: &str, name: &str) -> Result<Value, String> {
-        self.flight_job(event_id, name, true).await
+        self.flight_job(event_id, name, true, false).await
     }
-    async fn flight_job(&self, event_id: &str, name: &str, submit: bool) -> Result<Value, String> {
+    pub async fn flight_status(&self, event_id: &str, name: &str) -> Result<Value, String> {
+        let session = {
+            let mut inner = self.0.lock().unwrap();
+            prune(&mut inner);
+            let sessions: Vec<_> = inner.clients.iter().filter(|(_, client)| crate::readiness::compatible(&client.version)).map(|(id, _)| id.clone()).collect();
+            if sessions.len() != 1 { return Err("请连接唯一的兼容 Chrome 插件以读取司空任务状态。".into()); }
+            sessions[0].clone()
+        };
+        if event_id.is_empty() || name.is_empty() { return Err("司空任务状态参数无效。".into()); }
+        self.request(session, -1, json!({"type":"dji-status","eventId":event_id,"name":name,"submit":false})).await
+    }
+    async fn flight_job(&self, event_id: &str, name: &str, submit: bool, auto_submit: bool) -> Result<Value, String> {
         let session = {
             let mut inner = self.0.lock().unwrap();
             prune(&mut inner);
@@ -337,15 +382,18 @@ impl Bridge {
         self.request(
             session,
             -1,
-            json!({"type": if submit { "dji-submit" } else { "dji-prepare" }, "eventId":event_id, "name":name, "submit":submit}),
+            json!({"type": if submit { "dji-submit" } else { "dji-prepare" }, "eventId":event_id, "name":name, "submit":submit, "autoSubmit":auto_submit}),
         )
         .await
     }
     pub async fn request(&self, session: String, tab_id: i64, job: Value) -> Result<Value, String> {
-        let timeout = if job["type"] == "site-health" {
-            // Three checks share one heartbeat and are executed serially by
-            // the extension (up to 15 seconds each, plus heartbeat delivery).
-            55
+        let timeout = if ["site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
+            .iter()
+            .any(|kind| job["type"] == *kind)
+        {
+            // Checks share one heartbeat and execute serially. Include both
+            // background page preparation and the read-only API checks.
+            120
         } else {
             100
         };
@@ -364,7 +412,15 @@ impl Bridge {
             if !crate::readiness::compatible(&client.version) {
                 return Err(format!("浏览器插件必须更新：当前 v{}，需要 v{} 或以上。请在 Chrome 扩展管理页重新加载插件。", client.version, crate::readiness::MIN_VERSION));
             }
-            if job["type"] != "dji-prepare" && job["type"] != "dji-submit" && job["type"] != "dji-open-prepared" {
+            if job["type"] != "dji-prepare"
+                && job["type"] != "dji-submit"
+                && job["type"] != "dji-open-prepared"
+                && job["type"] != "dji-status"
+                && job["type"] != "airins-realtime"
+                && job["type"] != "airins-health-open"
+                && job["type"] != "dji-health-open"
+                && job["type"] != "jiangsu-health"
+            {
                 let tab = client
                     .tabs
                     .iter()
@@ -373,7 +429,20 @@ impl Bridge {
                 if tab.status != "complete" {
                     return Err("页面尚未加载完成，请稍后重试。".into());
                 }
-            } else if tab_id != -1 || job["submit"] != (job["type"] == "dji-submit") {
+            } else if (job["type"] == "airins-health-open" || job["type"] == "dji-health-open")
+                && (tab_id != -1 || job.as_object().is_none_or(|value| value.len() != 1))
+            {
+                return Err("后台网站验证任务参数无效。".into());
+            } else if job["type"] == "jiangsu-health"
+                && (tab_id < -1 || job.as_object().is_none_or(|value| value.len() != 1))
+            {
+                return Err("江苏大气站验证任务参数无效。".into());
+            } else if job["type"] != "airins-realtime"
+                && job["type"] != "airins-health-open"
+                && job["type"] != "dji-health-open"
+                && job["type"] != "jiangsu-health"
+                && (tab_id != -1 || job["submit"] != (job["type"] == "dji-submit"))
+            {
                 return Err("司空任务类型与提交标记不匹配。".into());
             }
             inner.pending.insert(
@@ -404,6 +473,28 @@ pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hourly_target_uses_the_api_verified_tab_and_rejects_navigation() {
+        let bridge = Bridge::default();
+        let url = "http://61.155.4.60:18080/#/home/map";
+        bridge.0.lock().unwrap().clients.insert("session".into(), Client {
+            version: crate::readiness::MIN_VERSION.into(),
+            last_seen: Instant::now(),
+            tabs: [1, 2].into_iter().map(|id| BrowserTab {
+                id, title: "fixture".into(), url: url.into(), status: "complete".into(),
+            }).collect(),
+        });
+        let mut verified = crate::readiness::SiteHealth {
+            id: "map".into(), state: "ready".into(), message: "fixture".into(),
+            checked_at: None, session: Some("session".into()), tab_id: Some(2), url: Some(url.into()),
+        };
+        assert_eq!(bridge.hourly_target(&verified).unwrap(), ("session".into(), 2));
+        verified.url = Some("http://61.155.4.60:18080/#/login".into());
+        assert!(bridge.hourly_target(&verified).is_err());
+        verified.url = Some(url.into());
+        verified.state = "login_required".into();
+        assert!(bridge.hourly_target(&verified).is_err());
+    }
     #[test]
     fn rejects_untrusted_urls() {
         assert!(allowed_url("https://fh.dji.com/project"));
@@ -468,6 +559,45 @@ mod tests {
         );
         prune(&mut inner);
         assert!(inner.clients.is_empty());
+    }
+    #[test]
+    fn background_site_health_jobs_require_fixed_parameters_and_allow_missing_tabs() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let session = Uuid::new_v4().to_string();
+            bridge.0.lock().unwrap().clients.insert(
+                session.clone(),
+                Client {
+                    version: crate::readiness::MIN_VERSION.into(),
+                    tabs: vec![],
+                    last_seen: Instant::now(),
+                },
+            );
+            for kind in ["airins-health-open", "dji-health-open", "jiangsu-health"] {
+                let invalid_tab = if kind == "jiangsu-health" { -2 } else { 1 };
+                for (tab_id, job) in [
+                    (invalid_tab, json!({"type":kind})),
+                    (-1, json!({"type":kind,"url":"https://example.test"})),
+                    (-1, json!({"type":kind,"submit":true})),
+                ] {
+                    assert!(bridge.request(session.clone(), tab_id, job).await.is_err());
+                }
+                let pending_bridge = bridge.clone();
+                let pending_session = session.clone();
+                let task = tauri::async_runtime::spawn(async move {
+                    pending_bridge.request(pending_session, -1, json!({"type":kind})).await
+                });
+                for _ in 0..100 {
+                    if bridge.busy() { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let pending = bridge.0.lock().unwrap().pending.drain().next().unwrap().1;
+                assert_eq!(pending.tab_id, -1);
+                assert_eq!(pending.job["type"], kind);
+                pending.result.send(Ok(json!({"state":"ready"}))).unwrap();
+                assert_eq!(task.await.unwrap().unwrap()["state"], "ready");
+            }
+        });
     }
     #[test]
     fn old_plugin_is_visible_but_cannot_receive_work_and_recovers_after_reload() {
@@ -558,7 +688,7 @@ mod tests {
             let batch_session = session.clone();
             let batch = tauri::async_runtime::spawn(async move {
                 tokio::join!(
-                    batch_bridge.request(batch_session.clone(), 0, json!({"type":"site-health"})),
+                    batch_bridge.request(batch_session.clone(), 0, json!({"type":"jiangsu-health"})),
                     batch_bridge.request(batch_session.clone(), 1, json!({"type":"site-health"})),
                     batch_bridge.request(batch_session, 2, json!({"type":"site-health"})),
                 )

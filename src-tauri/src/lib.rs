@@ -1,4 +1,5 @@
 use std::process::Command;
+use tauri::Manager;
 
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -67,6 +68,22 @@ fn open_business_site(url: String) -> Result<(), String> {
     open_in_chrome(&url)
 }
 
+#[tauri::command]
+async fn open_airins_realtime(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let bridge = app.state::<bridge::Bridge>();
+    let snapshot = bridge.status();
+    let session = snapshot
+        .tabs
+        .iter()
+        .find(|tab| tab.tab.url.starts_with("https://aai.airins.cn/sniff"))
+        .map(|tab| (tab.session.clone(), tab.tab.id));
+    let (session, tab_id) = match session {
+        Some(target) => target,
+        None => (bridge.single_session()?, -1),
+    };
+    bridge.request(session, tab_id, serde_json::json!({"type":"airins-realtime"})).await
+}
+
 #[cfg(all(dev, target_os = "macos"))]
 fn set_dev_app_icon() {
     use objc2::{AllocAnyThread, MainThreadMarker};
@@ -94,7 +111,7 @@ pub fn run() {
         .manage(weather::Weather::default())
         .setup(|app| {
             use tauri::Manager;
-            app.state::<bridge::Bridge>().start();
+            app.state::<bridge::Bridge>().start(app.handle().clone());
             readiness::start(app.handle().clone());
             flight::initialize(app.handle()).map_err(std::io::Error::other)?;
             monitoring::start(app.handle().clone());
@@ -117,6 +134,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_chrome_extensions,
             open_business_site,
+            open_airins_realtime,
             extension::get_extension_directory,
             extension::open_extension_directory,
             bridge::get_bridge_status,
@@ -130,13 +148,19 @@ pub fn run() {
             flight::set_flight_delay,
             flight::cancel_flight,
             flight::launch_flight,
+            flight::refresh_flight_status,
             flight::prepare_flight,
             flight::dismiss_flight,
+            flight::resolve_flight,
             flight::open_prepared_flight,
             monitoring::sync_monitoring,
             monitoring::set_monitoring_enabled,
             reports::generate_report,
             flight_report::list_flight_missions,
+            flight_report::list_flight_reasons,
+            flight_report::set_flight_reason,
+            flight_weather::list_flight_weather,
+            flight_weather::enrich_flight_weather,
             flight_report::collect_flight_report,
             flight_report::save_flight_report,
             flight_report::list_flight_reports,
@@ -169,6 +193,7 @@ mod updates;
 
 mod monitoring;
 mod settings;
+mod flight_weather;
 
 mod flight;
 

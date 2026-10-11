@@ -1,10 +1,12 @@
 //! Post-flight reports: fixed browser adapters, validated task data, native DOCX output.
-use crate::bridge::Bridge;
+use crate::{bridge::Bridge, monitoring::database};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use rusqlite::params;
 use std::{
+    collections::HashMap,
     fs,
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
@@ -82,6 +84,45 @@ pub struct Summary {
     pub photo_count: usize,
     pub point_count: usize,
     pub warning: String,
+    #[serde(default)]
+    pub mission: Option<Mission>,
+    #[serde(default)]
+    pub air_url: String,
+    #[serde(default)]
+    pub media_url: String,
+}
+const REASONS: &[&str] = &["dji_scheduled", "potassium_manual", "potassium_auto", "manual_immediate"];
+
+fn list_reasons(db: &rusqlite::Connection) -> Result<HashMap<String, String>, String> {
+    let mut statement = db.prepare("SELECT mission_id, reason FROM flight_mission_reasons").map_err(|e| e.to_string())?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
+    rows.map(|row| row.map(|(id, reason)| (id.to_string(), reason)).map_err(|e| e.to_string())).collect()
+}
+
+fn set_reason(db: &rusqlite::Connection, mission_id: u64, reason: &str) -> Result<(), String> {
+    if mission_id == 0 || mission_id > i64::MAX as u64 || (!reason.is_empty() && !REASONS.contains(&reason)) {
+        return Err("任务原因或编号无效。".into());
+    }
+    if reason.is_empty() {
+        db.execute("DELETE FROM flight_mission_reasons WHERE mission_id=?1", [mission_id]).map_err(|e| e.to_string())?;
+    } else {
+        db.execute(
+            "INSERT INTO flight_mission_reasons(mission_id,reason,updated_at) VALUES (?1,?2,?3)
+             ON CONFLICT(mission_id) DO UPDATE SET reason=excluded.reason,updated_at=excluded.updated_at",
+            params![mission_id, reason, chrono::Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_flight_reasons(app: tauri::AppHandle) -> Result<HashMap<String, String>, String> {
+    list_reasons(&database(&app)?)
+}
+
+#[tauri::command]
+pub fn set_flight_reason(app: tauri::AppHandle, mission_id: u64, reason: String) -> Result<(), String> {
+    set_reason(&database(&app)?, mission_id, &reason)
 }
 #[derive(Debug)]
 struct Stats {
@@ -147,7 +188,7 @@ fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
         }
         let t = photo_time(name)?;
         if t < m.start_time - 300000 || t > m.end_time + 300000 {
-            return Err("司空照片与所选可飞任务时间不匹配，请选择同一航次。".into());
+            return Err("司空照片与本次可飞任务时间不匹配，已停止生成。".into());
         }
         let (bytes, _) = decode_image(&p.data_url)?;
         let (width, height) = image_dimensions(&bytes)?;
@@ -325,23 +366,25 @@ pub async fn collect_flight_report(
             .await?,
     )
     .map_err(|e| format!("可飞格式错误：{e}"))?;
-    let media: Media = serde_json::from_value(
-        bridge
-            .request(
-                req.dji_session.clone(),
-                req.dji_tab_id,
-                json!({"type":"flight-dji-list"}),
-            )
-            .await?,
-    )
-    .map_err(|e| format!("司空格式错误：{e}"))?;
+    let media_value = bridge
+        .request(
+            req.dji_session.clone(),
+            req.dji_tab_id,
+            json!({"type":"flight-dji-list","startTime":req.mission.start_time,"endTime":req.mission.end_time}),
+        )
+        .await?;
+    if media_value["matchedStartTime"].as_i64() != Some(req.mission.start_time) {
+        return Err("浏览器插件尚不支持按时间自动匹配，请更新并重新加载插件后重试。".into());
+    }
+    let media: Media = serde_json::from_value(media_value)
+        .map_err(|e| format!("司空格式错误：{e}"))?;
     source(&air.url, false)?;
     source(&media.url, true)?;
     let mut photos = vec![];
     for name in &media.files {
         let t = photo_time(name)?;
         if t < req.mission.start_time - 300000 || t > req.mission.end_time + 300000 {
-            return Err("照片不属于所选可飞航次，请重新选择。".into());
+            return Err("照片不属于本次可飞航次，已停止采集。".into());
         }
         let v = bridge
             .request(
@@ -566,6 +609,14 @@ fn build_docx(data: &Collected, charts: &[String; 2], issued: i64, pm25_threshol
     Ok(zip.finish().map_err(|e| e.to_string())?.into_inner())
 }
 fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: f64) -> Result<Summary, String> {
+    // Serialize the lookup and commit so concurrent requests cannot create two reports.
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().map_err(|_| "报告保存锁异常，请重试")?;
+    if let Some(existing) = read_summaries(root)?.into_iter().find(|s| {
+        s.mission.as_ref().is_some_and(|m| m.mission_id == data.mission.mission_id)
+    }) {
+        return Ok(existing);
+    }
     let now = Utc::now().timestamp_millis();
     let stats = validate(data, now)?;
     let bytes = build_docx(data, charts, now, pm25_threshold)?;
@@ -580,6 +631,7 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
         );
         let summary = Summary {
             id: id.clone(),
+            mission: Some(data.mission.clone()),
             created_at: now,
             title: data.mission.mission_name.clone(),
             path: dest.join(&name).to_string_lossy().into_owned(),
@@ -590,6 +642,8 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             } else {
                 String::new()
             },
+            air_url: data.air.url.clone(),
+            media_url: data.media.url.clone(),
         };
         fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&serde_json::json!({"pm25Threshold": pm25_threshold})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join(&name), bytes).map_err(|e| e.to_string())?;
@@ -640,19 +694,39 @@ pub async fn save_flight_report(
 }
 #[tauri::command]
 pub fn list_flight_reports(app: tauri::AppHandle) -> Result<Vec<Summary>, String> {
+    read_summaries(&root(&app)?)
+}
+fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
     let mut items = vec![];
-    for item in fs::read_dir(root(&app)?).map_err(|e| e.to_string())? {
+    for item in fs::read_dir(root).map_err(|e| e.to_string())? {
         let p = item.map_err(|e| e.to_string())?.path();
         if Uuid::parse_str(p.file_name().unwrap_or_default().to_string_lossy().as_ref()).is_err() {
             continue;
         }
         if let Ok(b) = fs::read(p.join("summary.json")) {
-            if let Ok(summary) = serde_json::from_slice::<Summary>(&b) {
+            if let Ok(mut summary) = serde_json::from_slice::<Summary>(&b) {
+                // Older reports stored the mission only in source.json. Recover the
+                // association and platform URLs without rewriting or deleting files.
+                if let Ok(bytes) = fs::read(p.join("source.json")) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if summary.mission.is_none() {
+                            summary.mission = serde_json::from_value(value["mission"].clone()).ok();
+                        }
+                        if summary.air_url.is_empty() {
+                            summary.air_url = value["air"]["url"].as_str().unwrap_or_default().to_string();
+                        }
+                        if summary.media_url.is_empty() {
+                            summary.media_url = value["media"]["url"].as_str().unwrap_or_default().to_string();
+                        }
+                    }
+                }
                 items.push(summary);
             }
         }
     }
-    items.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|s| s.mission.as_ref().is_none_or(|m| seen.insert(m.mission_id)));
     Ok(items)
 }
 #[tauri::command]
@@ -675,6 +749,20 @@ pub fn open_flight_report(app: tauri::AppHandle, id: String) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mission_reasons_are_validated_and_persisted_by_airins_id() {
+        let db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        assert!(list_reasons(&db).unwrap().is_empty());
+        set_reason(&db, 12, "dji_scheduled").unwrap();
+        set_reason(&db, 13, "potassium_manual").unwrap();
+        assert_eq!(list_reasons(&db).unwrap()["12"], "dji_scheduled");
+        assert_eq!(list_reasons(&db).unwrap()["13"], "potassium_manual");
+        assert!(set_reason(&db, 12, "unknown").is_err());
+        assert!(set_reason(&db, 0, "dji_scheduled").is_err());
+        assert_eq!(list_reasons(&db).unwrap()["12"], "dji_scheduled");
+        set_reason(&db, 12, "").unwrap();
+        assert!(!list_reasons(&db).unwrap().contains_key("12"));
+    }
     fn sample() -> Collected {
         let start = 1790031680000;
         Collected {
@@ -738,7 +826,16 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let a = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
         let b = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
-        assert_ne!(a.path, b.path);
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.air_url, d.air.url);
+        assert_eq!(a.media_url, d.media.url);
+        assert_eq!(read_summaries(&root).unwrap().len(), 1);
+        let mut another = d.clone();
+        another.mission.mission_id = 2;
+        another.air.mission_id = 2;
+        let c = persist(&root, &another, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        assert_ne!(a.id, c.id);
+        assert_eq!(read_summaries(&root).unwrap().len(), 2);
         let mut z = zip::ZipArchive::new(Cursor::new(fs::read(&a.path).unwrap())).unwrap();
         let mut xml = String::new();
         z.by_name("word/document.xml")
@@ -750,6 +847,49 @@ mod tests {
         assert!(xml.contains("测试任务 &lt;&amp;&gt;"));
         assert!(xml.contains("48.0"));
         assert!(root.join(&a.id).join("source.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_reports_recover_missions_and_keep_only_latest_without_deleting_files() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let data = sample();
+        let old = persist(&root, &data, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        let mut legacy = serde_json::to_value(&old).unwrap();
+        legacy.as_object_mut().unwrap().remove("mission");
+        legacy.as_object_mut().unwrap().remove("airUrl");
+        legacy.as_object_mut().unwrap().remove("mediaUrl");
+        fs::write(root.join(&old.id).join("summary.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let dir = root.join(&id);
+        fs::create_dir(&dir).unwrap();
+        legacy["id"] = json!(id);
+        legacy["createdAt"] = json!(old.created_at + 1000);
+        fs::write(dir.join("summary.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(dir.join("source.json"), serde_json::to_vec(&data).unwrap()).unwrap();
+        let reports = read_summaries(&root).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, id);
+        assert_eq!(reports[0].mission.as_ref().unwrap().mission_id, 1);
+        assert_eq!(reports[0].media_url, data.media.url);
+        assert!(root.join(&old.id).join("summary.json").is_file());
+        assert_eq!(persist(&root, &data, &[PNG.into(), PNG.into()], 60.0).unwrap().id, id);
+        // An old report whose source is unavailable must remain accessible.
+        fs::remove_file(dir.join("source.json")).unwrap();
+        assert_eq!(read_summaries(&root).unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn concurrent_saves_return_the_same_report() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let jobs: Vec<_> = (0..4).map(|_| {
+            let root = root.clone();
+            std::thread::spawn(move || persist(&root, &sample(), &[PNG.into(), PNG.into()], 60.0).unwrap().id)
+        }).collect();
+        let ids: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        assert_eq!(read_summaries(&root).unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

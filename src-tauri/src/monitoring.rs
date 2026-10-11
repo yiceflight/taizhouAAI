@@ -12,8 +12,19 @@ use std::{
 };
 use tauri::Manager;
 
+#[cfg(test)]
 pub const SOURCE_URL: &str =
     "http://61.155.4.60:18080/#/particle-analysis/feature-analysis/time-series";
+pub fn source_page(url: &str) -> bool {
+    tauri::Url::parse(url).is_ok_and(|u| {
+        u.origin().ascii_serialization() == "http://61.155.4.60:18080"
+            && ![u.path(), u.fragment().unwrap_or("")].iter().any(|part| {
+                part.split(['/', '?', '#']).any(|segment| {
+                    segment.eq_ignore_ascii_case("login") || segment.eq_ignore_ascii_case("signin")
+                })
+            })
+    })
+}
 const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 #[derive(Default)]
 pub struct Monitor {
@@ -67,7 +78,15 @@ pub(crate) fn connect(path: &Path) -> Result<Connection, String> {
             unit TEXT NOT NULL, source_url TEXT NOT NULL, data_source TEXT NOT NULL,
             common_site_type TEXT NOT NULL, synced_at TEXT NOT NULL,
             PRIMARY KEY(city_code, observed_at));
-        CREATE TABLE IF NOT EXISTS monitor_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        CREATE TABLE IF NOT EXISTS monitor_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS flight_mission_reasons (
+            mission_id INTEGER PRIMARY KEY CHECK(mission_id > 0),
+            reason TEXT NOT NULL,
+            updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS flight_mission_weather (
+            mission_id INTEGER PRIMARY KEY CHECK(mission_id > 0),
+            start_time INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL);",
     )
     .map_err(|e| e.to_string())?;
     Ok(db)
@@ -121,7 +140,7 @@ fn window(db: &Connection) -> Result<(String, String), String> {
     ))
 }
 fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<(), String> {
-    if batch.url.split('?').next() != Some(SOURCE_URL)
+    if !source_page(&batch.url)
         || batch.city != "泰州市"
         || batch.city_code != "321200"
         || batch.unit != "μg/m³"
@@ -157,8 +176,8 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
     for row in batch.rows {
         tx.execute("INSERT INTO hourly_observations(city_code,observed_at,potassium,pm25,unit,source_url,data_source,common_site_type,synced_at)
             VALUES ('321200',?,?,?,?,?,'A_6','30',?) ON CONFLICT(city_code,observed_at) DO UPDATE SET
-            potassium=excluded.potassium,pm25=excluded.pm25,synced_at=excluded.synced_at",
-            params![row.time, row.potassium, Option::<f64>::None, batch.unit, SOURCE_URL, synced]).map_err(|e| e.to_string())?;
+            potassium=excluded.potassium,pm25=excluded.pm25,source_url=excluded.source_url,synced_at=excluded.synced_at",
+            params![row.time, row.potassium, Option::<f64>::None, batch.unit, batch.url, synced]).map_err(|e| e.to_string())?;
     }
     put(&tx, "query_through", end)?;
     put(&tx, "last_success", &synced)?;
@@ -182,7 +201,10 @@ async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String
     let result = async {
         let (start, end) = window(&database(app)?)?;
         let bridge = app.state::<Bridge>();
-        let (session, tab) = bridge.hourly_target()?;
+        let readiness = crate::readiness::view(app);
+        let verified = readiness.sites.iter().find(|site| site.id == "map" && site.state == "ready")
+            .ok_or("江苏大气站尚未通过 API 验证，请重新验证登录状态。")?;
+        let (session, tab) = bridge.hourly_target(verified)?;
         let raw = bridge
             .request(
                 session,
@@ -295,6 +317,19 @@ mod tests {
         persist(db, data, "2026-09-16 00:00:00", "2026-09-17 00:00:00")
     }
     #[test]
+    fn api_batches_accept_map_and_reject_login_and_foreign_origins() {
+        let mut db = connect(Path::new(":memory:")).unwrap();
+        let mut data = batch(json!([{ "time": "2026-09-16 01:00:00", "potassium": 0.38 }]));
+        data.url = "http://61.155.4.60:18080/#/home/map".into();
+        save(&mut db, data).unwrap();
+        assert_eq!(db.query_row("SELECT source_url FROM hourly_observations", [], |r| r.get::<_, String>(0)).unwrap(), "http://61.155.4.60:18080/#/home/map");
+        for url in ["http://61.155.4.60:18080/#/login", "http://61.155.4.60:18080/login", "http://61.155.4.60.evil.test:18080/#/home/map", "https://61.155.4.60:18080/#/home/map"] {
+            let mut data = batch(json!([]));
+            data.url = url.into();
+            assert!(save(&mut db, data).is_err());
+        }
+    }
+    #[test]
     fn hourly_upsert_survives_restart_and_invalid_batch_is_atomic() {
         let path = std::env::temp_dir().join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
         let mut db = connect(&path).unwrap();
@@ -338,6 +373,32 @@ mod tests {
         );
         drop(db);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn latest_missing_hours_are_persisted_and_later_backfilled_without_duplicates() {
+        let mut db = connect(Path::new(":memory:")).unwrap();
+        save(&mut db, batch(json!([
+            {"time":"2026-09-16 11:00:00","potassium":0.03},
+            {"time":"2026-09-16 12:00:00","potassium":null},
+            {"time":"2026-09-16 13:00:00","potassium":null},
+            {"time":"2026-09-16 14:00:00","potassium":null}
+        ]))).unwrap();
+        let latest = |db: &Connection| db.query_row(
+            "SELECT observed_at,potassium FROM hourly_observations ORDER BY observed_at DESC LIMIT 1",
+            [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+        ).unwrap();
+        assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), None));
+        assert!(setting(&db, "last_success").unwrap().is_some());
+        assert_eq!(setting(&db, "query_through").unwrap().as_deref(), Some("2026-09-17 00:00:00"));
+        save(&mut db, batch(json!([
+            {"time":"2026-09-16 12:00:00","potassium":null},
+            {"time":"2026-09-16 13:00:00","potassium":null},
+            {"time":"2026-09-16 14:00:00","potassium":null}
+        ]))).unwrap();
+        assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), None));
+        save(&mut db, batch(json!([{"time":"2026-09-16 14:00:00","potassium":0.0}]))).unwrap();
+        assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), Some(0.0)));
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM hourly_observations", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
     }
     #[test]
     fn catchup_advances_in_bounded_overlapping_windows() {

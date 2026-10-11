@@ -34,7 +34,29 @@ struct Cached {
 pub struct Readiness {
     sites: Mutex<Vec<Cached>>,
     checking: AtomicBool,
+    site_open_attempted: [AtomicBool; 3],
     pub started: AtomicBool,
+}
+impl Readiness {
+    fn reserve_site_open(&self, id: &str, missing: bool) -> bool {
+        SITES
+            .iter()
+            .position(|(site, _)| *site == id)
+            .is_some_and(|index| {
+                missing && !self.site_open_attempted[index].swap(true, Ordering::SeqCst)
+            })
+    }
+    fn retry_missing_sites(&self, snapshot: &crate::bridge::BridgeStatus) {
+        for (index, (_, origin)) in SITES.iter().enumerate() {
+            if !snapshot
+                .tabs
+                .iter()
+                .any(|t| same_origin(&t.tab.url, origin))
+            {
+                self.site_open_attempted[index].store(false, Ordering::SeqCst);
+            }
+        }
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +122,14 @@ fn empty(id: &str, state: &str, message: &str) -> SiteHealth {
 fn same_origin(url: &str, origin: &str) -> bool {
     tauri::Url::parse(url).is_ok_and(|u| u.origin().ascii_serialization() == origin)
 }
+fn valid_jiangsu_health(raw: &serde_json::Value) -> bool {
+    raw["tabId"].as_i64().is_some_and(|id| id >= 0)
+        && raw["url"].as_str().is_some_and(|url| {
+            same_origin(url, SITES[0].1)
+                && (raw["state"] != "ready" || crate::monitoring::source_page(url))
+        })
+}
+
 pub fn view(app: &tauri::AppHandle) -> View {
     let state = app.state::<Readiness>();
     let bridge = app.state::<Bridge>().status();
@@ -125,6 +155,13 @@ fn evaluate(
                 return empty(id, "blocked", "等待插件连接后检测");
             }
             if let Some(cached) = cache.iter().find(|c| c.health.id == *id) {
+                if cached.health.state == "error"
+                    && cached.health.tab_id.is_none()
+                    && cached.at.elapsed() < MAX_AGE
+                    && !bridge.tabs.iter().any(|t| same_origin(&t.tab.url, origin))
+                {
+                    return cached.health.clone();
+                }
                 let live = bridge.tabs.iter().any(|t| {
                     Some(&t.session) == cached.health.session.as_ref()
                         && Some(t.tab.id) == cached.health.tab_id
@@ -191,9 +228,9 @@ pub async fn refresh(app: &tauri::AppHandle) -> Result<(), String> {
     // Queue all checks before waiting for the next extension heartbeat. The
     // extension still executes them serially, preserving its single CDP lock.
     tokio::join!(
+        check_site(app, &snapshot, SITES[2]),
         check_site(app, &snapshot, SITES[0]),
         check_site(app, &snapshot, SITES[1]),
-        check_site(app, &snapshot, SITES[2]),
     );
     Ok(())
 }
@@ -220,17 +257,56 @@ async fn check_site(
             t.tab.id,
         )
     });
-    let health = if let Some(tab) = tabs.first() {
+    let has_tab = snapshot
+        .tabs
+        .iter()
+        .any(|t| same_origin(&t.tab.url, origin));
+    let open_missing = state.reserve_site_open(id, !has_tab);
+    let target = if let Some(tab) = tabs.first() {
+        Some((tab.session.clone(), tab.tab.id, Some(tab.tab.url.clone())))
+    } else if open_missing {
+        bridge
+            .single_session()
+            .ok()
+            .map(|session| (session, -1, None))
+    } else {
+        None
+    };
+    let health = if let Some((session, tab_id, expected_url)) = target {
         let result = bridge
             .request(
-                tab.session.clone(),
-                tab.tab.id,
-                json!({"type":"site-health"}),
+                session.clone(),
+                tab_id,
+                json!({"type": match id {
+                    "map" => "jiangsu-health",
+                    "sniff" if open_missing => "airins-health-open",
+                    "dji" if open_missing => "dji-health-open",
+                    _ => "site-health",
+                }}),
             )
             .await;
-        let mut health = empty(id, "error", "检测失败，请保持业务页面打开后重试");
+        let mut health = empty(
+            id,
+            "error",
+            if open_missing {
+                "无法在后台打开或验证网站，请检查网络后重新验证，或手动打开网站"
+            } else {
+                "检测失败，请检查网站登录或网络后重新验证"
+            },
+        );
+        health.url = expected_url.clone();
+        health.tab_id = (tab_id >= 0).then_some(tab_id);
         if let Ok(raw) = result {
-            if raw["url"].as_str() == Some(&tab.tab.url) {
+            let actual_url = raw["url"].as_str();
+            let valid_url = if id == "map" {
+                valid_jiangsu_health(&raw)
+            } else if let Some(expected) = &expected_url {
+                actual_url == Some(expected.as_str())
+            } else {
+                actual_url.is_some_and(|url| same_origin(url, origin))
+                    && raw["tabId"].as_i64().is_some_and(|id| id >= 0)
+            };
+            if valid_url {
                 if let (Some(status), Some(message)) =
                     (raw["state"].as_str(), raw["message"].as_str())
                 {
@@ -247,6 +323,12 @@ async fn check_site(
                         health.message = message.chars().take(180).collect();
                     }
                 }
+                health.url = actual_url.map(str::to_owned);
+                health.tab_id = if open_missing || id == "map" {
+                    raw["tabId"].as_i64()
+                } else {
+                    Some(tab_id)
+                };
             }
         }
         health.checked_at = Some(
@@ -254,12 +336,25 @@ async fn check_site(
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
         );
-        health.session = Some(tab.session.clone());
-        health.tab_id = Some(tab.tab.id);
-        health.url = Some(tab.tab.url.clone());
+        health.session = Some(session);
         health
+    } else if has_tab {
+        empty(id, "unchecked", "网站正在加载，完成后自动验证")
     } else {
-        empty(id, "not_open", "请打开网站并完成登录，等待页面加载完成")
+        // Keep a failed background-open attempt actionable across automatic
+        // rechecks; only an explicit retry or a newly opened tab replaces it.
+        state
+            .sites
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|cached| {
+                cached.health.id == id
+                    && cached.health.state == "error"
+                    && cached.health.tab_id.is_none()
+            })
+            .map(|cached| cached.health.clone())
+            .unwrap_or_else(|| empty(id, "not_open", "请打开网站并完成登录，等待页面加载完成"))
     };
     let mut cache = state.sites.lock().unwrap();
     cache.retain(|c| c.health.id != id);
@@ -295,6 +390,10 @@ pub fn get_readiness(app: tauri::AppHandle) -> View {
 }
 #[tauri::command]
 pub async fn check_readiness(app: tauri::AppHandle) -> Result<View, String> {
+    let state = app.state::<Readiness>();
+    if !state.checking.load(Ordering::SeqCst) {
+        state.retry_missing_sites(&app.state::<Bridge>().status());
+    }
     refresh(&app).await?;
     Ok(view(&app))
 }
@@ -316,6 +415,30 @@ pub async fn start_workspace(app: tauri::AppHandle) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn jiangsu_health_accepts_authenticated_routes_and_tracks_the_verified_tab() {
+        let mut raw = json!({"url": crate::monitoring::SOURCE_URL, "tabId": 17, "state": "ready"});
+        assert!(valid_jiangsu_health(&raw));
+        raw["url"] = json!("http://61.155.4.60:18080/#/home/map");
+        assert!(valid_jiangsu_health(&raw));
+        raw["url"] = json!("http://61.155.4.60:18080/#/login");
+        assert!(!valid_jiangsu_health(&raw));
+        raw["state"] = json!("login_required");
+        raw["url"] = json!("http://61.155.4.60:18080/#/login");
+        assert!(valid_jiangsu_health(&raw));
+        raw["url"] = json!("http://61.155.4.60.evil.test:18080/#/login");
+        assert!(!valid_jiangsu_health(&raw));
+        raw["url"] = json!(crate::monitoring::SOURCE_URL);
+        raw["tabId"] = json!(-1);
+        assert!(!valid_jiangsu_health(&raw));
+        let (mut bridge, mut cache) = fixture();
+        cache[0].health.url = Some(crate::monitoring::SOURCE_URL.into());
+        cache[0].health.tab_id = Some(17);
+        assert!(!evaluate(&bridge, &cache, false, false).ready);
+        bridge.tabs[0].tab.id = 17;
+        bridge.tabs[0].tab.url = crate::monitoring::SOURCE_URL.into();
+        assert!(evaluate(&bridge, &cache, false, false).ready);
+    }
+    #[test]
     fn version_and_origin_are_exact() {
         assert!(compatible(MIN_VERSION));
         assert!(compatible("0.10.0"));
@@ -334,6 +457,55 @@ mod tests {
             "https://fh.dji.com.evil.test/path",
             "https://fh.dji.com"
         ));
+    }
+    #[test]
+    fn missing_sites_are_opened_once_each_and_loading_tabs_do_not_consume_attempts() {
+        let state = Readiness::default();
+        for (id, _) in SITES {
+            assert!(!state.reserve_site_open(id, false));
+            assert!(state.reserve_site_open(id, true));
+            assert!(!state.reserve_site_open(id, true));
+        }
+        assert!(!state.reserve_site_open("unknown", true));
+    }
+    #[test]
+    fn manual_retry_only_resets_attempts_for_missing_sites() {
+        let state = Readiness::default();
+        for (id, _) in SITES {
+            assert!(state.reserve_site_open(id, true));
+        }
+        let (mut bridge, _) = fixture();
+        bridge.tabs.remove(0);
+        state.retry_missing_sites(&bridge);
+        assert!(state.reserve_site_open("map", true));
+        assert!(!state.reserve_site_open("dji", true));
+        assert!(!state.reserve_site_open("sniff", true));
+    }
+    #[test]
+    fn background_open_failure_remains_visible_until_a_tab_appears() {
+        let (mut bridge, mut cache) = fixture();
+        bridge.tabs.remove(2);
+        cache[2].health.state = "error".into();
+        cache[2].health.message = "后台打开失败".into();
+        cache[2].health.tab_id = None;
+        cache[2].health.url = None;
+        assert_eq!(
+            evaluate(&bridge, &cache, false, false).sites[2].state,
+            "error"
+        );
+        bridge.tabs.push(crate::bridge::TabStatus {
+            session: "session".into(),
+            tab: crate::bridge::BrowserTab {
+                id: 3,
+                title: "Airins".into(),
+                url: "https://aai.airins.cn/sniff/HistoryCloud".into(),
+                status: "complete".into(),
+            },
+        });
+        assert_eq!(
+            evaluate(&bridge, &cache, false, false).sites[2].state,
+            "unchecked"
+        );
     }
     fn fixture() -> (crate::bridge::BridgeStatus, Vec<Cached>) {
         let tabs: Vec<_> = SITES

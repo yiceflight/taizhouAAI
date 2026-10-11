@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { ossConfig, headOrNull, safeError } from './lib/oss.mjs';
 import { compareVersions, inspectMacArchive } from './lib/release-assets.mjs';
 import { verifyArtifactSignature } from './lib/verify-signature.mjs';
+import { releaseDate } from './lib/release-date.mjs';
 
 const stagingDirectory = path.resolve(process.argv[2] ?? 'staging');
 const packageVersion = JSON.parse(await readFile('package.json', 'utf8')).version;
@@ -28,11 +29,7 @@ function notes() {
     const log = execFileSync('git', ['log', '--format=- %s', previous ? `${previous}..${tag}` : tag], { encoding: 'utf8' }).trim();
     if (log) return log;
   } catch { /* a clean checkout may not have tags */ }
-  return `- 泰州市监测中心智能监测系统 ${version} 更新`;
-}
-function releaseDate() {
-  try { return execFileSync('git', ['show', '-s', '--format=%cI', `v${version}`], { encoding: 'utf8' }).trim(); }
-  catch { return new Date().toISOString(); }
+  return `- 江苏省泰州环境监测中心智能监测系统 ${version} 更新`;
 }
 
 let releaseLock;
@@ -69,10 +66,11 @@ try {
     await verifyArtifactSignature(asset.filePath, asset.signature, config.plugins.updater.pubkey);
   }
   if (process.argv.includes('--dry-run')) {
-    console.log(JSON.stringify({ version, assets: candidates.map(({ name, platforms, sha256 }) => ({ name, platforms, sha256 })) }));
+    console.log(JSON.stringify({ version, pub_date: releaseDate(version), assets: candidates.map(({ name, platforms, sha256 }) => ({ name, platforms, sha256 })) }));
     process.exit(0);
   }
 
+  const pubDate = releaseDate(version);
   const { client, bucket, domain, timeout } = await ossConfig();
   const versioning = await client.getBucketVersioning(bucket);
   if (versioning.versionStatus) throw new Error('Publishing lock requires an unversioned bucket; refusing unsafe concurrent publication');
@@ -114,7 +112,7 @@ try {
 
   const platforms = {};
   for (const asset of candidates) for (const platform of asset.platforms) platforms[platform] = { url: urls[asset.name], signature: asset.signature };
-  const manifest = { version, notes: notes(), pub_date: releaseDate(), platforms };
+  const manifest = { version, notes: notes(), pub_date: pubDate, platforms };
   const contents = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   const latestKey = 'client/latest.json';
   await client.put(latestKey, contents, { timeout, headers: {

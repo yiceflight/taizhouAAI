@@ -19,17 +19,24 @@ const getReadiness = () => ({
 let enabled = true;
 let flightEnabled = true;
 let flightEvent: any = null;
+let flightRecords: any[] = [];
 const now = new Date(); now.setMinutes(0,0,0);
 const date = (time:number) => new Date(time+8*3600000).toISOString().slice(0,19).replace('T',' ');
 const getMonitor = () => ({settings,enabled,syncing:false,lastAttempt:date(Date.now()),lastSuccess:date(Date.now()),error:null,total:168,queryThrough:date(now.getTime()),
   rows: Array.from({length:168},(_,i)=>({time:date(now.getTime() - (i+(scenario==='stale'?8:0))*3600000),potassium: i===0 && scenario==='stale' ? null : 0.32+(Math.sin(i)*0.12),pm25:33+Math.round(Math.cos(i)*10)})),
   weather:{location:'泰州环境监测 Dock 3',latitude:32.43,longitude:119.93,source:'测试天气',refreshing:false,allowed:true,level:'ok',label:'天气条件通过',reasons:['模拟天气'],current:{observedAt:Date.now()/1000,fetchedAt:Date.now()/1000,temperature:22,weatherCode:0,windSpeed:2,windGusts:3,windDirection:90,precipitation:0}},
-  flight:{enabled:flightEnabled,threshold:settings.potassiumThreshold,delayMinutes:settings.takeoffDelayMinutes,event:flightEvent},
+  flight:{enabled:flightEnabled,threshold:settings.potassiumThreshold,delayMinutes:settings.takeoffDelayMinutes,event:flightEvent,records:flightRecords},
 });
 mockIPC(async (command, payload) => {
   if(command==='get_bridge_status')return {connected:scenario!=='missing',clients:scenario==='missing'?0:1,versions:['0.7.0'],tabs,error:null};
   if(command==='get_readiness'||command==='check_readiness')return getReadiness();
   if(command==='get_monitoring')return getMonitor();
+  if(command==='refresh_flight_status'){
+    if(flightEvent?.id!==payload?.eventId)throw Error('任务已变化');
+    flightRecords=[{...flightEvent,statusCheckedAt:Date.now(),statusCheckError:'司空列表未识别到该任务状态。已手动刷新并解除本地任务占用，原起飞结果仍未确认。'},...flightRecords];
+    flightEvent=null;
+    return;
+  }
   if(command==='cancel_flight'){if(flightEvent?.id!==payload?.eventId)throw Error('任务已变化');flightEvent={...flightEvent,status:'canceled',launchAt:null};return;}
   if(command==='set_flight_enabled'){flightEnabled=!!payload?.enabled;if(!flightEnabled&&flightEvent?.status==='countdown')flightEvent={...flightEvent,status:'canceled',launchAt:null};return;}
   if(command==='launch_flight'){flightEvent={id:'fixture-manual',observedAt:date(now.getTime()),potassium:null,name:'手动巡查 · UI 模拟',status:'submitted',error:null,preview:false,source:'manual',launchAt:null};return;}

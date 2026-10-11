@@ -4,6 +4,9 @@ import { isTauri } from "@tauri-apps/api/core";
 import { version as configuredVersion } from "../../src-tauri/tauri.conf.json";
 import { checkForAppUpdate, type AppUpdateProgress, type AvailableAppUpdate } from "../lib/appUpdater";
 
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const RETRY_INTERVAL_MS = 5 * 60 * 1000;
+
 export function UpdateBanner() {
   const [version, setVersion] = useState(configuredVersion);
   const [update, setUpdate] = useState<AvailableAppUpdate | null>(null);
@@ -15,14 +18,17 @@ export function UpdateBanner() {
   const busy = useRef(false);
   const mounted = useRef(false);
   const currentUpdate = useRef<AvailableAppUpdate | null>(null);
+  const nextAutoCheck = useRef(0);
+  const automatic = import.meta.env.PROD && isTauri();
 
-  const checkUpdate = useCallback(async () => {
+  const checkUpdate = useCallback(async (background = false) => {
     if (busy.current || currentUpdate.current) return;
     if (!isTauri()) {
       setMessage("请在客户端检查更新");
       return;
     }
     busy.current = true;
+    nextAutoCheck.current = Date.now() + CHECK_INTERVAL_MS;
     setChecking(true);
     setMessage("");
     setError(false);
@@ -34,11 +40,14 @@ export function UpdateBanner() {
       }
       currentUpdate.current = result;
       setUpdate(result);
-      setMessage(result ? "" : "已是最新版本");
+      nextAutoCheck.current = Date.now() + CHECK_INTERVAL_MS;
+      setMessage(result ? "" : background ? "自动检查：已是最新版本" : "已是最新版本");
     } catch (error) {
+      nextAutoCheck.current = Date.now() + RETRY_INTERVAL_MS;
       if (mounted.current) {
         setError(true);
-        setMessage(String(error));
+        console.warn("检查更新失败", error);
+        setMessage(import.meta.env.PROD ? "暂时无法检查更新，5 分钟后自动重试" : "检查更新失败，请稍后重试");
       }
     } finally {
       busy.current = false;
@@ -49,18 +58,25 @@ export function UpdateBanner() {
   useEffect(() => {
     mounted.current = true;
     if (isTauri()) void getVersion().then((value) => { if (mounted.current) setVersion(value); }).catch(() => {});
-    if (import.meta.env.PROD && isTauri()) void checkUpdate();
-    const timer = window.setInterval(() => {
-      if (import.meta.env.PROD && isTauri()) void checkUpdate();
-    }, 6 * 60 * 60 * 1000);
+    const checkWhenDue = () => {
+      if (automatic && Date.now() >= nextAutoCheck.current) void checkUpdate(true);
+    };
+    const checkWhenOnline = () => { if (automatic) void checkUpdate(true); };
+    checkWhenDue();
+    // Also recover after sleep or a failed check, without waiting six hours.
+    const timer = automatic ? window.setInterval(checkWhenDue, 60_000) : undefined;
+    window.addEventListener("online", checkWhenOnline);
+    window.addEventListener("focus", checkWhenDue);
     return () => {
       mounted.current = false;
       window.clearInterval(timer);
+      window.removeEventListener("online", checkWhenOnline);
+      window.removeEventListener("focus", checkWhenDue);
       const available = currentUpdate.current;
       currentUpdate.current = null;
       if (available) void available.close().catch(() => {});
     };
-  }, [checkUpdate]);
+  }, [automatic, checkUpdate]);
 
   const installUpdate = async () => {
     if (!update || busy.current) return;
@@ -91,11 +107,14 @@ export function UpdateBanner() {
     : installing ? `下载中${percent === null ? "…" : ` ${percent}%`}` : "下载并重启";
 
   return <div className="update-status">
-    <span className="app-version">v{version}</span>
-    <span className={`update-message${error ? " error" : ""}`} role="status" title={message}>
-      {message || (update ? `新版本 v${update.latestVersion}` : "")}
-    </span>
-    {update ? <button className="update-install" disabled={installing} title={update.releaseNotes.join("\n")} onClick={() => void installUpdate()}>{installLabel}</button>
+    <span className="app-version">当前客户端 v{version}</span>
+    {(!update || message) && <span className={`update-message${error ? " error" : ""}`} role="status" title={message}>
+      {message || (automatic ? "已开启自动检查更新" : "")}
+    </span>}
+    {update ? <button className="update-install" disabled={installing} title={update.releaseNotes.join("\n")} onClick={() => void installUpdate()}>
+      <span className="update-install-icon" aria-hidden="true">↻</span>
+      <span>有新版本 v{update.latestVersion}，{installLabel}</span>
+    </button>
       : <button className="update-action" disabled={checking} onClick={() => void checkUpdate()}>{checking ? "正在检查…" : "检查更新"}</button>}
   </div>;
 }

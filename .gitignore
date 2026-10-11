@@ -13,6 +13,8 @@ node_modules
 extension-dev/
 dist
 dist-ssr
+output/
+.codex-ppt-build-*/
 *.local
 .secrets/
 staging/

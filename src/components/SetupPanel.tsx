@@ -3,8 +3,8 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { targetSites, type TargetSite } from '../config/sites';
 import { siteLabels, type Readiness } from '../lib/workspace';
 
-type Props = { state: Readiness | null; busy: boolean; onCheck: () => void; onStart: () => void; openSite: (site: TargetSite) => void; onHistory: () => void };
-export function SetupPanel({ state, busy, onCheck, onStart, openSite, onHistory }: Props) {
+type Props = { state: Readiness | null; busy: boolean; onCheck: () => void; openSite: (site: TargetSite) => void; onHistory: () => void };
+export function SetupPanel({ state, busy, onCheck, openSite, onHistory }: Props) {
   const [directory, setDirectory] = useState<{path:string;platform:string} | null>(null);
   const [message, setMessage] = useState('');
   const [opening, setOpening] = useState(false);
@@ -14,8 +14,8 @@ export function SetupPanel({ state, busy, onCheck, onStart, openSite, onHistory 
   const passed = state?.sites.filter(s => s.state === 'ready').length || 0;
   const conflict = /端口|重复|多个/.test(state?.pluginMessage || '');
   return <div className="setup-workspace">
-    <div className="page-heading"><div><span className="eyebrow">开始工作前</span><h2>{state?.started ? state.ready ? '工作环境已就绪' : '恢复工作环境' : '完成准备，开始监测'}</h2><p>验证通过后，将自动读取最新数据并进入监测工作台。</p></div><button className="text-button" onClick={onHistory}>查看历史报告 →</button></div>
-    <ol className="setup-steps" aria-label="准备进度">{['连接浏览器插件', '验证三个网站', '读取数据并开始'].map((label, index) => <li key={label} className={index < step ? 'done' : index === step ? 'current' : ''} aria-current={index === step ? 'step' : undefined}><span>{index < step ? '✓' : index + 1}</span><div>{label}<small>{index < step ? '已完成' : index === step ? '当前步骤' : '等待前一步完成'}</small></div></li>)}</ol>
+    <div className="page-heading"><div><span className="eyebrow">运行状态</span><h2>{!state ? '正在检测运行状态' : state.ready ? '运行正常' : '运行状态待处理'}</h2><p>查看浏览器连接与网站验证状态，异常时请按下方提示处理。</p></div><button className="text-button" onClick={onHistory}>查看巡查任务与报告 →</button></div>
+    <ol className="setup-steps" aria-label="运行状态检查">{['浏览器连接', '网站验证'].map((label, index) => <li key={label} className={index < step ? 'done' : index === step ? 'current' : ''} aria-current={index === step ? 'step' : undefined}><span>{index < step ? '✓' : index + 1}</span><div>{label}<small>{index < step ? index === 0 ? '已连接' : '全部通过' : index === step ? !state || state.checking ? '检测中' : '待处理' : '等待浏览器连接'}</small></div></li>)}</ol>
     {step === 0 ? <section className="setup-card">
       <div className="section-heading"><div><h3>{state?.pluginUpdateRequired ? '必须更新 Chrome 插件' : conflict ? '先解决客户端连接冲突' : '连接 Chrome 插件'}</h3><p>{state?.pluginMessage || '正在检查本机插件连接…'}</p></div><span className="badge warning">{state ? '未就绪' : '检测中'}</span></div>
       {conflict ? <div className="notice warning"><strong>请为当前版本只保留一个客户端和一个 Chrome 插件会话</strong><p>退出同一版本重复运行的客户端后，重新启动要使用的客户端。此问题无需重复安装插件。</p><button className="secondary-button" disabled={busy} onClick={onCheck}>重新检测连接</button></div> : <>
@@ -23,10 +23,9 @@ export function SetupPanel({ state, busy, onCheck, onStart, openSite, onHistory 
       </>}
       {message && <p className="notice" role="status">{message}</p>}
     </section> : <>
-      <section className="setup-card"><div className="section-heading"><div><h3>三个网站均需验证通过 <span className="inline-count">{passed} / 3</span></h3><p>在 Chrome 完成登录后，点击“重新验证全部”；系统也会自动复查。</p></div><button className="secondary-button" disabled={busy || state?.checking} onClick={onCheck}>{state?.checking ? '正在验证…' : '重新验证全部'}</button></div>
+      <section className="setup-card"><div className="section-heading"><div><h3>三个网站均需验证通过 <span className="inline-count">{passed} / 3</span></h3><p>系统会在 Chrome 后台自动打开缺失的平台页面；请完成登录，登录状态会自动复查。</p></div><button className="secondary-button" disabled={busy || state?.checking} onClick={onCheck}>{state?.checking ? '正在验证…' : '重新验证全部'}</button></div>
         <div className="health-list">{targetSites.map((site, index) => { const health = state?.sites.find(s => s.id === site.id); return <article className="health-row" key={site.id}><span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 1}</span><div className="health-copy"><h4>{site.name}</h4><p>{health?.message || '等待检测'}</p><small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small></div><span className={`badge ${health?.state === 'ready' ? 'success' : 'warning'}`}>{health ? siteLabels[health.state] : '待验证'}</span><button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button></article>; })}</div>
       </section>
-      <section className={`setup-card start-card ${step < 2 ? 'pending' : ''}`}><div><h3>{state?.started ? '恢复监测工作台' : '自动读取数据，进入工作台'}</h3><p>{step < 2 ? '还需完成上方网站验证。已保存的数据和报告仍可查看。' : state?.started ? '环境已恢复，可继续处理原有任务。' : '验证已通过，数据读取成功后自动进入；读取失败时可点击下方按钮重试。'}</p></div><button className="primary-button" disabled={step < 2 || busy || state?.checking} onClick={onStart}>{busy ? state?.checking ? '正在验证…' : '正在读取数据…' : state?.started ? '返回工作台' : '读取数据并开始监测'}</button></section>
     </>}
   </div>;
 }

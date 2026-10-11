@@ -42,6 +42,6 @@ export function WeatherPanel({ weather, busy, onRefresh }: WeatherProps) {
     </div>
     <div className="weather-metrics"><span>降水 <strong>{number(s?.precipitation)} <small>mm</small></strong></span><span>{dir}风 <strong>{number(s?.windSpeed)} <small>m/s</small></strong></span><span>阵风 <strong>{number(s?.windGusts)} <small>m/s</small></strong></span></div>
     <p className="weather-decision" role="status">{expired ? '天气数据已过期，请刷新；暂不准备巡查计划。' : weather?.reasons.join(' ') || '正在获取机场天气，暂不准备巡查计划。'}</p>
-    <div className="weather-details"><h4>数据时间与判断规则</h4><p>数据时刻：{time(s?.observedAt)}（北京时间）</p><p>位置：{weather?.longitude ?? 119.92992}° E，{weather?.latitude ?? 32.434525}° N · <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a> 模型天气 · 每 5 分钟更新</p><p>无降水且风速、阵风均 ≤ 6 m/s 时通过；超过 6 m/s 暂停并复核，超过 10 m/s 不宜起飞。有雾、雨雪、雷暴或数据缺失/过期时不通过。降水为当前时段累计量。</p><p>模型天气不替代机场现场检查；实际起飞仍需确认现场天气及设备状态。</p></div>
+    <div className="weather-details"><h4>数据时间与判断规则</h4><p>数据时刻：{time(s?.observedAt)}（北京时间）</p><p>位置：{weather?.longitude ?? 119.92992}° E，{weather?.latitude ?? 32.434525}° N · <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a> 模型天气 · 每 5 分钟更新</p><p>无降水且风速、阵风均低于 7 m/s 时通过；达到 7 m/s 暂停并需人工确认，达到 12 m/s 禁止起飞，人工确认不能覆盖。有雾、雨雪、雷暴或数据缺失/过期时不通过。降水为当前时段累计量。</p><p>模型天气不替代机场现场检查；实际起飞仍需确认现场天气及设备状态。</p></div>
   </section>;
 }

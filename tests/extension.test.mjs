@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { allowedUrl, evaluationValue } from '../extension/src/bridge-core.js';
 import { ENDPOINT } from '../extension/src/bridge-config.js';
+import { createDebuggerSession } from '../extension/src/debugger-session.js';
 test('only authorized business origins are capturable', () => {
   for (const url of ['https://fh.dji.com/organization/a', 'https://aai.airins.cn/sniff/HistoryCloud', 'http://61.155.4.60:18080/#/home/map']) assert.equal(allowedUrl(url), true);
   for (const url of ['https://fh.dji.com.evil.test/', 'http://fh.dji.com/', 'https://fh.dji.com:444/', 'https://user@fh.dji.com/', 'file:///tmp/a', 'chrome://settings']) assert.equal(allowedUrl(url), false);
@@ -45,4 +46,26 @@ test('large table captures are bounded and explicitly marked truncated', async (
   assert.equal(result.truncated, true);
   assert.ok(Buffer.byteLength(JSON.stringify(result)) < 1500000);
   assert.ok(result.tables.flat(2).join('').length <= 200000);
+});
+test('debugger remains on one authorized business tab across checks and unrelated browsing', async () => {
+  const calls=[];
+  const api={attach:async({tabId})=>{calls.push(['attach',tabId])},detach:async({tabId})=>{calls.push(['detach',tabId])}};
+  const session=createDebuggerSession(api,allowedUrl);
+  const tabs=[{id:1,url:'https://aai.airins.cn/sniff/HistoryCloud',status:'complete'},{id:2,url:'https://fh.dji.com/project',status:'complete'}];
+  await session.maintain(tabs);
+  assert.equal(await session.acquire(1),false);
+  await session.release(1,false);
+  await session.maintain(tabs);
+  assert.deepEqual(calls,[['attach',1]]);
+  assert.equal(await session.acquire(2),true);
+  await session.release(2,true);
+  assert.deepEqual(calls,[['attach',1],['attach',2],['detach',2]]);
+  await session.maintain([{...tabs[0],url:'https://example.com'},tabs[1]]);
+  assert.deepEqual(calls.slice(-2),[['detach',1],['attach',2]]);
+  session.detached(2,'canceled_by_user');
+  await session.maintain(tabs);
+  await assert.rejects(session.acquire(1),/调试已取消/);
+  session.resume();
+  await session.maintain(tabs);
+  assert.deepEqual(calls.at(-1),['attach',1]);
 });

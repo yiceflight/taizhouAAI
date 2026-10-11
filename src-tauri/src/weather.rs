@@ -13,6 +13,8 @@ const LNG: &str = "119.92992";
 const REFRESH_SECS: u64 = 300;
 const MAX_OBSERVATION_AGE: i64 = 1800;
 const MAX_FETCH_AGE: i64 = 600;
+const WIND_CONFIRM_SPEED: f64 = 7.;
+const WIND_PROHIBIT_SPEED: f64 = 12.;
 
 #[derive(Default)]
 pub struct Weather {
@@ -38,17 +40,17 @@ pub struct Sample {
     wind_direction: Option<f64>,
     precipitation: Option<f64>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
-    location: &'static str,
+    location: String,
     latitude: f64,
     longitude: f64,
-    source: &'static str,
+    source: String,
     refreshing: bool,
     pub allowed: bool,
-    level: &'static str,
-    label: &'static str,
+    level: String,
+    label: String,
     pub reasons: Vec<String>,
     current: Option<Sample>,
 }
@@ -98,9 +100,12 @@ fn assess(sample: Option<&Sample>, error: Option<&str>, now: i64) -> (&'static s
             vec!["天气数据已过期或时间异常，请刷新后再判断。".into()],
         );
     }
+    conditions(s.weather_code, s.wind_speed, s.wind_gusts, s.precipitation)
+}
+pub(crate) fn conditions(weather_code: Option<u64>, wind_speed: Option<f64>, wind_gusts: Option<f64>, precipitation: Option<f64>) -> (&'static str, Vec<String>) {
     let mut reasons = Vec::new();
     let mut level = "ok";
-    match s.weather_code {
+    match weather_code {
         Some(0..=3) => {}
         Some(45 | 48) => {
             level = "caution";
@@ -118,24 +123,24 @@ fn assess(sample: Option<&Sample>, error: Option<&str>, now: i64) -> (&'static s
             reasons.push("天气现象数据缺失或无法识别。".into());
         }
     }
-    if s.precipitation.is_some_and(|v| v > 0.) {
+    if precipitation.is_some_and(|v| v > 0.) {
         level = "unsafe";
-        reasons.push(format!("当前时段降水量 {} mm。", s.precipitation.unwrap()));
+        reasons.push(format!("当前时段降水量 {} mm。", precipitation.unwrap()));
     }
-    for (name, value) in [("风速", s.wind_speed), ("阵风", s.wind_gusts)] {
+    for (name, value) in [("风速", wind_speed), ("阵风", wind_gusts)] {
         if let Some(v) = value {
-            if v > 10. {
+            if v >= WIND_PROHIBIT_SPEED {
                 level = "unsafe";
-                reasons.push(format!("{name} {v:.1} m/s，超过 10 m/s。"));
-            } else if v > 6. {
+                reasons.push(format!("{name} {v:.1} m/s，达到 12 m/s，禁止起飞。"));
+            } else if v >= WIND_CONFIRM_SPEED {
                 if level == "ok" {
                     level = "caution";
                 }
-                reasons.push(format!("{name} {v:.1} m/s，超过 6 m/s，需现场复核。"));
+                reasons.push(format!("{name} {v:.1} m/s，达到 7 m/s，需人工确认并现场复核。"));
             }
         }
     }
-    if [s.wind_speed, s.wind_gusts, s.precipitation]
+    if [wind_speed, wind_gusts, precipitation]
         .iter()
         .any(Option::is_none)
     {
@@ -145,9 +150,16 @@ fn assess(sample: Option<&Sample>, error: Option<&str>, now: i64) -> (&'static s
         reasons.push("风速、阵风或降水数据不完整，暂停准备计划。".into());
     }
     if reasons.is_empty() {
-        reasons.push("无降水，风速及阵风均不超过 6 m/s。".into());
+        reasons.push("无降水，风速及阵风均低于 7 m/s。".into());
     }
     (level, reasons)
+}
+fn require_wind_below_limit(sample: Option<&Sample>) -> Result<(), String> {
+    if sample.is_some_and(|s| [s.wind_speed, s.wind_gusts].iter().any(|v| v.is_some_and(|v| v >= WIND_PROHIBIT_SPEED))) {
+        Err("风速或阵风达到 12 m/s，禁止起飞，人工确认不能覆盖。".into())
+    } else {
+        Ok(())
+    }
 }
 pub fn view(app: &tauri::AppHandle) -> View {
     let state = app.state::<Weather>();
@@ -158,19 +170,20 @@ pub fn view(app: &tauri::AppHandle) -> View {
         Utc::now().timestamp(),
     );
     View {
-        location: "泰州环境监测 Dock 3",
+        location: "泰州环境监测 Dock 3".into(),
         latitude: LAT.parse().unwrap(),
         longitude: LNG.parse().unwrap(),
-        source: "Open-Meteo",
+        source: "Open-Meteo".into(),
         refreshing: state.refreshing.load(Ordering::SeqCst),
         allowed: level == "ok",
-        level,
+        level: level.into(),
         label: match level {
             "ok" => "天气条件通过",
+            "unsafe" if require_wind_below_limit(cache.sample.as_ref()).is_err() => "禁止起飞",
             "unsafe" => "不宜起飞",
             "caution" => "需现场复核",
             _ => "暂无法判断",
-        },
+        }.into(),
         reasons,
         current: cache.sample.clone(),
     }
@@ -236,14 +249,17 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
         Err(error) => cache.error = Some(error),
     }
 }
-pub async fn require_suitable(app: &tauri::AppHandle) -> Result<(), String> {
+pub async fn check_launch(app: &tauri::AppHandle, manual_override: bool) -> (View, Result<(), String>) {
     refresh(app, true).await;
     let weather = view(app);
-    if weather.allowed {
+    let result = if manual_override {
+        require_wind_below_limit(weather.current.as_ref())
+    } else if weather.allowed {
         Ok(())
     } else {
         Err(format!("天气条件未通过：{}", weather.reasons.join(" ")))
-    }
+    };
+    (weather, result)
 }
 #[tauri::command]
 pub async fn refresh_weather(app: tauri::AppHandle) {
@@ -297,15 +313,15 @@ mod tests {
                 ..s.clone()
             },
             Sample {
-                wind_speed: Some(10.1),
+                wind_speed: Some(12.),
                 ..s.clone()
             },
             Sample {
-                wind_gusts: Some(10.1),
+                wind_gusts: Some(12.),
                 ..s.clone()
             },
             Sample {
-                wind_gusts: Some(6.1),
+                wind_gusts: Some(7.),
                 ..s.clone()
             },
             Sample {
@@ -355,6 +371,20 @@ mod tests {
             .0,
             "ok"
         );
+    }
+    #[test]
+    fn wind_thresholds_apply_to_speed_and_gusts_and_cannot_be_overridden() {
+        for (speed, expected) in [(6.1, "ok"), (6.99, "ok"), (7., "caution"), (10.1, "caution"), (11.99, "caution"), (12., "unsafe"), (12.01, "unsafe")] {
+            for gusts in [false, true] {
+                let mut s = sample();
+                if gusts { s.wind_gusts = Some(speed); } else { s.wind_speed = Some(speed); }
+                assert_eq!(assess(Some(&s), None, 10000).0, expected, "speed={speed}, gusts={gusts}");
+                assert_eq!(require_wind_below_limit(Some(&s)).is_ok(), speed < 12.);
+            }
+        }
+        // A lower second reading must not downgrade the higher reading's prohibition.
+        assert_eq!(conditions(Some(0), Some(12.), Some(7.), Some(0.)).0, "unsafe");
+        assert_eq!(conditions(Some(0), Some(7.), Some(12.), Some(0.)).0, "unsafe");
     }
     #[test]
     fn parser_rejects_units_and_preserves_missing_values() {

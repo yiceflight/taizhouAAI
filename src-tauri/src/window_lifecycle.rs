@@ -36,7 +36,7 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(
         app,
         "tray-show",
-        "打开 泰州市监测中心智能监测系统",
+        "打开 江苏省泰州环境监测中心智能监测系统",
         true,
         None::<&str>,
     )?;
@@ -44,7 +44,7 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItem::with_id(
         app,
         "tray-quit",
-        "退出 泰州市监测中心智能监测系统",
+        "退出 江苏省泰州环境监测中心智能监测系统",
         true,
         None::<&str>,
     )?;
@@ -57,7 +57,7 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::with_id("main-tray")
         .icon(icon.clone())
-        .tooltip("泰州市监测中心智能监测系统 · 后台运行")
+        .tooltip("江苏省泰州环境监测中心智能监测系统 · 后台运行")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

@@ -1,7 +1,7 @@
 [package]
 name = "taizhou-aai"
-version = "0.2.2"
-description = "泰州市监测中心智能监测系统 browser automation desktop client"
+version = "0.2.3"
+description = "江苏省泰州环境监测中心智能监测系统 browser automation desktop client"
 authors = ["you"]
 edition = "2021"
 

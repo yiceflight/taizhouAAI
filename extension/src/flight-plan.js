@@ -2,7 +2,6 @@
 export const PLAN_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 export const PLAN_RECIPE = Object.freeze({
   route: '东南火点巡查航线（已验证）',
-  selectedRoute: '东南火点巡查航线（已验证）-副本(2)',
   device: '泰州环境监测', dock: 'Dock 3', aircraft: 'Matrice 4TD',
   precision: '高精度 RTK', strategy: '立即', returnHeight: 110,
   lostLink: '返航', completion: '自动返航', media: '全部文件', subscriber: '运维',
@@ -21,14 +20,73 @@ export function validateSubmitJob(job) {
   }
 }
 
+// Read only the exact plan row in the fixed project. Missing or ambiguous rows
+// are observations of nothing, never evidence that a flight finished.
+export async function readFlightStatus(name, expectedUrl) {
+  if (location.href !== expectedUrl) throw new Error('司空计划列表页面不匹配');
+  if (!/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('巡飞计划名称无效');
+  // FlightHub labels an active mission "任务执行 (3/9)". Keep the
+  // bridge's canonical status so existing clients can reconcile it.
+  const states = ['待执行', '执行中', '任务执行', '已暂停', '已挂起', '部分执行', '执行成功', '执行失败', '执行终止'];
+  const visible = e => e.getClientRects().length > 0;
+  const label = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
+  const read = () => {
+    const rows = [...document.querySelectorAll('tr,[role="row"]')].filter(visible).filter(row =>
+      [...row.querySelectorAll('*')].some(e => visible(e) && !e.children.length && label(e) === name));
+    if (rows.length > 1) throw new Error('同名司空计划不唯一');
+    if (!rows.length) return null;
+    // The finished list appends progress, e.g. "执行成功 (9/9)".
+    const found = [...new Set(states.filter(state => [...rows[0].querySelectorAll('*')].some(e =>
+      visible(e) && new RegExp(`^${state}(?:[（(]\\d+/\\d+[）)])?$`).test(label(e))))
+      .map(state => state === '任务执行' ? '执行中' : state))];
+    return found.length === 1 ? found[0] : null;
+  };
+  const observations = [];
+  for (const tabName of ['未完成', '已结束', '已完成']) {
+    const tabs = [...document.querySelectorAll('[role="tab"],button')].filter(visible).filter(e => label(e) === tabName);
+    if (tabs.length !== 1) continue;
+    tabs[0].click();
+    await new Promise(resolve => setTimeout(resolve, 900));
+    if (location.href !== expectedUrl) throw new Error('司空计划列表已跳转');
+    const status = read();
+    if (status) observations.push(status);
+  }
+  return { url: location.href, name, status: observations.length === 1 ? observations[0] : null };
+}
+
+// Read-only: FlightHub uses a prefixed Ant modal for weather blocking and other
+// follow-up confirmations. Never activate its execute/confirm buttons.
+export function readFlightSubmissionIssue(expectedUrl, expectedName) {
+  if (![expectedUrl, `${expectedUrl}/create-plan`].includes(location.href)) return null;
+  if (expectedName !== undefined) {
+    const inputs = [...document.querySelectorAll('input[placeholder="请输入计划名称"]')];
+    if (location.href !== `${expectedUrl}/create-plan` || inputs.length !== 1 || inputs[0].value !== expectedName) return null;
+  }
+  const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+  const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
+  for (const dialog of dialogs) {
+    const body = dialog.querySelector('[class*="-modal-body"]') || dialog;
+    const message = (body.innerText || body.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!message) continue;
+    const weather = /天气阻飞|因天气原因|在线天气风速/.test(message);
+    return `司空平台${weather ? '天气阻飞' : '要求人工确认'}：${message.slice(0, 220)}；未继续执行`;
+  }
+  return null;
+}
+
 // Fixed project/recipe only. Preview always leaves the final confirmation intact.
-export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) {
+export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, readSubmissionIssue) {
   const deadline = Date.now() + 55000;
   const check = () => {
     if (![expectedUrl, `${expectedUrl}/create-plan`].includes(location.href)) throw new Error('司空页面不匹配，请登录后重试');
     if (Date.now() >= deadline) throw new Error('司空填写超时；已停止，请检查页面');
   };
   check();
+  if (submit) {
+    if (typeof readSubmissionIssue !== 'function') throw new Error('司空提交提示读取不可用，未点击确定');
+    const issue = readSubmissionIssue(expectedUrl);
+    if (issue) throw new Error(issue);
+  }
   if (submit && !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
   const text = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
@@ -74,13 +132,29 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) 
   while (form && !(leaves('任务类型', form).length && leaves('媒体存储位置', form).length)) form = form.parentElement;
   if (!form || form === document.body || form === document.documentElement) throw new Error('未能限定新建计划表单范围');
   if (!submit) choose('普通任务', form);
-  const routeSelected = () => leaves(recipe.selectedRoute, form).length === 1 || leaves(recipe.route, form).length === 1;
+  // FlightHub creates a route copy when selecting it; its suffix is variable.
+  // Match the configured prefix, keeping the library and selected form separate.
+  const routeNames = root => all('*', root).filter(e => text(e).startsWith(norm(recipe.route))
+    && ![...e.children].some(c => visible(c) && text(c).startsWith(norm(recipe.route))));
+  const routeSelected = () => {
+    const matches = routeNames(form);
+    if (matches.length > 1) throw new Error('已选航线不唯一，已停止填写');
+    return matches.length === 1;
+  };
   if (!routeSelected()) {
     if (submit) throw new Error('指定航线已变化，未提交');
     choose('选择航线', form);
-    await wait(() => leaves(recipe.route).length || leaves(recipe.selectedRoute).length, '指定航线');
-    // Prefer the library name shown in the video, never use the first route.
-    const candidates = leaves(recipe.route).length ? leaves(recipe.route) : leaves(recipe.selectedRoute).filter(e => !form.contains(e));
+    const library = await wait(() => {
+      const titles = leaves('航线库');
+      if (!titles.length) return null;
+      let root = unique(titles, '航线库').parentElement;
+      while (root && root !== document.body && !root.contains(form)) {
+        if (routeNames(root).length) return root;
+        root = root.parentElement;
+      }
+      return null;
+    }, '航线库内的指定航线');
+    const candidates = routeNames(library);
     click(unique(candidates, '视频指定航线'));
     await wait(routeSelected, '选中航线');
   }
@@ -137,7 +211,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) 
     return false;
   };
   const checks = [
-    [finalNameInput.value === name, '计划名称'], [Number(height.value) === recipe.returnHeight, '返航高度'],
+    [finalNameInput.value === name, '计划名称'], [Number(height.value) === recipe.returnHeight, '最低返航高度（相对机场）'],
     [Number(frequency.value) === 0, '告警频率'],
     ...[recipe.precision, recipe.strategy, recipe.lostLink, '普通任务'].map(label => [selected(label), label]),
     [routeSelected(), '执行航线'], [deviceCards(form).length === 1, '选择设备'],
@@ -146,16 +220,23 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) 
   ];
   const failed = checks.filter(([ok]) => !ok).map(([, label]) => label);
   if (failed.length) throw new Error(`填写核对未通过：${failed.join('、')}；未点击确定`);
-  for (const label of ['多模态识别', '自动断点续飞', '智能规划最佳返航路线']) if (checked(field(label, '[role="switch"],input[type="checkbox"]', form)) !== false) throw new Error(`${label}未关闭`);
-  for (const { input, value, label } of channels) if (checked(input) !== value) throw new Error(`${label}未通过核对`);
+  for (const label of ['多模态识别', '自动断点续飞', '智能规划最佳返航路线']) {
+    if (checked(field(label, '[role="switch"],input[type="checkbox"]', form)) !== false) throw new Error(`${label}未关闭`);
+    checks.push([true, label]);
+  }
+  for (const { input, value, label } of channels) {
+    if (checked(input) !== value) throw new Error(`${label}未通过核对`);
+    checks.push([true, label]);
+  }
   for (const row of rows) {
     const controls = all('input[type="checkbox"]', row).length ? all('input[type="checkbox"]', row) : all('[role="checkbox"]', row);
     if (controls.length && checked(controls[0]) !== (row === subscriberRow)) throw new Error('订阅人员未通过核对');
   }
+  checks.push([true, '订阅人员勾选']);
   let footer = form;
   while (footer && !leaves('确定', footer).length) footer = footer.parentElement;
   const confirmation = unique(leaves('确定', footer || form), '最终确定按钮');
-  if (!submit) return { status: 'ready', submitted: false, name, url: location.href, recipe };
+  if (!submit) return { status: 'ready', submitted: false, name, url: location.href, verified: checks.map(([, label]) => label) };
   if (!/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   check();
   const button = confirmation.closest('button,[role="button"]');
@@ -164,8 +245,13 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false) 
   button.click();
   const receiptDeadline = Date.now() + 8000;
   while (Date.now() < receiptDeadline) {
-    if (location.href === expectedUrl && leaves(name).length === 1 && !nameInputs().length) {
-      return { status: 'submitted', submitted: true, name, url: location.href };
+    const issue = readSubmissionIssue(expectedUrl);
+    if (issue) throw new Error(issue);
+    if (location.href === expectedUrl && !nameInputs().length) {
+      // The same name appears in both the active-device card and plan list.
+      // Only the unique plan row is a receipt; a device card alone is not.
+      const rows = all('tr,[role="row"]').filter(row => leaves(name, row).length > 0);
+      if (rows.length === 1) return { status: 'submitted', submitted: true, name, url: location.href };
     }
     await new Promise(resolve => setTimeout(resolve, 200));
   }

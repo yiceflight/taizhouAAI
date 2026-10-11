@@ -1,6 +1,7 @@
-name: Build and publish release
+name: Build clients and publish tagged releases
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*.*.*'
@@ -18,19 +19,23 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      source_ref: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - id: version
         shell: bash
         env:
           REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
-          tag="$REF_NAME"
+          tag="v$package_version"
+          if [[ "$EVENT_NAME" == "push" ]]; then tag="$REF_NAME"; fi
           version="${tag#v}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$package_version" == "$version" ]] || { echo "package.json is $package_version, release is $version" >&2; exit 1; }
+          node --input-type=module -e 'import fs from "node:fs"; const v = JSON.parse(fs.readFileSync("package.json")).version; const tauri = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json")).version; const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8").match(/^version = "([^"]+)"/m)?.[1]; if (v !== tauri || v !== cargo) throw new Error("Client versions must match");'
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -40,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.source_ref }}
       - uses: pnpm/action-setup@v4
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -59,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.source_ref }}
       - uses: pnpm/action-setup@v4
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -69,6 +74,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build universal macOS updater artifact
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -80,9 +86,11 @@ jobs:
           set -euo pipefail
           rm -rf staging
           mkdir -p staging
-          find "src-tauri/target/universal-apple-darwin/release/bundle" -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sig' \) -exec cp {} staging/ \;
-          files=(staging/*.tar.gz staging/*.tar.gz.sig)
-          ((${#files[@]} == 2)) || { echo "Expected one macOS tar.gz and one signature" >&2; find staging -maxdepth 1 -type f -print; exit 1; }
+          find "src-tauri/target/universal-apple-darwin/release/bundle" -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.tar.gz.sig' \) -exec cp {} staging/ \;
+          for pattern in '*.dmg' '*.tar.gz' '*.tar.gz.sig'; do
+            count=$(find staging -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')
+            [[ "$count" == 1 ]] || { echo "Expected one $pattern artifact" >&2; exit 1; }
+          done
           ls -l staging
       - uses: actions/upload-artifact@v4
         with:
@@ -96,7 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.source_ref }}
       - uses: pnpm/action-setup@v4
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -106,6 +114,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: rustup target add x86_64-pc-windows-msvc
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build Windows x64 updater artifact
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -131,12 +140,13 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: github.event_name == 'push'
     needs: [metadata, build-macos, build-windows]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.source_ref }}
           fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
@@ -172,4 +182,4 @@ jobs:
       - name: Create GitHub release record
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ needs.metadata.outputs.tag }}" staging/* --title "泰州市监测中心智能监测系统 ${{ needs.metadata.outputs.version }}" --generate-notes
+        run: gh release create "${{ needs.metadata.outputs.tag }}" staging/* --title "江苏省泰州环境监测中心智能监测系统 ${{ needs.metadata.outputs.version }}" --generate-notes

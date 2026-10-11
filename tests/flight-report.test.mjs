@@ -38,3 +38,52 @@ test('DJI opens the selected photo with click and downloads its full-size record
  sandbox.createImageBitmap=async()=>({width:200,height:113,close(){}});
  await assert.rejects(vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name})})`,sandbox),/缩略图/);
 });
+
+function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jpeg'], immediate = true, initialFolder = false }) {
+ const {document} = parseHTML('<html><body><div class="ant-breadcrumb"></div><table><thead><tr><th></th></tr></thead><tbody></tbody></table></body></html>');
+ const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
+ let hash = '', opened = [];
+ const total = pages.reduce((count, names) => count + names.length, 0);
+ const show = (folder, names, onClick) => {
+  document.querySelector('.ant-breadcrumb').textContent = folder;
+  document.querySelector('th').textContent = `名称 (0/${folder === '媒体文件' ? total : names.length})`;
+  document.querySelector('tbody').innerHTML = names.length ? names.map(name => `<tr><td><span>${name}</span></td></tr>`).join('') : '<tr><td>暂无数据</td></tr>';
+  for(const e of document.querySelectorAll('*')) e.getClientRects = () => [{}];
+  for(const e of document.querySelectorAll('tbody span')) e.click = () => onClick(e.textContent);
+ };
+ const openTask = name => {
+  opened.push(name); hash = '#/media?page=1&size=50&pid=task';
+  show(`媒体文件 / ${name}`, immediate ? ['Immediate-Media'] : ['video.mp4'], () => {
+   hash = '#/media?page=1&size=50&pid=photos';
+   show(`媒体文件 / ${name} / Immediate-Media`, folderPhotos, () => {});
+  });
+ };
+ const location = {origin:'https://fh.dji.com',pathname:project, get href(){return this.origin+this.pathname+hash;},get hash(){return hash;},set hash(value){hash=value;show('媒体文件',pages[Number(new URLSearchParams(value.split('?')[1]).get('page'))-1] || [],openTask);}};
+ location.hash = '#/media?page=1&size=50';
+ if(initialFolder){ hash='#/media?page=1&size=50&pid=wrong'; show('媒体文件 / 旧航次 / Immediate-Media',['DJI_20260921071701_0002_V.jpeg'],()=>{}); }
+ const run = () => vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-list',startTime:start,endTime:end})})`,{document,location,URLSearchParams,setTimeout:fn=>fn()});
+ return {run,opened,document};
+}
+test('DJI matches the unique Beijing start time across pages and navigates from another flight', async()=>{
+ const fixture=autoMediaFixture({initialFolder:true,pages:[['旧任务 2026-09-21 07:00:05 (UTC+08)'],['每日7时 2026-09-22 07:00:05 (UTC+08)']]});
+ const result=await fixture.run();
+ assert.deepEqual(fixture.opened,['每日7时 2026-09-22 07:00:05 (UTC+08)']);
+ assert.equal(result.matchedStartTime,start);
+ assert.equal(result.files.length,1);
+ assert.match(result.folder,/2026-09-22 07:00:05.*Immediate-Media/);
+});
+test('DJI refuses ambiguous candidates even when they occur on different pages', async()=>{
+ const fixture=autoMediaFixture({pages:[['任务A 2026-09-22 07:00:05 (UTC+08)'],['任务B 2026-09-22 07:02:05 (UTC+08)']]});
+ await assert.rejects(fixture.run(),/多个司空航次/);assert.equal(fixture.opened.length,0);
+});
+test('DJI does not choose the nearest flight outside the tolerance or infer time from creation column', async()=>{
+ const fixture=autoMediaFixture({pages:[['另一天任务 2026-09-21 07:00:05 (UTC+08)']]});
+ fixture.document.querySelector('tbody tr').innerHTML += '<td>2026-09-22 07:01:20</td>';
+ await assert.rejects(fixture.run(),/未找到开始时间/);assert.equal(fixture.opened.length,0);
+});
+test('DJI distinguishes missing photo folder from a confirmed empty photo folder', async()=>{
+ const pages=[['每日7时 2026-09-22 07:00:05 (UTC+08)']];
+ await assert.rejects(autoMediaFixture({pages,immediate:false}).run(),/尚无 Immediate-Media/);
+ const result=await autoMediaFixture({pages,folderPhotos:[]}).run();
+ assert.equal(result.files.length,0);assert.match(result.folder,/Immediate-Media$/);
+});

@@ -14,6 +14,8 @@ pnpm oss:setup
 
 ## 发布
 
+仅构建安装包时，在 GitHub Actions 手动运行 `Build clients and publish tagged releases`（选择已提交的分支）。该入口运行 Node、UI 和两平台 Rust 测试，产出 Windows x64 NSIS 安装包、macOS universal DMG、updater 包及签名；不会更新 OSS 清单或创建 GitHub Release。安装包从该次运行的 `release-windows`、`release-macos` artifacts 下载。客户端三处版本号必须一致。
+
 正式发布走 GitHub Actions：修改 `package.json`、`src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的同一版本号，提交后创建对应 tag（例如 `v0.2.0`）并推送。`.github/workflows/release.yml` 会先运行测试和前端构建，再分别构建 macOS universal updater 包与 Windows x64 NSIS 安装包，最后校验签名并发布到 OSS，同时创建 GitHub Release。
 
 仓库 Actions secrets 需要配置 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`OSS_ENDPOINT`、`OSS_BUCKET`、`OSS_DOMAIN` 和 `TAURI_SIGNING_PRIVATE_KEY`。私钥只在 runner 环境注入，不写入仓库。当前工作流未配置 Apple Developer 证书与 notarization，macOS 包已完成 Tauri updater 签名，但首次安装仍可能需要用户在系统设置中允许打开。
@@ -29,7 +31,9 @@ pnpm oss:publish staging 0.1.1
 
 发布脚本会把每个版本写入不可变的 `client/v<version>/`，更新 `client/latest.json`，并匿名验证公开 URL。它拒绝覆盖内容不同的旧版本，也拒绝把较新的清单回退到旧版本。
 
-客户端只在正式构建中自动检查更新，启动时检查一次，之后每 6 小时检查一次。发现新版本后显示版本提示；用户确认后下载、校验签名并重启安装，避免在数据采集过程中突然退出。
+客户端只在正式构建中自动检查更新，启动时检查一次，之后每 6 小时检查一次；失败后每 5 分钟重试，网络恢复时立即重试，窗口恢复焦点时补做已到期的检查。底栏显示自动检查状态，手动检查只是补充入口。发现新版本后显示版本提示；用户确认后下载、校验签名并重启安装，避免在数据采集过程中突然退出。
+
+发布清单的 `pub_date` 必须是单行 RFC 3339 时间。发布脚本读取标签所指向提交的时间，避免带注释标签的说明文字混入日期，并在发布前及 dry-run 时校验。
 
 ## 随版本携带的插件兼容要求
 

@@ -1,5 +1,50 @@
+import { findJiangsuApi } from './jiangsu.js';
+import { PLAN_URL } from './flight-plan.js';
+
 // Fixed read-only checks in the site's own context. Credentials never leave the page.
-export async function checkSiteHealth() {
+export function prioritizeHealthJobs(jobs, tabs) {
+  const positions = jobs.flatMap((job, index) => ['site-health', 'jiangsu-health', 'airins-health-open', 'dji-health-open'].includes(job.type) ? [index] : []);
+  const checks = positions.map(index => jobs[index]).sort((a, b) =>
+    Number(b.type === 'airins-health-open' || tabs.some(tab => tab.id === b.tabId && tab.url.startsWith('https://aai.airins.cn/sniff'))) -
+    Number(a.type === 'airins-health-open' || tabs.some(tab => tab.id === a.tabId && tab.url.startsWith('https://aai.airins.cn/sniff'))));
+  const ordered = [...jobs];
+  positions.forEach((index, order) => { ordered[index] = checks[order]; });
+  return ordered;
+}
+
+async function openForHealth(chrome, capture, url, name, timing) {
+  const now = timing.now || Date.now;
+  const pause = timing.pause || (() => new Promise(resolve => setTimeout(resolve, 200)));
+  const origin = new URL(url).origin;
+  const tabs = (await chrome.tabs.query({ url: `${origin}/*` }))
+    .filter(tab => new URL(tab.url).origin === origin);
+  // The user may have opened a tab since the client's last heartbeat. Reuse it,
+  // including loading/login pages, without replacing or activating their page.
+  const tab = tabs.find(tab => new URL(tab.url).pathname === new URL(url).pathname)
+    || tabs[0] || await chrome.tabs.create({ url, active: false });
+  const deadline = now() + 20000;
+  while (now() < deadline) {
+    const current = await chrome.tabs.get(tab.id);
+    if (new URL(current.url).origin !== origin) throw new Error(`${name}跳转到非授权网站，已停止验证`);
+    if (current.status === 'complete') {
+      const health = await capture(tab.id, { type: 'site-health' });
+      if (new URL(health.url).origin !== origin) throw new Error(`${name}验证页面来源不匹配`);
+      return { ...health, tabId: tab.id };
+    }
+    await pause();
+  }
+  throw new Error(`${name}页面加载超时，请检查 Chrome 或网络`);
+}
+
+export async function openAirinsForHealth(chrome, capture, timing = {}) {
+  return openForHealth(chrome, capture, 'https://aai.airins.cn/sniff/HistoryCloud', '可飞', timing);
+}
+
+export async function openDjiForHealth(chrome, capture, timing = {}) {
+  return openForHealth(chrome, capture, PLAN_URL, '司空', timing);
+}
+
+export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
   const url = location.href;
   const result = (state, message) => ({ url: location.href, state, message });
   const origin = location.origin;
@@ -14,16 +59,9 @@ export async function checkSiteHealth() {
   };
   try {
     if (origin === 'http://61.155.4.60:18080') {
-      if (location.hash.split('?')[0] !== '#/particle-analysis/feature-analysis/time-series') return result('page_required', '请打开颗粒物分析的时间序列页面');
-      const queue = [document.querySelector('.time-series')?.__vue__, document.querySelector('#app')?.__vue__].filter(Boolean), seen = new Set();
-      let vm;
-      while (queue.length && seen.size < 3000) {
-        const node = queue.shift(); if (seen.has(node)) continue; seen.add(node);
-        if (node.$options?.name === 'PM-time-series') { vm = node; break; }
-        queue.push(...(node.$children || [])); if (node.$parent) queue.push(node.$parent);
-      }
-      if (!vm?.$Ajax?.componentDeviceOption || !vm.$Ajax.photoTimeSeriesData) return result('page_required', '时间序列页面尚未就绪，请等待加载或重新打开');
-      const response = await vm.$Ajax.componentDeviceOption({ componentSiteType: 1, siteCodes: '321200', includeDeviceType: 'WEATHER,SO2,O3,CO,PM10,PM25,NOx', siteType: 'CITY' });
+      const api = getJiangsuApi();
+      if (!api) return result('page_required', '正在等待江苏大气站 API 客户端加载');
+      const response = await api.componentDeviceOption({ componentSiteType: 1, siteCodes: '321200', includeDeviceType: 'WEATHER,SO2,O3,CO,PM10,PM25,NOx', siteType: 'CITY' });
       if (response?.code !== 0 || !Array.isArray(response.data)) return result(classify(response), '指标目录读取失败，请检查登录或平台访问权限');
       return result('ready', '登录有效，泰州市指标目录可读取');
     }

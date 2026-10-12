@@ -94,7 +94,7 @@ fn plugin(bridge: &crate::bridge::BridgeStatus) -> (bool, String) {
     if !bridge.connected {
         return (
             false,
-            "尚未连接插件。请安装或启用插件，并保持 Chrome 运行。".into(),
+            "未收到插件连接，请保持 Chrome 运行，并查看本机连接诊断；此状态不代表插件未安装。".into(),
         );
     }
     if bridge.versions.iter().any(|v| !compatible(v)) {

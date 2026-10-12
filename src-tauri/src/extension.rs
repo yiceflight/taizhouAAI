@@ -8,7 +8,7 @@ pub struct ExtensionDirectory {
     platform: &'static str,
 }
 
-fn extension_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn extension_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     // Tauri's dev flag also distinguishes a packaged debug build from tauri dev.
     // Join native paths instead of constructing platform-specific path strings in JS.
     let directory = if tauri::is_dev() {

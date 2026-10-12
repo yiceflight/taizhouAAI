@@ -138,6 +138,7 @@ pub fn run() {
             extension::get_extension_directory,
             extension::open_extension_directory,
             bridge::get_bridge_status,
+            bridge_diagnostics::diagnose_bridge,
             readiness::get_readiness,
             readiness::check_readiness,
             readiness::start_workspace,
@@ -190,6 +191,7 @@ mod extension;
 mod window_lifecycle;
 
 mod bridge;
+mod bridge_diagnostics;
 mod reports;
 mod updates;
 

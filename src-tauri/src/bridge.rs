@@ -17,12 +17,12 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const ORIGIN: &str = if tauri::is_dev() {
+pub(crate) const ORIGIN: &str = if tauri::is_dev() {
     env!("BRIDGE_DEV_ORIGIN")
 } else {
     env!("BRIDGE_PROD_ORIGIN")
 };
-const ADDRESS: &str = if tauri::is_dev() {
+pub(crate) const ADDRESS: &str = if tauri::is_dev() {
     env!("BRIDGE_DEV_ADDRESS")
 } else {
     env!("BRIDGE_PROD_ADDRESS")
@@ -60,9 +60,18 @@ struct Inner {
     clients: HashMap<String, Client>,
     pending: HashMap<String, Pending>,
     error: Option<String>,
+    instance_id: String,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Bridge(Arc<Mutex<Inner>>);
+impl Default for Bridge {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(Inner {
+            instance_id: Uuid::new_v4().to_string(),
+            ..Inner::default()
+        })))
+    }
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabStatus {
@@ -200,6 +209,17 @@ async fn heartbeat(
         .collect();
     Ok(Json(json!({ "ok": true, "jobs": jobs })))
 }
+
+// Read-only probe: never register a browser session or deliver queued jobs.
+async fn diagnose(
+    State(bridge): State<Bridge>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !authorized(&headers) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(json!({"instanceId": bridge.instance_id()})))
+}
 #[derive(Deserialize)]
 struct Completion {
     session: String,
@@ -244,13 +264,19 @@ impl Bridge {
             let listener = match tokio::net::TcpListener::bind(ADDRESS).await {
                 Ok(listener) => listener,
                 Err(error) => {
+                    let advice = if error.kind() == std::io::ErrorKind::AddrInUse {
+                        "端口已被占用，请检查是否重复运行客户端或有其他程序占用此端口。"
+                    } else {
+                        "请运行本机连接诊断，检查系统权限或安全软件的拦截记录。"
+                    };
                     bridge.0.lock().unwrap().error = Some(format!(
-                        "本地连接端口 {ADDRESS} 无法启动：{error}。请退出重复运行的客户端后重启。"
+                        "本地连接端口 {ADDRESS} 无法启动：{error}。{advice}"
                     ));
                     return;
                 }
             };
             let router = Router::new()
+                .route("/diagnose", post(diagnose))
                 .route("/heartbeat", post(heartbeat))
                 .route("/complete", post(complete))
                 .route("/cancel-flight", post(move |headers: HeaderMap, Json(input): Json<CancelFlight>| {
@@ -271,6 +297,9 @@ impl Bridge {
     }
     pub fn busy(&self) -> bool {
         !self.0.lock().unwrap().pending.is_empty()
+    }
+    pub(crate) fn instance_id(&self) -> String {
+        self.0.lock().unwrap().instance_id.clone()
     }
     pub fn status(&self) -> BridgeStatus {
         let mut inner = self.0.lock().unwrap();
@@ -473,6 +502,22 @@ pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_receipt_requires_authorization_and_never_creates_a_session() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            assert_ne!(bridge.instance_id(), Bridge::default().instance_id());
+            let mut headers = HeaderMap::new();
+            assert_eq!(diagnose(State(bridge.clone()), headers.clone()).await.unwrap_err(), StatusCode::FORBIDDEN);
+            headers.insert("origin", ORIGIN.parse().unwrap());
+            headers.insert("host", ADDRESS.parse().unwrap());
+            headers.insert("x-taizhou-bridge", "1".parse().unwrap());
+            let result = diagnose(State(bridge.clone()), headers).await.unwrap();
+            assert_eq!(result.0["instanceId"], bridge.instance_id());
+            assert!(!bridge.status().connected);
+            assert!(!bridge.busy());
+        });
+    }
     #[test]
     fn hourly_target_uses_the_api_verified_tab_and_rejects_navigation() {
         let bridge = Bridge::default();

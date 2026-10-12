@@ -443,3 +443,14 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .task-clear-confirm p { margin-top: 8px; }
 .task-clear-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .task-clear-actions .secondary-button { margin-top: 0; }
+/* Connection diagnostics stay readable for long Windows paths and OS errors. */
+.bridge-diagnostics { margin-top: 16px; }
+.diagnostic-time { color: var(--muted, #64748b); font-size: 12px; }
+.diagnostic-checks { list-style: none; padding: 0; margin: 12px 0; }
+.diagnostic-checks > li { padding: 12px 0; border-bottom: 1px solid var(--border, #e2e8f0); }
+.diagnostic-check-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.diagnostic-checks p { margin: 6px 0; overflow-wrap: anywhere; }
+.diagnostic-checks small { display: block; color: var(--muted, #64748b); line-height: 1.6; }
+.diagnostic-details summary { cursor: pointer; }
+.diagnostic-details dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; font-size: 12px; }
+.diagnostic-details dd { margin: 0; overflow-wrap: anywhere; }

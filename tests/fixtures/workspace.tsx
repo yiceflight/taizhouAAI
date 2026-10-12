@@ -28,6 +28,16 @@ const getMonitor = () => ({settings,enabled,syncing:false,lastAttempt:date(Date.
   flight:{enabled:flightEnabled,threshold:settings.potassiumThreshold,delayMinutes:settings.takeoffDelayMinutes,event:flightEvent,records:flightRecords},
 });
 mockIPC(async (command, payload) => {
+  if(command==='diagnose_bridge')return {
+    checkedAt:new Date().toISOString(),appVersion:'0.2.4',platform:'windows',channel:'正式版',address:'127.0.0.1:14520',
+    extensionId:'knpgppgofegbnimjoahnifpmhgmgnicf',minimumExtensionVersion:'0.7.14',
+    checks:[
+      {id:'files',label:'随 App 附带的插件目录',state:'pass',detail:'目录和入口文件可读取：D:\\江苏省泰州环境监测中心智能监测系统\\extension',suggestion:'此项不能确认 Chrome 实际加载的是这个目录。'},
+      {id:'tcp',label:'本机端口',state:'pass',detail:'127.0.0.1:14520 TCP 连接成功',suggestion:''},
+      {id:'service',label:'当前客户端服务',state:'pass',detail:'当前 App 的本机服务回应正常，身份核对通过',suggestion:''},
+      {id:'plugin',label:'浏览器插件心跳',state:scenario==='missing'?'warning':'pass',detail:scenario==='missing'?'未收到有效插件心跳，无法据此判断插件是否已安装':'收到插件 v0.7.14 的有效心跳；网站登录状态请查看网站验证',suggestion:scenario==='missing'?'若本机服务通过：打开 Chrome 扩展管理页，确认插件已启用、ID 与下方一致，并重新加载当前 App 提供的插件目录；查看插件的“错误”和 Service Worker。App 内的端口检测不能证明 Chrome 到 App 的请求未被拦截。':''},
+    ],
+  };
   if(command==='get_bridge_status')return {connected:scenario!=='missing',clients:scenario==='missing'?0:1,versions:['0.7.0'],tabs,error:null};
   if(command==='get_readiness'||command==='check_readiness')return getReadiness();
   if(command==='get_monitoring')return getMonitor();

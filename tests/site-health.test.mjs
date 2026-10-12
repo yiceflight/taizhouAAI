@@ -35,17 +35,88 @@ test('Jiangsu uses fixed read-only catalog and rejects expired or unavailable se
   assert.equal((await run('http://61.155.4.60:18080/#/home/map')).state,'page_required');
   assert.equal((await run(map)).state,'page_required');
 });
-test('DJI reuses only the existing HTTP client and verifies identity rather than URL presence', async () => {
-  assert.equal((await run(dji)).state,'error');
-  let response={data:{code:0,data:{uuid:'fixture'}}};
-  const chunks=[];
-  chunks.push=chunk=>chunk[2](id=>{assert.equal(id,'4994');return {ZP:{get:async(path,opts)=>{assert.equal(path,'/manage/api/v1/users/current');assert.equal(opts.timeout,12000);return response;}}};});
-  assert.equal((await run(dji,{webpackChunkmain_app:chunks})).state,'ready');
-  response={data:{code:401}};
-  assert.equal((await run(dji,{webpackChunkmain_app:chunks})).state,'login_required');
-  response={data:{code:0,data:null}};
-  assert.equal((await run(dji,{webpackChunkmain_app:chunks})).state,'error');
-  assert.equal((await run('https://fh.dji.com/organization/other/project/other#/plan')).state,'page_required');
+function djiSession(extra = {}) {
+  return {
+    localStorage: { getItem: key => key === 'x-auth-token' ? 'fixture-auth' : null },
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ code: 0, data: { user_id: 'fixture-user' } }) }),
+    ...extra,
+  };
+}
+test('DJI verifies the server identity without loading any frontend modules or returning credentials', async () => {
+  for (const useUserToken of [false, true]) {
+    const reads = [];
+    const context = djiSession({
+      webpackChunkmain_app: new Proxy([], {get() { throw Error('must not inspect modules'); }}),
+      localStorage: { getItem(key) { reads.push(key); return key === 'x-user-token' ? (useUserToken ? 'fixture-user-token' : null) : 'fixture-auth'; } },
+      fetch: async (url, options) => {
+        assert.equal(url, 'https://es-flight-api-cn.djigate.com/manage/api/v1/users/current');
+        assert.equal(options.method, 'GET');
+        assert.equal(options.credentials, 'omit');
+        assert.equal(options.cache, 'no-store');
+        assert.equal(options.redirect, 'error');
+        assert.ok(options.signal);
+        assert.deepEqual(Object.keys(options.headers), [useUserToken ? 'X-User-Token' : 'X-Auth-Token']);
+        assert.equal(Object.values(options.headers)[0], useUserToken ? 'fixture-user-token' : 'fixture-auth');
+        return {ok:true,status:200,json:async()=>({code:0,data:{user_id:'private-user-id',user_account:'private-account'}})};
+      },
+    });
+    const result = await run(dji, context);
+    assert.equal(result.state, 'ready');
+    assert.deepEqual(Object.keys(result).sort(), ['message','state','url']);
+    assert.doesNotMatch(JSON.stringify(result), /fixture-|private-/);
+    assert.deepEqual(reads, useUserToken ? ['x-user-token'] : ['x-user-token','x-auth-token']);
+  }
+});
+test('DJI refuses missing credentials, other projects and untrusted backend destinations before requesting', async () => {
+  const noRequest = async () => { throw Error('must not request'); };
+  assert.equal((await run(dji, djiSession({localStorage:{getItem:()=>null},fetch:noRequest}))).state, 'login_required');
+  const noStorage = {getItem() {throw Error('must not read');}};
+  assert.equal((await run('https://fh.dji.com/organization/other/project/other#/plan', djiSession({localStorage:noStorage,fetch:noRequest}))).state,'page_required');
+  const result = await run(dji, djiSession({CURRENT_BE_ENV_CONFIG:{server_url:'https://evil.test'},localStorage:noStorage,fetch:noRequest}));
+  assert.equal(result.message, '请使用司空中国区服务后重新验证');
+  const login = await run('https://fh.dji.com/#/login', djiSession({localStorage:noStorage,fetch:noRequest}));
+  assert.equal(login.state, 'login_required');
+});
+test('DJI classifies HTTP failures and requires a successful identity, not just an open page or stored token', async () => {
+  for (const [status, state] of [[401,'login_required'],[403,'forbidden'],[500,'error']]) {
+    assert.equal((await run(dji,djiSession({fetch:async()=>({ok:false,status,json(){throw Error('must not parse');}})}))).state,state);
+  }
+  for (const [body, state] of [
+    [{code:200401},'login_required'], [{code:'200401'},'login_required'],
+    [{code:403},'forbidden'], [{code:0,data:null},'error'],
+    [{code:0,data:{}},'error'], [{code:0,data:{user_id:'  '}},'error'],
+    [{code:1,data:{user_id:'fixture'}},'error'],
+  ]) {
+    assert.equal((await run(dji,djiSession({fetch:async()=>({ok:true,status:200,json:async()=>body})}))).state,state);
+  }
+});
+test('DJI network, timeout, invalid JSON and storage failures stay errors without leaking their contents', async () => {
+  for (const extra of [
+    {fetch:async()=>{throw Error('secret-network-detail');}},
+    {fetch:async()=>{throw new DOMException('secret-timeout-detail','TimeoutError');}},
+    {fetch:async()=>({ok:true,status:200,json:async()=>{throw Error('secret-response');}})},
+    {localStorage:{getItem(){throw Error('secret-storage');}}},
+  ]) {
+    const result=await run(dji,djiSession(extra));
+    assert.equal(result.state,'error');
+    assert.doesNotMatch(JSON.stringify(result), /secret-/);
+  }
+});
+test('DJI discards successful identity replies after navigation, including while parsing the body', async () => {
+  for (const duringJson of [false,true]) for (const [target,state] of [
+    ['https://fh.dji.com/#/login','login_required'],
+    ['https://fh.dji.com/organization/other/project/other#/plan','page_required'],
+  ]) {
+    const location = new URL(dji);
+    const result=await run(dji,djiSession({location,fetch:async()=>{
+      if (!duringJson) location.href=target;
+      return {ok:true,status:200,json:async()=>{
+        if (duringJson) location.href=target;
+        return {code:0,data:{user_id:'fixture'}};
+      }};
+    }}));
+    assert.equal(result.state,state);
+  }
 });
 test('startup health checks prioritize Airins without moving flight jobs', () => {
   const jobs = [{type:'dji-submit'}, {type:'site-health',tabId:1}, {type:'capture'}, {type:'site-health',tabId:2}, {type:'airins-health-open'}];

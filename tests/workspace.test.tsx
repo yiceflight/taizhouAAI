@@ -109,7 +109,7 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.querySelector('button[aria-label="立即同步"] svg.refresh-icon')).not.toBeNull();
     expect(d.documentElement.textContent).not.toContain('暂停自动同步');
     const f=dom(<DroneStatus {...props} onFlight={noop}/>);
-    expect(f.documentElement.textContent).toContain('等待浏览器与网站就绪');
+    expect(f.querySelector('.drone-status-copy')).toBeNull();
     expect(button(f,'立即执行任务').hasAttribute('disabled')).toBe(true);
   });
   it('keeps old data warnings visible and never labels unavailable flight data as waiting for threshold',()=>{

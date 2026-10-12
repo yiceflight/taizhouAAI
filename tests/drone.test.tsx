@@ -26,26 +26,45 @@ describe('drone task display',()=>{
       const d = data(); d.flight.event = { ...event(state), statusCheckedAt: now, statusCheckError: '平台风速超限，请核查原任务' };
       expect(button(render(d), '刷新状态')).toBeDefined();
       const overview = parseHTML(renderToStaticMarkup(<MonitoringPanel data={d} ready started busy={false} action={async()=>true} onPrepare={()=>{}} onFlight={()=>{}} />)).document;
-      expect(overview.querySelector('[role="status"]')?.textContent).toContain('核查未完成');
-      expect(overview.querySelector('[role="status"]')?.textContent).toContain('平台风速超限');
+      if (state === 'flight_error') {
+        expect(overview.querySelector('[role="status"]')).toBeNull();
+        expect(overview.querySelector('.task-records')?.textContent).toContain('平台风速超限');
+      } else {
+        expect(overview.querySelector('[role="status"]')?.textContent).toContain('核查未完成');
+        expect(overview.querySelector('[role="status"]')?.textContent).toContain('平台风速超限');
+      }
     }
     for (const state of ['failed', 'preparing', 'submitting', 'completed'] as const) {
       const d = data(); d.flight.event = event(state);
       expect(button(render(d), '刷新状态')).toBeUndefined();
     }
   });
-  it('keeps the header brief and places human verification and original receipts below the metrics', () => {
-    const d=data(); d.flight.event={...event('failed'),error:'Error: 填写核对未通过：执行航线；未点击确定'};
+  it.each(['completed', 'failed', 'canceled', 'dismissed', 'not_flown', 'flight_error'] as const)('hides %s from both current displays and retains its receipt once in collapsed history', state => {
+    const d=reading(data(),2);
+    d.flight.event={...event(state), error:'原始平台回执', statusCheckedAt:now};
+    d.flight.records=[d.flight.event];
+    const before=JSON.stringify(d);
+    for (const reportGenerating of [false,true]) {
+      expect(renderToStaticMarkup(<DroneStatus compact data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}} reportGenerating={reportGenerating}/>)).toBe('');
+      const doc=parseHTML(renderToStaticMarkup(<MonitoringPanel data={d} ready started busy={false} action={async()=>true} onPrepare={()=>{}} onFlight={()=>{}} reportGenerating={reportGenerating}/>)).document;
+      expect(doc.querySelector('.drone-status')).toBeNull();
+      expect(doc.querySelector('.task-details-copy')).toBeNull();
+      expect(doc.querySelector('.task-callout')).toBeNull();
+      expect(doc.querySelectorAll('.task-records li')).toHaveLength(1);
+      expect(doc.querySelector('.task-records')?.hasAttribute('open')).toBe(false);
+      expect(doc.querySelector('.task-records')?.textContent).toContain('原始平台回执');
+      expect(button(doc,'核对资料并生成报告')).toBeUndefined();
+      if(state !== 'flight_error') expect(button(doc,state==='failed'?'重新发起任务':'立即执行任务')?.hasAttribute('disabled')).toBe(false);
+    }
+    expect(JSON.stringify(d)).toBe(before);
+  });
+  it.each(['countdown', 'preparing', 'ready', 'submitting', 'submitted', 'uncertain', 'flying', 'paused'] as const)('keeps %s visible in both current displays', state => {
+    const d=data();d.flight.event=event(state);
     const header=parseHTML(renderToStaticMarkup(<DroneStatus compact data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}}/>)).document;
-    expect(header.documentElement.textContent).toContain('待人工核验');
-    expect(header.documentElement.textContent).not.toContain('填写核对');
-    expect(header.documentElement.textContent).not.toContain('手动强制起飞');
-    expect(header.documentElement.textContent).not.toContain('新小时');
-    const below=parseHTML(renderToStaticMarkup(<MonitoringPanel data={d} ready started busy={false} action={async()=>true} onPrepare={()=>{}} onFlight={()=>{}}/>)).document;
-    const details=below.querySelector('#monitoring-task-details')!;
-    expect(details.textContent).toContain('请人工核验电量、设备状态和平台提示');
-    expect(details.textContent).not.toContain('电量不足');
-    expect(details.querySelector('details')?.textContent).toContain('填写核对未通过');
+    const doc=parseHTML(renderToStaticMarkup(<MonitoringPanel data={d} ready started busy={false} action={async()=>true} onPrepare={()=>{}} onFlight={()=>{}}/>)).document;
+    expect(header.querySelector('.drone-status-copy')).not.toBeNull();
+    expect(doc.querySelector('.drone-status-copy')).not.toBeNull();
+    expect(doc.querySelector('.task-callout')).not.toBeNull();
   });
   it('uses Beijing time for multiple no-fly ranges and moves a recorded skip to history at the end', () => {
     const d=data();d.settings.noFlyPeriods=[{start:'05:00',end:'08:00'},{start:'23:00',end:'01:30'}];
@@ -76,7 +95,7 @@ describe('drone task display',()=>{
       d.rows=[{time:'2026-10-09 07:00:00',potassium:1.27}];
       d.flight.event={...event('restricted'),observedAt:d.rows[0].time,error:'禁飞时间：05:00–08:00（北京时间），超标仅记录，不执行起飞。'};
       d.flight.records=[d.flight.event];
-      expect(render(d).querySelector('.drone-status-copy')?.textContent).toContain('禁飞时间');
+      expect(render(d).querySelector('.drone-status-copy')).toBeNull();
       vi.setSystemTime(new Date('2026-10-09T08:00:00+08:00'));
       const header=parseHTML(renderToStaticMarkup(<DroneStatus compact data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}}/>)).document;
       expect(header.querySelector('.drone-status-copy')?.textContent).toContain('等待新小时数据');
@@ -145,7 +164,7 @@ describe('drone task display',()=>{
     expect(flightSummary(d,true,now).title).toContain('起飞请求已提交');
     expect(flightSummary(d,true,now).needsManualLaunch).not.toBe(true);
   });
-  it('uses verified execution and report states, then prompts for report preparation',()=>{
+  it('keeps verified execution visible and removes completed report prompts from the overview',()=>{
     const d=data();
     d.flight.event=event('submitted');
     expect(flightSummary(d,true,now).title).toContain('请求已提交');
@@ -157,8 +176,9 @@ describe('drone task display',()=>{
     expect(flightSummary(d,true,now).title).toContain('执飞异常');
     d.flight.event=event('completed');
     expect(flightSummary(d,true,now).title).toContain('巡飞已结束');
-    expect(button(render(d),'核对资料并生成报告')).toBeDefined();
-    expect(button(render(d),'立即执行任务')).toBeDefined(); // Secondary action in More.
+    expect(button(render(d),'核对资料并生成报告')).toBeUndefined();
+    expect(render(d).querySelector('.drone-status-copy')).toBeNull();
+    expect(button(render(d),'立即执行任务')).toBeDefined(); // Direct manual launch remains available.
     expect(flightSummary(d,true,now,true).title).toContain('正在生成');
     expect(flightSummary(d,true,now,false).title).toContain('巡飞已结束');
   });
@@ -208,20 +228,6 @@ describe('drone task display',()=>{
     d.flight.event=event('canceled');
     expect(button(render(d),'立即执行任务')?.hasAttribute('disabled')).toBe(false);
   });
-  it('requires manual verification without inferring device failure from the preparation receipt',()=>{
-    const d=data();d.flight.event={...event('failed'),error:'天气条件未通过：阵风 6.1 m/s'};
-    const doc=parseHTML(renderToStaticMarkup(<DroneStatus data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}} onAir={()=>{}}/>)).document;
-    expect(doc.querySelector('.drone-status-copy')?.textContent).not.toContain('阵风 6.1 m/s');
-    expect(doc.querySelector('.drone-status-copy')?.textContent).toContain('待人工核验');
-    expect(doc.querySelector('.drone-status-copy')?.textContent).toContain('新小时有效数据到达后，将重新判断超标与起飞条件');
-    expect(button(doc,'重新发起任务')).toBeDefined();
-    expect(button(doc,'查看失败详情')).toBeDefined();
-    const more=doc.querySelector('.drone-more-popover')!;
-    expect(more.hasAttribute('hidden')).toBe(true);
-    expect(more.textContent).toContain('暂不执行本次任务');
-    expect(more.textContent).not.toContain('查看实时监测');
-    expect(button(doc,'归档提醒')).toBeUndefined();
-  });
   it('keeps submitted and executing tasks tracked and directs users to the relevant platform',()=>{
     for(const state of ['ready','submitted','uncertain','paused','flight_error','flying'] as const) {
       const d=data();d.flight.event=event(state);
@@ -244,7 +250,7 @@ describe('drone task display',()=>{
   it('restores the ordinary launch entrance after FlightHub confirms weather blocked execution', () => {
     const d = data(); d.flight.event = { ...event('not_flown'), statusCheckedAt: now, error: '司空平台天气阻飞：在线天气风速 12.75m/s；未继续执行' };
     const doc = render(d);
-    expect(doc.documentElement.textContent).toContain('无人机 · 未起飞');
+    expect(doc.querySelector('.drone-status-copy')).toBeNull();
     expect(button(doc, '立即执行任务')?.hasAttribute('disabled')).toBe(false);
     expect(button(doc, '核查后重新发起')).toBeUndefined();
   });

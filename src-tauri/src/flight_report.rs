@@ -15,11 +15,15 @@ use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
+mod evidence;
+use evidence::{Evidence, photo_facts};
+
 const TEMPLATE: &[u8] = include_bytes!("../assets/flight-report-template.docx");
 const PROJECT: &str = "/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Mission {
+    // Zero means the user supplied flight metadata without an Airins task.
     pub mission_id: u64,
     pub mission_name: String,
     pub start_time: i64,
@@ -60,6 +64,12 @@ pub struct Photo {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Collected {
+    #[serde(default)]
+    pub evidence: Option<Evidence>,
+    #[serde(default)]
+    pub without_air_data: bool,
+    #[serde(default)]
+    pub local_event_id: Option<String>,
     pub mission: Mission,
     pub air: AirData,
     pub media: Media,
@@ -68,15 +78,23 @@ pub struct Collected {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectRequest {
+    #[serde(default)]
+    pub without_air_data: bool,
+    #[serde(default)]
+    pub local_event_id: Option<String>,
     pub dji_session: String,
     pub dji_tab_id: i64,
-    pub sniff_session: String,
-    pub sniff_tab_id: i64,
+    pub sniff_session: Option<String>,
+    pub sniff_tab_id: Option<i64>,
     pub mission: Mission,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
+    #[serde(default)]
+    pub without_air_data: bool,
+    #[serde(default)]
+    pub local_event_id: Option<String>,
     pub id: String,
     pub created_at: i64,
     pub title: String,
@@ -156,12 +174,18 @@ fn photo_time(name: &str) -> Result<i64, String> {
     let t = NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M%S").map_err(|_| "照片拍摄时间无效")?;
     Ok(t.and_utc().timestamp_millis() - 8 * 3600000)
 }
-fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
-    source(&data.air.url, false)?;
+fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
+    if data.without_air_data {
+        if !data.air.points.is_empty() || !data.air.url.is_empty() || data.air.mission_id != 0 || !data.air.unit.is_empty() {
+            return Err("无可飞数据模式不能包含可飞采样资料。".into());
+        }
+    } else {
+        source(&data.air.url, false)?;
+    }
     source(&data.media.url, true)?;
     let m = &data.mission;
-    if m.mission_id == 0
-        || m.mission_id != data.air.mission_id
+    if (!data.without_air_data && (m.mission_id == 0 || m.mission_id != data.air.mission_id))
+        || data.local_event_id.as_ref().is_some_and(|id| Uuid::parse_str(id).is_err())
         || m.mission_name.trim().is_empty()
         || m.mission_name.len() > 500
         || m.geo_location.len() > 500
@@ -172,7 +196,7 @@ fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
     {
         return Err("任务编号或时间无效；请等待飞行结束且数据上传完成至少 1 分钟。".into());
     }
-    if data.air.unit != "μg/m³" || data.air.points.len() < 2 || data.air.points.len() > 20000 {
+    if !data.without_air_data && (data.air.unit != "μg/m³" || data.air.points.len() < 2 || data.air.points.len() > 20000) {
         return Err("PM2.5 单位不符或采样数据不完整。".into());
     }
     if !data.media.folder.trim_end().ends_with("Immediate-Media")
@@ -188,7 +212,7 @@ fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
         }
         let t = photo_time(name)?;
         if t < m.start_time - 300000 || t > m.end_time + 300000 {
-            return Err("司空照片与本次可飞任务时间不匹配，已停止生成。".into());
+            return Err("司空照片与本次飞行时间不匹配，已停止生成。".into());
         }
         let (bytes, _) = decode_image(&p.data_url)?;
         let (width, height) = image_dimensions(&bytes)?;
@@ -210,8 +234,9 @@ fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
     if folder_time.is_none_or(|t| {
         (t.and_utc().timestamp_millis() - 8 * 3600000 - m.start_time).abs() > 300000
     }) {
-        return Err("司空任务文件夹时间与可飞任务不匹配或无法核对。".into());
+        return Err("司空任务文件夹时间与本次飞行不匹配或无法核对。".into());
     }
+    if data.without_air_data { return Ok(None); }
     let mut seen = std::collections::HashSet::new();
     let mut values = vec![];
     let mut coords = 0;
@@ -243,14 +268,14 @@ fn validate(data: &Collected, now: i64) -> Result<Stats, String> {
     }
     let min = values.iter().map(|x| x.0).fold(f64::INFINITY, f64::min);
     let peak = values.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
-    Ok(Stats {
+    Ok(Some(Stats {
         min,
         max: peak.0,
         mean: values.iter().map(|x| x.0).sum::<f64>() / values.len() as f64,
         count: values.len(),
         missing: data.air.points.len() - values.len(),
         peak_time: peak.1,
-    })
+    }))
 }
 fn decode_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
     let (value, ext) = if let Some(v) = url.strip_prefix("data:image/png;base64,") {
@@ -351,21 +376,27 @@ pub async fn collect_flight_report(
     bridge: tauri::State<'_, Bridge>,
     request: CollectRequest,
 ) -> Result<Collected, String> {
-    crate::readiness::require_started(&app)?;
+    if request.without_air_data {
+        crate::readiness::require_report_media(&app)?;
+    } else {
+        crate::readiness::require_started(&app)?;
+    }
     let req = request;
     if req.mission.end_time > Utc::now().timestamp_millis() - 60000 {
         return Err("请等待飞行结束并完成上传至少 1 分钟。".into());
     }
-    let air: AirData = serde_json::from_value(
+    let air: AirData = if req.without_air_data {
+        AirData { url: String::new(), mission_id: 0, unit: String::new(), points: vec![] }
+    } else { serde_json::from_value(
         bridge
             .request(
-                req.sniff_session,
-                req.sniff_tab_id,
+                req.sniff_session.ok_or("请选择可飞页面")?,
+                req.sniff_tab_id.ok_or("请选择可飞页面")?,
                 json!({"type":"flight-airins","missionId":req.mission.mission_id}),
             )
             .await?,
     )
-    .map_err(|e| format!("可飞格式错误：{e}"))?;
+    .map_err(|e| format!("可飞格式错误：{e}"))? };
     let media_value = bridge
         .request(
             req.dji_session.clone(),
@@ -378,13 +409,13 @@ pub async fn collect_flight_report(
     }
     let media: Media = serde_json::from_value(media_value)
         .map_err(|e| format!("司空格式错误：{e}"))?;
-    source(&air.url, false)?;
+    if !req.without_air_data { source(&air.url, false)?; }
     source(&media.url, true)?;
     let mut photos = vec![];
     for name in &media.files {
         let t = photo_time(name)?;
         if t < req.mission.start_time - 300000 || t > req.mission.end_time + 300000 {
-            return Err("照片不属于本次可飞航次，已停止采集。".into());
+            return Err("照片不属于本次飞行，已停止采集。".into());
         }
         let v = bridge
             .request(
@@ -399,6 +430,9 @@ pub async fn collect_flight_report(
         photos.push(serde_json::from_value(v).map_err(|e| format!("图片格式错误：{e}"))?);
     }
     let data = Collected {
+        evidence: None,
+        without_air_data: req.without_air_data,
+        local_event_id: req.local_event_id,
         mission: req.mission,
         air,
         media,
@@ -424,47 +458,39 @@ fn date(t: i64, pattern: &str) -> String {
         .format(pattern)
         .to_string()
 }
-fn paragraph(text: &str) -> String {
-    format!("<w:p><w:pPr><w:spacing w:after=\"120\"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:eastAsia=\"宋体\"/><w:sz w:val=\"24\"/></w:rPr><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",xml(text))
+// Fill only known slots; inserted user text is never interpreted as a slot.
+fn fill_slots(template: &str, fields: &[(&str, String)]) -> Result<String, String> {
+    let mut rest = template;
+    let mut out = String::new();
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let end = rest[start + 2..].find("}}").ok_or("模板字段未闭合")? + start + 2;
+        let key = &rest[start + 2..end];
+        let value = fields.iter().find(|(name, _)| *name == key).ok_or_else(|| format!("模板字段未填写：{key}"))?;
+        out.push_str(&xml(&value.1));
+        rest = &rest[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
-fn table(rows: &[Vec<String>]) -> String {
-    let mut out = String::from("<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>");
-    for side in ["top", "left", "bottom", "right", "insideH", "insideV"] {
-        out.push_str(&format!(
-            "<w:{side} w:val=\"single\" w:sz=\"4\" w:color=\"D9D9D9\"/>"
-        ));
+fn fill_table(doc: &mut String, index: usize, rows: &[Vec<String>]) -> Result<(), String> {
+    let token = format!("{{{{T{index}_0}}}}");
+    let pos = doc.find(&token).ok_or("模板表格行缺失")?;
+    let start = doc[..pos].rfind("<w:tr>").max(doc[..pos].rfind("<w:tr ")).ok_or("模板行起点缺失")?;
+    let end = pos + doc[pos..].find("</w:tr>").ok_or("模板行终点缺失")? + 7;
+    let row_template = &doc[start..end];
+    let mut filled = String::new();
+    for row in rows {
+        let fields: Vec<_> = row.iter().enumerate().map(|(col, value)| (format!("T{index}_{col}"), value.clone())).collect();
+        let fields: Vec<_> = fields.iter().map(|(key, value)| (key.as_str(), value.clone())).collect();
+        filled.push_str(&fill_slots(row_template, &fields)?);
     }
-    out.push_str("</w:tblBorders><w:tblCellMar><w:top w:w=\"80\" w:type=\"dxa\"/><w:left w:w=\"90\" w:type=\"dxa\"/><w:bottom w:w=\"80\" w:type=\"dxa\"/><w:right w:w=\"90\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr>");
-    for (i, row) in rows.iter().enumerate() {
-        out.push_str("<w:tr><w:trPr><w:cantSplit/>");
-        if i == 0 {
-            out.push_str("<w:tblHeader/>")
-        };
-        out.push_str("</w:trPr>");
-        for (col, cell) in row.iter().enumerate() {
-            out.push_str(&format!(
-                "<w:tc><w:tcPr><w:tcW w:w=\"{}\" w:type=\"dxa\"/>{}</w:tcPr>{}</w:tc>",
-                if row.len() == 3 {
-                    [700, 6000, 2000][col]
-                } else {
-                    8700 / row.len()
-                },
-                if i == 0 {
-                    "<w:shd w:fill=\"EDF0F2\"/>"
-                } else {
-                    ""
-                },
-                paragraph(cell)
-            ));
-        }
-        out.push_str("</w:tr>");
-    }
-    out.push_str("</w:tbl>");
-    out
+    doc.replace_range(start..end, &filled);
+    Ok(())
 }
 fn image_xml(id: usize, width: i64, height: i64) -> String {
     format!(
-        r#"<w:p><w:pPr><w:jc w:val="center"/><w:keepNext/><w:spacing w:after="80"/></w:pPr><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{id}" name="Report image {id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="0" name="image"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdFlight{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+        r#"<w:p><w:pPr><w:jc w:val="center"/><w:keepNext/><w:spacing w:before="200" w:after="80"/></w:pPr><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{id}" name="Report image {id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="0" name="image"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdFlight{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
     )
 }
 fn block(doc: &mut String, key: &str, value: &str) -> Result<(), String> {
@@ -484,7 +510,11 @@ fn build_docx(data: &Collected, charts: &[String; 2], issued: i64, pm25_threshol
         return Err("PM2.5 报告阈值必须大于 0。".into());
     }
     let stats = validate(data, issued)?;
-    let above_threshold = data.air.points.iter().filter(|point| point.pm25.is_some_and(|value| value > pm25_threshold)).count();
+    // These remain collection inputs, but the reference has a nine-column
+    // observation table, not extra chart sections or a photo appendix.
+    if !data.without_air_data {
+        for chart in charts { decode_image(chart)?; }
+    }
     let mut src = zip::ZipArchive::new(Cursor::new(TEMPLATE)).map_err(|e| e.to_string())?;
     let mut parts = std::collections::BTreeMap::new();
     for i in 0..src.len() {
@@ -493,131 +523,148 @@ fn build_docx(data: &Collected, charts: &[String; 2], issued: i64, pm25_threshol
         f.read_to_end(&mut b).map_err(|e| e.to_string())?;
         parts.insert(f.name().to_owned(), b);
     }
-    let mut doc = String::from_utf8(parts.remove("word/document.xml").ok_or("模板正文缺失")?)
-        .map_err(|e| e.to_string())?;
+    let mut doc = String::from_utf8(parts.remove("word/document.xml").ok_or("模板正文缺失")?).map_err(|e| e.to_string())?;
+    let caption = String::from_utf8(parts.remove("word/report-caption.xml").ok_or("模板图注缺失")?).map_err(|e| e.to_string())?;
+    let caption = &caption[caption.find("<w:p ").ok_or("图注段落缺失")?..];
+    let caption_for = |text: String| fill_slots(caption, &[("CAPTION", text)]);
     let m = &data.mission;
-    let warning = if stats.max == 0.0 {
-        "本航次 PM2.5 有效数值全部为 0，请核查传感器状态；不能据此判断空气质量良好。"
+    let flight_window = format!("{}～{}", date(m.start_time, "%Y年%m月%d日%H时%M分"), date(m.end_time, "%Y年%m月%d日%H时%M分"));
+    let table_window = if date(m.start_time, "%Y%m%d") == date(m.end_time, "%Y%m%d") {
+        format!("{}～{}", date(m.start_time, "%H:%M"), date(m.end_time, "%H:%M"))
     } else {
-        "单航次采样结果不等同于固定站点小时均值或日均值，不能据此判定污染成因。"
+        format!("{}～{}", date(m.start_time, "%m-%d %H:%M"), date(m.end_time, "%m-%d %H:%M"))
     };
-    let fields=[("DATE",date(m.start_time,"%Y年%m月%d日")),("ISSUED",date(issued,"%Y年%m月%d日")),("OVERVIEW",format!("本快报汇总 {} 本次巡飞的司空影像和可飞 PM2.5 数据。PM2.5 有效采样 {} 点，范围 {:.1}—{:.1} μg/m³。{} 未取得同步 K⁺、气象及站点污染过程资料，污染过程特征待复核。",date(m.start_time,"%Y年%m月%d日"),stats.count,stats.min,stats.max,warning)),("MISSION",format!("可飞任务：{}。任务时间：{} 至 {}（北京时间），时长 {:.1} 分钟。区域：{}。航线见图2。",m.mission_name,date(m.start_time,"%Y-%m-%d %H:%M:%S"),date(m.end_time,"%H:%M:%S"),(m.end_time-m.start_time) as f64/60000.0,m.geo_location)),("PHOTO_SUMMARY",format!("从本次司空 Immediate-Media 文件夹导出 {} 张照片，拍摄时间已与可飞任务核对。图片详见附录。影像内容、火点及异常数量尚未人工判读。",data.photos.len())),("PM_SUMMARY",format!("数据来源：可飞任务 {} 的完整原始序列（未应用页面筛选）。采样 {} 点，其中 PM2.5 有效 {} 点、缺测 {} 点；最小值 {:.1}、最大值 {:.1}、采样算术平均值 {:.1} μg/m³；峰值采样时间 {}。本报告 PM2.5 判定阈值为 {} μg/m³，严格大于阈值的采样点 {} 个（占有效采样 {:.1}%）。",m.mission_id,data.air.points.len(),stats.count,stats.missing,stats.min,stats.max,stats.mean,date(stats.peak_time,"%H:%M:%S"),pm25_threshold,above_threshold,above_threshold as f64 / stats.count as f64 * 100.0)),("CONCLUSION",warning.to_owned()),("NOTES","建议结合同期站点 K⁺、风向风速以及现场核查，对照片逐张判读后形成污染源结论。本快报未执行 AI 火点识别，异常数量和处理建议需复核后签发。".into())];
-    for (key, value) in fields {
-        doc = doc.replace(&format!("{{{{{key}}}}}"), &xml(&value));
-    }
-    block(
-        &mut doc,
-        "SUMMARY_TABLE",
-        &table(&[
-            vec!["资料".into(), "本次收录".into()],
-            vec!["可飞任务编号".into(), m.mission_id.to_string()],
-            vec!["PM2.5 采样点".into(), data.air.points.len().to_string()],
-            vec!["司空照片".into(), data.photos.len().to_string()],
-        ]),
-    )?;
-    let mut rows = vec![vec!["序号".into(), "照片文件名".into(), "拍摄时间".into()]];
-    for (i, p) in data.photos.iter().enumerate() {
-        rows.push(vec![
-            (i + 1).to_string(),
-            p.name.clone(),
-            date(photo_time(&p.name)?, "%H:%M:%S"),
-        ]);
-    }
-    block(
-        &mut doc,
-        "PHOTO_TABLE",
-        &if data.photos.is_empty() {
-            paragraph("当前任务文件夹无照片，本快报仅含可飞监测资料。")
-        } else {
-            table(&rows)
-        },
-    )?;
-    let mut rels = String::from_utf8(
-        parts
-            .remove("word/_rels/document.xml.rels")
-            .ok_or("模板关系缺失")?,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut types = String::from_utf8(parts.remove("[Content_Types].xml").ok_or("模板类型缺失")?)
-        .map_err(|e| e.to_string())?;
-    let mut appendix = String::new();
-    for (idx, src) in charts
-        .iter()
-        .chain(data.photos.iter().map(|p| &p.data_url))
-        .enumerate()
-    {
-        let id = idx + 1;
-        let (bytes, ext) = decode_image(src)?;
+    let mut photos: Vec<_> = data.photos.iter().collect();
+    photos.sort_by_key(|p| photo_time(&p.name).unwrap_or_default());
+    let facts=photos.iter().map(|p| decode_image(&p.data_url).map(|(b,_)|photo_facts(&b))).collect::<Result<Vec<_>,_>>()?;
+    let fallback=Evidence {captured_at:issued,..Default::default()};
+    let evidence=data.evidence.as_ref().unwrap_or(&fallback);
+    let reviewed=facts.iter().filter(|f|evidence.reviews.contains_key(&f.hash)).count();
+    let visible=facts.iter().filter(|f|f.image_type.starts_with("可见光")).count();
+    let infrared=facts.iter().filter(|f|f.image_type=="红外热成像").count();
+    let count = photos.len().to_string();
+    let blank = "【 】".to_owned();
+    let mut fields = vec![
+        ("ISSUE", blank.clone()), ("SERIES_ISSUE", blank.clone()),
+        ("ISSUED", date(issued, "%Y年%-m月%-d日")),
+        ("ANALYSIS_WINDOW", format!("{}00:00至{}（北京时间）", date(issued, "%Y年%m月%d日"), date(issued, "%H:%M"))),
+        ("FLIGHT_WINDOW", flight_window.clone()), ("PHOTO_COUNT", count.clone()),
+        ("TOTAL0_1", "本航次".into()), ("TOTAL0_2", table_window),
+        ("TOTAL0_3", "范围待核实".into()), ("TOTAL0_4", format!("{count}张")), ("TOTAL0_5", if reviewed>0 {"见表2初判".into()} else {"待判读".into()}),
+        ("TOTAL1_1", match (photos.first(), photos.last()) {
+            (Some(a), Some(b)) => format!("{}～{}", date(photo_time(&a.name)?, "%m-%d %H:%M"), date(photo_time(&b.name)?, "%m-%d %H:%M")),
+            _ => blank.clone(),
+        }),
+        ("TOTAL1_2", "本航次抓拍点".into()), ("TOTAL1_3", "—".into()),
+        ("TOTAL1_4", format!("可见光{visible}张，红外{infrared}张")), ("TOTAL1_5", format!("共{count}张")), ("TOTAL1_6", format!("已初判{reviewed}张，待复核")),
+    ];
+    fields.extend(evidence.city_fields());
+    fields.push(("TRIGGER",if evidence.trigger.is_empty(){"触发原因待核实".into()}else{evidence.trigger.clone()}));
+    fields.push(("PHOTO_REVIEW_SUMMARY",format!("含可见光{visible}张、红外{infrared}张；{}异常事件数量尚未经现场核实。表中坐标为照片EXIF记录的WGS-84拍摄位置，不是污染源坐标",if reviewed>0 {format!("已完成{reviewed}张影像的AI辅助初判，结果需人工复核；")}else{"尚未完成影像判读；".into()})));
+    // Known capture positions are point records, not invented route segments.
+    let execution=photos.iter().zip(&facts).enumerate().map(|(i,(p,f))|Ok(vec![
+        (i+1).to_string(),format!("抓拍点{}",i+1),date(photo_time(&p.name)?,"%H:%M:%S"),"已抓拍；范围待核实".into(),"1张".into(),
+        if evidence.reviews.contains_key(&f.hash){"见表2初判".into()}else{"待判读".into()},
+    ])).collect::<Result<Vec<_>,String>>()?;
+    fill_table(&mut doc,0,&if execution.is_empty(){vec![vec!["未取得".into();6]]}else{execution})?;
+    let rows: Vec<_> = photos.iter().zip(&facts).enumerate().map(|(i,(p,f))| Ok(vec![
+        (i+1).to_string(), date(photo_time(&p.name)?, "%m-%d %H:%M:%S"),format!("抓拍点{}",i+1),
+        match(f.longitude,f.latitude){(Some(lon),Some(lat))=>format!("{:.6}°{} / {:.6}°{}",lon.abs(),if lon<0.0 {"W"}else{"E"},lat.abs(),if lat<0.0 {"S"}else{"N"}),_=>"照片无有效GPS".into()},f.image_type.clone(),
+        evidence.reviews.get(&f.hash).map(|r|r.description.clone()).unwrap_or_else(||f.relative_height.map(|h|format!("相对高度{h:.2}米；场景待判读")).unwrap_or_else(||"场景待判读".into())),
+        evidence.reviews.get(&f.hash).map(|r|r.result.clone()).unwrap_or_else(||"未判读".into()),
+    ])).collect::<Result<_, String>>()?;
+    fill_table(&mut doc, 1, &if rows.is_empty() { vec![vec!["未取得".into(); 7]] } else { rows })?;
+    let mut points: Vec<_> = data.air.points.iter().collect();
+    points.sort_by_key(|p| p.time);
+    let air_rows: Vec<_> = points.iter().enumerate().map(|(i, p)| vec![
+        (i+1).to_string(), date(p.time, "%m-%d %H:%M:%S"),
+        match (p.longitude, p.latitude) { (Some(lon), Some(lat)) => format!("{lon:.6} / {lat:.6}"), _ => "缺测".into() },
+        p.pm25.map(|v| format!("{v:.1}")).unwrap_or_else(|| "缺测".into()),
+        "未取得".into(), "未取得".into(), "未取得".into(), "未取得".into(), "未取得".into(),
+    ]).collect();
+    fill_table(&mut doc, 2, &if data.without_air_data { vec![vec![blank.clone(); 9]; 4] } else { air_rows })?;
+    let above = points.iter().filter(|p| p.pm25.is_some_and(|v| v > pm25_threshold)).count();
+    let warning = if stats.as_ref().is_some_and(|s| s.max == 0.0) {
+        "本航次 PM2.5 有效数值全部为 0，请核查传感器状态；不能据此判断空气质量良好。"
+    } else { "" };
+    fields.push(("AIR_INTRO", if data.without_air_data { String::new() } else {
+        "本次巡航无人机搭载可飞科技“灵嗅”高精度气体传感器，空气六参数监测数据经可飞平台实时回传并生成监测成果。巡航期间六参数监测数据如下（数据来源：可飞平台）：".into()
+    }));
+    fields.push(("CONCLUSION", if !evidence.conclusion.is_empty() {evidence.conclusion.clone()} else if let Some(s) = &stats {
+        format!("本次巡航抓拍图片{count}张，影像异常及污染成因待判读、核实。PM2.5有效采样{}点、缺测{}点，浓度范围{:.1}～{:.1} μg/m³，采样算术平均值{:.1} μg/m³，峰值时间{}。本报告PM2.5判定阈值为 {} μg/m³，严格大于阈值的采样点 {} 个。{}", s.count, s.missing, s.min, s.max, s.mean, date(s.peak_time, "%m-%d %H:%M:%S"), pm25_threshold, above, warning)
+    } else { blank.clone() }));
+    // Use only explicit, flight-bound editorial input for recommendations.
+    fields.push(("RECOMMENDATION", if evidence.recommendation.is_empty(){blank.clone()}else{evidence.recommendation.clone()}));
+    let mut rels = String::from_utf8(parts.remove("word/_rels/document.xml.rels").ok_or("模板关系缺失")?).map_err(|e| e.to_string())?;
+    let mut types = String::from_utf8(parts.remove("[Content_Types].xml").ok_or("模板类型缺失")?).map_err(|e| e.to_string())?;
+    let mut photo_xml = String::new();
+    let mut section_xml = String::new();
+    for (i, p) in photos.iter().enumerate() {
+        let id = i + 1000; // avoid the reference masthead drawing's ID
+        let (bytes, ext) = decode_image(&p.data_url)?;
+        let (width, height) = image_dimensions(&bytes)?;
         let name = format!("media/flight-{id}.{ext}");
-        let (pixel_width, pixel_height) = image_dimensions(&bytes)?;
         parts.insert(format!("word/{name}"), bytes);
-        rels=rels.replace("</Relationships>",&format!("<Relationship Id=\"rIdFlight{id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{name}\"/></Relationships>"));
+        rels = rels.replace("</Relationships>", &format!("<Relationship Id=\"rIdFlight{id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{name}\"/></Relationships>"));
         if !types.contains(&format!("Extension=\"{ext}\"")) {
-            types = types.replace(
-                "</Types>",
-                &format!("<Default Extension=\"{ext}\" ContentType=\"image/{ext}\"/></Types>"),
-            );
+            types = types.replace("</Types>", &format!("<Default Extension=\"{ext}\" ContentType=\"image/{ext}\"/></Types>"));
         }
-        let scale = (5500000.0 / pixel_width as f64)
-            .min((if idx < 2 { 2400000.0 } else { 3800000.0 }) / pixel_height as f64);
-        let img = image_xml(
-            id,
-            (pixel_width as f64 * scale) as i64,
-            (pixel_height as f64 * scale) as i64,
-        );
-        if idx < 2 {
-            block(
-                &mut doc,
-                if idx == 0 { "PM_CHART" } else { "ROUTE_CHART" },
-                &img,
-            )?;
-        } else {
-            appendix.push_str(&img);
-            appendix.push_str(&paragraph(&format!(
-                "图{}  {}（{}）",
-                id,
-                data.photos[idx - 2].name,
-                date(photo_time(&data.photos[idx - 2].name)?, "%H:%M:%S")
-            )));
+        let scale = (5500000.0 / width as f64).min(3200000.0 / height as f64);
+        let img = image_xml(id, (width as f64 * scale) as i64, (height as f64 * scale) as i64)
+            .replace("name=\"image\"", &format!("name=\"{}\"", xml(&p.name)));
+        if i == 0 {
+            section_xml.push_str(&image_xml(id + 10000, (width as f64 * scale) as i64, (height as f64 * scale) as i64).replace(&format!("rIdFlight{}", id + 10000), &format!("rIdFlight{id}")));
+            section_xml.push_str(&caption_for("图1　巡航现场照片（抓拍点1，对应表2序号1）".into())?);
+
         }
+        photo_xml.push_str(&img);
+        photo_xml.push_str(&caption_for(format!("图{}　大疆司空平台抓拍图片（表2序号{}，{}）", i+3, i+1, date(photo_time(&p.name)?, "%m-%d %H:%M:%S")))?);
     }
-    block(
-        &mut doc,
-        "PHOTOS",
-        &if appendix.is_empty() {
-            paragraph("本航次无照片。")
-        } else {
-            appendix
-        },
-    )?;
-    if doc.contains("{{") {
-        return Err("模板存在未替换字段".into());
+    if let Some(map)=evidence::location_plot(&facts)? {
+        parts.insert("word/media/capture-locations.png".into(),map);
+        rels=rels.replace("</Relationships>","<Relationship Id=\"rIdFlight20000\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/capture-locations.png\"/></Relationships>");
+        if !types.contains("Extension=\"png\""){types=types.replace("</Types>","<Default Extension=\"png\" ContentType=\"image/png\"/></Types>");}
+        section_xml.push_str(&image_xml(20000,5500000,3575000));
+        section_xml.push_str(&caption_for("图2　抓拍位置分布（WGS-84；数字对应表2序号；离散拍摄点，非完整航迹或目标位置）".into())?);
+    } else if !photos.is_empty(){ section_xml.push_str(&caption_for("图2　位置图未取得（照片无有效GPS）".into())?); }
+    if photos.is_empty() {
+        section_xml = caption_for("巡航现场照片及对应位置图【待补】".into())?;
+        photo_xml = caption_for("本航次无照片。".into())?;
     }
+    // Fill global fields before adding user-derived table/figure content; no
+    // arbitrary strings are used as XML, and absent fields keep editable blanks.
+    // Tables are already filled, so user data containing braces is protected by
+    // limiting this pass to the named global slots.
+    for (key, value) in fields { doc = doc.replace(&format!("{{{{{key}}}}}"), &xml(&value)); }
+    block(&mut doc, "SECTION_PHOTOS", &section_xml)?;
+    block(&mut doc, "PHOTOS", &photo_xml)?;
     parts.insert("word/document.xml".into(), doc.into_bytes());
     parts.insert("word/_rels/document.xml.rels".into(), rels.into_bytes());
     parts.insert("[Content_Types].xml".into(), types.into_bytes());
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, data) in parts {
-        zip.start_file(
-            name,
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated),
-        )
-        .map_err(|e| e.to_string())?;
-        zip.write_all(&data).map_err(|e| e.to_string())?;
+    for (name, content) in parts {
+        zip.start_file(name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).map_err(|e| e.to_string())?;
+        zip.write_all(&content).map_err(|e| e.to_string())?;
     }
     Ok(zip.finish().map_err(|e| e.to_string())?.into_inner())
 }
-fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: f64) -> Result<Summary, String> {
-    // Serialize the lookup and commit so concurrent requests cannot create two reports.
+fn report_key(mission: &Mission, local_event_id: Option<&str>) -> String {
+    if mission.mission_id > 0 { format!("mission-{}", mission.mission_id) }
+    else if let Some(id) = local_event_id { format!("event-{id}") }
+    else { format!("flight-{}-{}-{}", mission.start_time, mission.end_time, mission.mission_name) }
+}
+fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: f64, regenerate: bool) -> Result<Summary, String> {
+    // Serialize the lookup and commit; normal saves reuse the latest report.
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SAVE_LOCK.lock().map_err(|_| "报告保存锁异常，请重试")?;
-    if let Some(existing) = read_summaries(root)?.into_iter().find(|s| {
-        s.mission.as_ref().is_some_and(|m| m.mission_id == data.mission.mission_id)
-    }) {
-        return Ok(existing);
+    let existing = read_summaries(root)?.into_iter().find(|s| {
+        s.mission.as_ref().is_some_and(|m| report_key(m, s.local_event_id.as_deref()) == report_key(&data.mission, data.local_event_id.as_deref()))
+    });
+    if !regenerate {
+        if let Some(existing) = existing { return Ok(existing); }
     }
-    let now = Utc::now().timestamp_millis();
+    // Keep new revisions ordered even when generated within the same millisecond.
+    let now = data.evidence.as_ref().map_or_else(|| Utc::now().timestamp_millis(), |e| e.captured_at).max(existing.as_ref().map_or(0, |s| s.created_at + 1));
     let stats = validate(data, now)?;
     let bytes = build_docx(data, charts, now, pm25_threshold)?;
     let id = Uuid::new_v4().to_string();
@@ -630,6 +677,8 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             date(data.mission.start_time, "%Y%m%d-%H%M%S")
         );
         let summary = Summary {
+            without_air_data: data.without_air_data,
+            local_event_id: data.local_event_id.clone(),
             id: id.clone(),
             mission: Some(data.mission.clone()),
             created_at: now,
@@ -637,7 +686,9 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             path: dest.join(&name).to_string_lossy().into_owned(),
             photo_count: data.photos.len(),
             point_count: data.air.points.len(),
-            warning: if stats.max == 0.0 {
+            warning: if data.without_air_data {
+                "未收录可飞数据，报告对应位置留空".into()
+            } else if stats.as_ref().is_some_and(|s| s.max == 0.0) {
                 "PM2.5 全部为 0，请核查传感器".into()
             } else {
                 String::new()
@@ -645,7 +696,7 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             air_url: data.air.url.clone(),
             media_url: data.media.url.clone(),
         };
-        fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&serde_json::json!({"pm25Threshold": pm25_threshold})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&serde_json::json!({"pm25Threshold": pm25_threshold, "templateSha256": "e30bc73f8f720df2c150e36a41a10080a3ff871be0be7cd3e9466f09c16c0a32", "generatorVersion": "template-fill-v3"})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join(&name), bytes).map_err(|e| e.to_string())?;
         fs::write(
             temp.join("source.json"),
@@ -683,12 +734,16 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
 #[tauri::command]
 pub async fn save_flight_report(
     app: tauri::AppHandle,
-    data: Collected,
+    mut data: Collected,
     charts: [String; 2],
+    regenerate: Option<bool>,
 ) -> Result<Summary, String> {
     let root = root(&app)?;
-    let threshold = crate::settings::read(&crate::monitoring::database(&app)?)?.pm25_threshold;
-    tauri::async_runtime::spawn_blocking(move || persist(&root, &data, &charts, threshold))
+    let db = crate::monitoring::database(&app)?;
+    let threshold = crate::settings::read(&db)?.pm25_threshold;
+    let review_path=app.path().app_data_dir().map_err(|e| e.to_string())?.join("report-photo-reviews.json");
+    data.evidence=Some(evidence::snapshot(&db,&data,&review_path,Utc::now().timestamp_millis())?);
+    tauri::async_runtime::spawn_blocking(move || persist(&root, &data, &charts, threshold, regenerate.unwrap_or(false)))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -726,13 +781,29 @@ fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
     }
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
     let mut seen = std::collections::HashSet::new();
-    items.retain(|s| s.mission.as_ref().is_none_or(|m| seen.insert(m.mission_id)));
+    items.retain(|s| s.mission.as_ref().is_none_or(|m| seen.insert(report_key(m, s.local_event_id.as_deref()))));
     Ok(items)
 }
 #[tauri::command]
 pub fn open_flight_report(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let id = Uuid::parse_str(&id).map_err(|_| "报告编号无效")?;
-    let dir = root(&app)?.join(id.to_string());
+    let path = saved_report_path(&root(&app)?, &id)?;
+    app.opener()
+        .open_path(path.to_str().ok_or("路径无效")?, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn open_flight_report_directory(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let path = saved_report_path(&root(&app)?, &id)?;
+    if !path.is_file() {
+        return Err("Word 报告文件不存在，可能已被移动或删除".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|e| format!("无法打开报告所在文件夹：{e}"))
+}
+fn saved_report_path(root: &Path, id: &str) -> Result<PathBuf, String> {
+    let id = Uuid::parse_str(id).map_err(|_| "报告编号无效")?;
+    let dir = root.join(id.to_string());
     let s: Summary =
         serde_json::from_slice(&fs::read(dir.join("summary.json")).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -741,9 +812,7 @@ pub fn open_flight_report(app: tauri::AppHandle, id: String) -> Result<(), Strin
     if path.extension().and_then(|s| s.to_str()) != Some("docx") {
         return Err("报告类型无效".into());
     }
-    app.opener()
-        .open_path(path.to_str().ok_or("路径无效")?, None::<&str>)
-        .map_err(|e| e.to_string())
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -763,9 +832,12 @@ mod tests {
         set_reason(&db, 12, "").unwrap();
         assert!(!list_reasons(&db).unwrap().contains_key("12"));
     }
-    fn sample() -> Collected {
+    pub(super) fn sample() -> Collected {
         let start = 1790031680000;
         Collected {
+            evidence: None,
+            without_air_data: false,
+            local_event_id: None,
             mission: Mission {
                 mission_id: 1,
                 mission_name: "测试任务 <&>".into(),
@@ -801,11 +873,31 @@ mod tests {
             photos: vec![],
         }
     }
-    const PNG:&str="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII=";
+    pub(super) const PNG:&str="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII=";
+    #[test]
+    fn template_tables_preserve_samples_and_analysis_uses_issue_day() {
+        let data = sample();
+        let issued = data.mission.start_time + 86400000;
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], issued, 60.0).unwrap();
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert_eq!(doc.matches("<w:tbl>").count(), 3);
+        assert!(doc.contains("2026年09月23日00:00至07:01"));
+        let air_table = doc.split("<w:tbl>").nth(3).unwrap().split("</w:tbl>").next().unwrap();
+        assert_eq!(air_table.matches("</w:tr>").count(), 3); // header plus BOTH raw observations
+        for value in ["09-22 07:01:20", "09-22 07:01:21", "31.0", "65.0", "119.930000 / 32.430000", "未取得"] {
+            assert!(air_table.contains(value), "missing observation: {value}");
+        }
+        assert!(!doc.contains("附录"));
+        assert!(!doc.contains("{{"));
+        assert!(!doc.contains("生物质燃烧特征明显"));
+        assert_eq!(fill_slots("{{VALUE}}", &[("VALUE", "<&> {{VALUE}}".into())]).unwrap(), "&lt;&amp;&gt; {{VALUE}}");
+    }
     #[test]
     fn rejects_wrong_flight_and_units() {
         let mut d = sample();
-        assert_eq!(validate(&d, i64::MAX).unwrap().mean, 48.0);
+        assert_eq!(validate(&d, i64::MAX).unwrap().unwrap().mean, 48.0);
         d.air.unit = "ppm".into();
         assert!(validate(&d, i64::MAX).is_err());
         d = sample();
@@ -819,13 +911,107 @@ mod tests {
         d.air.url = d.media.url.clone();
         assert!(validate(&d, i64::MAX).is_err());
     }
+    fn photo_only_sample() -> Collected {
+        let mut data = sample();
+        data.without_air_data = true;
+        data.mission.mission_id = 0;
+        data.air = AirData { url: String::new(), mission_id: 0, unit: String::new(), points: vec![] };
+        data
+    }
+    #[test]
+    fn missing_air_data_requires_explicit_mode_and_preserves_media_validation() {
+        let mut data = sample();
+        data.air.points.clear();
+        assert!(validate(&data, i64::MAX).is_err());
+        data.without_air_data = true;
+        assert!(validate(&data, i64::MAX).is_err()); // Never relabel real data as absent.
+        data = photo_only_sample();
+        assert!(validate(&data, i64::MAX).unwrap().is_none());
+        data.media.url = data.media.url.replace("c7ea6bbc", "other");
+        assert!(validate(&data, i64::MAX).is_err());
+        data = photo_only_sample();
+        data.media.folder = data.media.folder.replace("09-22", "09-21");
+        assert!(validate(&data, i64::MAX).is_err());
+        data = photo_only_sample();
+        data.media.files.push("DJI_20260922070005_0001.JPG".into());
+        assert!(validate(&data, i64::MAX).is_err()); // Missing photo export still blocks.
+        data = photo_only_sample();
+        assert!(validate(&data, data.mission.end_time).is_err());
+    }
+    #[test]
+    fn photo_only_docx_keeps_blank_air_slots_and_independent_history() {
+        let data = photo_only_sample();
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let first = persist(&root, &data, &[String::new(), String::new()], 60.0, false).unwrap();
+        assert!(first.without_air_data);
+        assert_eq!(first.point_count, 0);
+        assert!(!first.warning.contains("全部为 0"));
+        let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&first.path).unwrap())).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert!(!doc.contains("{{"));
+        assert!(!doc.contains("有效采样 0"));
+        assert!(!doc.contains("算术平均"));
+        assert!(!doc.contains("建议逐张"));
+        assert!(!doc.contains("建议优先"));
+        assert!(!doc.contains("rIdFlight"));
+        assert!(doc.contains("空气六参数监测数据"));
+        assert!(doc.contains("<w:tblGrid>"));
+        assert!(!doc.contains("巡飞监测记录"));
+        assert_eq!(persist(&root, &data, &[String::new(), String::new()], 60.0, false).unwrap().id, first.id);
+        let mut another = data.clone();
+        another.mission.start_time += 86400000;
+        another.mission.end_time += 86400000;
+        another.media.folder = another.media.folder.replace("09-22", "09-23");
+        assert_ne!(persist(&root, &another, &[String::new(), String::new()], 60.0, false).unwrap().id, first.id);
+        assert_eq!(read_summaries(&root).unwrap().len(), 2);
+        let mut local = data.clone();
+        local.local_event_id = Some(Uuid::new_v4().to_string());
+        let saved = persist(&root, &local, &[String::new(), String::new()], 60.0, false).unwrap();
+        local.mission.mission_name = "更新显示名称".into();
+        assert_eq!(persist(&root, &local, &[String::new(), String::new()], 60.0, false).unwrap().id, saved.id);
+        assert_eq!(read_summaries(&root).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn regeneration_saves_new_data_and_keeps_previous_files() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let data = sample();
+        let old = persist(&root, &data, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
+        let old_bytes = fs::read(&old.path).unwrap();
+        let mut updated = data.clone();
+        updated.air.points[0].pm25 = Some(99.0);
+        let new = persist(&root, &updated, &[PNG.into(), PNG.into()], 80.0, true).unwrap();
+        assert_ne!(new.id, old.id);
+        assert!(new.created_at > old.created_at);
+        assert_eq!(fs::read(&old.path).unwrap(), old_bytes);
+        let source: Collected = serde_json::from_slice(&fs::read(root.join(&new.id).join("source.json")).unwrap()).unwrap();
+        assert_eq!(source.air.points[0].pm25, Some(99.0));
+        let reports = read_summaries(&root).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, new.id);
+        assert_eq!(persist(&root, &updated, &[PNG.into(), PNG.into()], 80.0, false).unwrap().id, new.id);
+        assert!(persist(&root, &updated, &[String::new(), String::new()], 80.0, true).is_err());
+        assert_eq!(read_summaries(&root).unwrap()[0].id, new.id);
+        let mut blank = photo_only_sample();
+        blank.local_event_id = Some(Uuid::new_v4().to_string());
+        let before = persist(&root, &blank, &[String::new(), String::new()], 60.0, false).unwrap();
+        let after = persist(&root, &blank, &[String::new(), String::new()], 60.0, true).unwrap();
+        assert_ne!(before.id, after.id);
+        assert!(Path::new(&before.path).is_file());
+        assert!(after.without_air_data);
+        assert_eq!(read_summaries(&root).unwrap().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn native_docx_and_atomic_history() {
         let d = sample();
         let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
         fs::create_dir_all(&root).unwrap();
-        let a = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
-        let b = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        let a = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
+        let b = persist(&root, &d, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
         assert_eq!(a.path, b.path);
         assert_eq!(a.air_url, d.air.url);
         assert_eq!(a.media_url, d.media.url);
@@ -833,7 +1019,7 @@ mod tests {
         let mut another = d.clone();
         another.mission.mission_id = 2;
         another.air.mission_id = 2;
-        let c = persist(&root, &another, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        let c = persist(&root, &another, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
         assert_ne!(a.id, c.id);
         assert_eq!(read_summaries(&root).unwrap().len(), 2);
         let mut z = zip::ZipArchive::new(Cursor::new(fs::read(&a.path).unwrap())).unwrap();
@@ -844,7 +1030,7 @@ mod tests {
             .unwrap();
         assert!(!xml.contains("{{"));
         assert!(!xml.contains("2026年5月21日"));
-        assert!(xml.contains("测试任务 &lt;&amp;&gt;"));
+        assert!(xml.contains("大疆司空平台抓拍图片信息"));
         assert!(xml.contains("48.0"));
         assert!(root.join(&a.id).join("source.json").is_file());
         fs::remove_dir_all(root).unwrap();
@@ -854,7 +1040,7 @@ mod tests {
         let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
         fs::create_dir_all(&root).unwrap();
         let data = sample();
-        let old = persist(&root, &data, &[PNG.into(), PNG.into()], 60.0).unwrap();
+        let old = persist(&root, &data, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
         let mut legacy = serde_json::to_value(&old).unwrap();
         legacy.as_object_mut().unwrap().remove("mission");
         legacy.as_object_mut().unwrap().remove("airUrl");
@@ -873,7 +1059,7 @@ mod tests {
         assert_eq!(reports[0].mission.as_ref().unwrap().mission_id, 1);
         assert_eq!(reports[0].media_url, data.media.url);
         assert!(root.join(&old.id).join("summary.json").is_file());
-        assert_eq!(persist(&root, &data, &[PNG.into(), PNG.into()], 60.0).unwrap().id, id);
+        assert_eq!(persist(&root, &data, &[PNG.into(), PNG.into()], 60.0, false).unwrap().id, id);
         // An old report whose source is unavailable must remain accessible.
         fs::remove_file(dir.join("source.json")).unwrap();
         assert_eq!(read_summaries(&root).unwrap().len(), 2);
@@ -885,7 +1071,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let jobs: Vec<_> = (0..4).map(|_| {
             let root = root.clone();
-            std::thread::spawn(move || persist(&root, &sample(), &[PNG.into(), PNG.into()], 60.0).unwrap().id)
+            std::thread::spawn(move || persist(&root, &sample(), &[PNG.into(), PNG.into()], 60.0, false).unwrap().id)
         }).collect();
         let ids: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
         assert!(ids.iter().all(|id| id == &ids[0]));
@@ -914,7 +1100,7 @@ mod tests {
             let charts: [String; 2] = serde_json::from_value(v["charts"].clone()).unwrap();
             let root = PathBuf::from(std::env::var("TAIZHOU_REPORT_QA_DIR").unwrap());
             fs::create_dir_all(&root).unwrap();
-            let s = persist(&root, &d, &charts, 60.0).unwrap();
+            let s = persist(&root, &d, &charts, 60.0, false).unwrap();
             println!("QA report: {}", s.path);
         }
     }

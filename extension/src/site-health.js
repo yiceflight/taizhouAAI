@@ -1,7 +1,8 @@
 import { findJiangsuApi } from './jiangsu.js';
 import { PLAN_URL } from './flight-plan.js';
 
-// Fixed read-only checks in the site's own context. Credentials never leave the page.
+// Fixed read-only checks in the site's own context. Platform credentials are
+// sent only to their fixed platform endpoint, never returned to the bridge.
 export function prioritizeHealthJobs(jobs, tabs) {
   const positions = jobs.flatMap((job, index) => ['site-health', 'jiangsu-health', 'airins-health-open', 'dji-health-open'].includes(job.type) ? [index] : []);
   const checks = positions.map(index => jobs[index]).sort((a, b) =>
@@ -53,7 +54,7 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
   if (/[/#](login|signin)([/?#]|$)/i.test(url) || [...document.querySelectorAll('input[type="password"]')].some(visible)) return result('login_required', '请在 Chrome 中完成登录');
   const classify = response => {
     const code = response?.code;
-    if ([401, 44001, '401', '44001'].includes(code)) return 'login_required';
+    if ([401, 44001, 200401, '401', '44001', '200401'].includes(code)) return 'login_required';
     if ([403, '403'].includes(code)) return 'forbidden';
     return 'error';
   };
@@ -77,17 +78,32 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     }
     const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
     if (location.pathname.replace(/\/$/, '') !== project) return result('page_required', '请打开泰州环境监测项目');
-    // Reuse the platform's existing HTTP client; do not inspect its headers/store.
-    // Module and endpoint were verified in the platform's published frontend.
-    const chunks = globalThis.webpackChunkmain_app;
-    if (!Array.isArray(chunks)) return result('error', '司空页面结构已变化，暂不能验证登录');
-    let request;
-    chunks.push([[`taizhou-health-${Date.now()}`], {}, require => { request = require('4994').ZP; }]);
-    if (typeof request?.get !== 'function') return result('error', '司空验证适配器不可用');
-    const response = await request.get('/manage/api/v1/users/current', { timeout: 12000 });
-    const body = response?.data;
-    if (body?.code !== 0 || !body.data || typeof body.data !== 'object') return result(classify(body), '司空身份验证失败，请检查登录状态或访问权限');
-    if (location.href !== url) return result('login_required', '验证期间页面跳转，请完成登录');
+    // FlightHub's module IDs change on releases. Use its fixed identity API
+    // directly, with the same user-token-first convention as its web client.
+    // Never accept a page-supplied destination or follow a credentialed redirect.
+    const apiOrigin = 'https://es-flight-api-cn.djigate.com';
+    if (globalThis.CURRENT_BE_ENV_CONFIG?.server_url && globalThis.CURRENT_BE_ENV_CONFIG.server_url !== apiOrigin) {
+      return result('error', '请使用司空中国区服务后重新验证');
+    }
+    const userToken = localStorage.getItem('x-user-token');
+    const authToken = userToken ? null : localStorage.getItem('x-auth-token');
+    if (!userToken && !authToken) return result('login_required', '未取得司空登录状态，请在 Chrome 中完成登录');
+    const response = await fetch(`${apiOrigin}/manage/api/v1/users/current`, {
+      method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error',
+      headers: userToken ? { 'X-User-Token': userToken } : { 'X-Auth-Token': authToken },
+      signal: AbortSignal.timeout(12000),
+    });
+    const changedPage = () => location.href !== url
+      ? result(/[/#](login|signin)([/?#]|$)/i.test(location.href) ? 'login_required' : 'page_required', '验证期间页面已切换，请重新验证') : null;
+    if (changedPage()) return changedPage();
+    if (response.status === 401) return result('login_required', '登录已过期，请重新登录司空');
+    if (response.status === 403) return result('forbidden', '当前账号无权访问司空');
+    if (!response.ok) return result('error', '司空服务暂时不可用，请稍后重试');
+    const body = await response.json();
+    if (changedPage()) return changedPage();
+    if (body?.code !== 0 || typeof body.data?.user_id !== 'string' || !body.data.user_id.trim()) {
+      return result(classify(body), '司空身份验证失败，请检查登录状态或访问权限');
+    }
     return result('ready', '登录有效，泰州项目已打开');
   } catch (error) {
     if (location.href !== url && /login|signin/i.test(location.href)) return result('login_required', '登录已过期，请重新登录');

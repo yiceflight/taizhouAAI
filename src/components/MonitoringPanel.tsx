@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { dataQuality, defaultSettings, flightDisplay, hourTime, type WorkspaceSettings, type HourRow, type MonitorView } from '../lib/workspace';
+import { dataQuality, defaultSettings, flightDisplay, hourTime, isCurrentFlightEvent, type WorkspaceSettings, type HourRow, type MonitorView } from '../lib/workspace';
 import { DroneStatus } from './DroneStatus';
 const format = (value: number | null | undefined) => value == null ? '暂无数据' : value.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
 const dateValue = hourTime;
@@ -135,8 +135,9 @@ export function MonitoringPanel({ data, busy, ready, started, action, onPrepare,
     if (range === 'today') return row.time.slice(0, 10) === today;
     return !latest || dateValue(row.time) >= dateValue(latest.time) - (range - 1) * 3600000;
   });
-  const { event: plan, records } = flightDisplay(data);
-  const pending = plan && !['dismissed', 'canceled', 'completed'].includes(plan.status);
+  const { event: plan, records: history } = flightDisplay(data);
+  const pending = isCurrentFlightEvent(plan);
+  const records = plan && !pending ? [plan, ...history] : history;
   return <div className="monitoring-workspace">
     <div className={`page-heading monitoring-heading ${quality.tone}`}><div>
       <span className="eyebrow">泰州市 · 小时监测</span>
@@ -154,17 +155,15 @@ export function MonitoringPanel({ data, busy, ready, started, action, onPrepare,
     <section id="monitoring-task-details" className={`task-details ${pending ? 'task-callout' : 'data-card'}`} aria-label="巡查任务详情">
       <div className="section-heading"><h3>巡查任务</h3><button className="text-button" onClick={onFlight}>查看任务 →</button></div>
       <DroneStatus data={data} ready={ready} started={started} busy={busy} action={action} onFlight={onFlight} onAir={onAir} reportGenerating={reportGenerating} />
-      {pending && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>
-        {plan.status === 'failed' && <p>本次未发送起飞请求。请人工核验电量、设备状态和平台提示；系统回执不足以确认具体设备故障。</p>}
-        {plan.status === 'restricted' && <p>{plan.error}</p>}
-        {(plan.status === 'failed' || plan.status === 'uncertain' || plan.status === 'flight_error' || plan.status === 'not_flown') && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
+      {pending && plan && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>
+        {plan.status === 'uncertain' && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
       </div>}
-      {plan && !plan.preview && ['ready', 'submitted', 'uncertain', 'flying', 'paused', 'completed', 'flight_error', 'not_flown'].includes(plan.status) && <div className="task-details-copy" role="status">
+      {pending && plan && !plan.preview && ['ready', 'submitted', 'uncertain', 'flying', 'paused'].includes(plan.status) && <div className="task-details-copy" role="status">
         {plan.statusCheckedAt ? <p>最近核查：{new Date(plan.statusCheckedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间） · {plan.statusCheckError ? '核查未完成' : plan.status === 'uncertain' ? '已读取司空任务，起飞结果仍待核查' : '已更新任务状态'}</p> : <p>尚未取得司空状态核查结果。</p>}
         {plan.statusCheckError && <p>司空核查：{plan.statusCheckError}</p>}
         {plan.status === 'uncertain' && <p>手动刷新后，若司空仍未识别到任务状态，将保留历史记录并恢复起飞入口；再次起飞前请核对平台任务。</p>}
       </div>}
-      {!!records.length && <details className="task-records"><summary>最近巡查记录（{records.length}）</summary><ul>{records.map(record => <li key={record.id}><strong>{record.observedAt.slice(0, 16)}{record.resolvedAt ? ' · 已结束处理' : ''} · {record.status === 'restricted' ? '禁飞时间 · 仅记录' : record.status === 'failed' ? '起飞未完成 · 待人工核验' : record.status === 'completed' ? '巡飞已结束' : record.status === 'uncertain' ? '起飞结果未确认 · 历史记录' : '历史任务'}</strong><p>{record.name}{record.potassium != null ? ` · K⁺ ${format(record.potassium)} μg/m³` : ''}</p>{record.status === 'restricted' ? <p>{record.error}</p> : record.error && <details><summary>查看原始回执</summary><p>{record.error}</p></details>}{record.statusCheckError && <p>司空核查：{record.statusCheckError}</p>}</li>)}</ul></details>}
+      {!!records.length && <details className="task-records"><summary>最近巡查记录（{records.length}）</summary><ul>{records.map(record => <li key={record.id}><strong>{record.observedAt.slice(0, 16)}{record.resolvedAt ? ' · 已结束处理' : ''} · {record.status === 'restricted' ? '禁飞时间 · 仅记录' : record.status === 'failed' ? '起飞未完成 · 待人工核验' : record.status === 'completed' ? '巡飞已结束' : record.status === 'uncertain' ? '起飞结果未确认 · 历史记录' : record.status === 'flight_error' ? '执飞异常' : record.status === 'not_flown' ? '未起飞' : record.status === 'canceled' ? '任务已取消' : '历史任务'}</strong><p>{record.name}{record.potassium != null ? ` · K⁺ ${format(record.potassium)} μg/m³` : ''}</p>{record.status === 'restricted' ? <p>{record.error}</p> : record.error && <details><summary>查看原始回执</summary><p>{record.error}</p></details>}{record.statusCheckError && <p>司空核查：{record.statusCheckError}</p>}</li>)}</ul></details>}
     </section>
     <section className="data-card"><div className="chart-toolbar"><h3>小时变化趋势</h3><div className="button-row"><RangePicker value={range} onChange={setRange} /><div className="view-switcher-buttons" role="group" aria-label="数据展示方式"><button className={viewMode === 'chart' ? 'active' : ''} aria-pressed={viewMode === 'chart'} onClick={() => setViewMode('chart')}>图表</button><button className={viewMode === 'table' ? 'active' : ''} aria-pressed={viewMode === 'table'} onClick={() => setViewMode('table')}>表格</button></div></div></div>
     {!rows.length ? <div className="empty-state"><h3>暂无数据</h3><p>环境就绪后将自动读取首批数据。</p><button className="secondary-button" onClick={onPrepare}>查看运行状态</button></div> : viewMode === 'chart' ? <MonitoringChart rows={rows} settings={settings} /> : <div className="hourly-table-wrap"><table className="hourly-table"><thead><tr><th>数据时间</th><th>K⁺（μg/m³）</th><th>数据状态</th></tr></thead><tbody>{rows.map((row, index) => { const older = rows[index + 1]; const gap = older ? (dateValue(row.time) - dateValue(older.time)) / 3600000 - 1 : 0; return <tr key={row.time}><td>{row.time.slice(0,16)}</td><td className={row.potassium != null && row.potassium > settings.potassiumThreshold ? 'missing-value' : ''}>{format(row.potassium)}</td><td className={row.potassium === null || gap > 0 ? 'missing-value' : ''}>{row.potassium === null ? '暂无数据' : '数据齐全'}{gap > 0 ? ` · 此前缺 ${gap} 小时` : ''}</td></tr>; })}</tbody></table></div>}

@@ -3,14 +3,15 @@ import { createRoot } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FlightReportPanel } from '../src/components/FlightReportPanel';
-import { missionOriginLabel, patrolTasks, type Mission, type FlightSummary, type FlightWeather, type LocalFlightEvent } from '../src/lib/flightReport';
+import { DJI_PLAN_URL, localFlightTimeDisplay, missionOriginLabel, patrolTasks, type Mission, type FlightSummary, type FlightWeather, type LocalFlightEvent } from '../src/lib/flightReport';
 import type { BrowserTab } from '../src/lib/workspace';
 import type { WeatherCheck } from '../src/lib/weather';
 const ipc = vi.hoisted(() => ({ invoke: vi.fn(), isTauri: () => true }));
 vi.mock('@tauri-apps/api/core', () => ipc);
-vi.mock('../src/lib/flightReport', async importOriginal => ({ ...await importOriginal<typeof import('../src/lib/flightReport')>(), flightCharts: () => ['chart', 'route'] }));
+vi.mock('../src/lib/flightReport', async importOriginal => ({ ...await importOriginal<typeof import('../src/lib/flightReport')>(), flightCharts: (data: { withoutAirData?: boolean }) => data.withoutAirData ? ['', ''] : ['chart', 'route'] }));
 const first: Mission = { missionId: 11, missionName: '南侧巡飞', startTime: Date.now() - 7200000, endTime: Date.now() - 3600000, geoLocation: '泰州' };
 const second: Mission = { ...first, missionId: 12, missionName: '北侧巡飞' };
+const completedWithoutAir: LocalFlightEvent = { id: 'bd1b9a5d-8792-445c-b7b0-02dc1d6c49bd', name: '无采样巡飞', observedAt: '2026-09-22 07:00:00', status: 'completed' };
 const saved = (mission = first): FlightSummary => ({ id: `report-${mission.missionId}`, title: mission.missionName, mission, createdAt: Date.now(), path: '/fixture.docx', photoCount: 0, pointCount: 2, warning: '', airUrl: `https://aai.airins.cn/sniff/HistoryCloud?missionId=${mission.missionId}`, mediaUrl: 'https://fh.dji.com/organization/org/project/project#/media?page=1&pid=folder-1' });
 const tabs: BrowserTab[] = [
   { session: 'fixture', id: 1, title: '可飞', url: 'https://aai.airins.cn/sniff/HistoryCloud', status: 'complete' },
@@ -37,12 +38,88 @@ beforeEach(() => {
     if (command === 'list_flight_weather') return weather;
     if (command === 'enrich_flight_weather') return { weather, error: null };
     if (command === 'list_flight_missions') return { missions, total: missions.length };
-    if (command === 'collect_flight_report') return { mission: args.request.mission, air: { points: [{ pm25: 10 }, { pm25: 20 }] }, media: { folder: 'Immediate-Media' }, photos: [] };
-    if (command === 'save_flight_report') return saved(args.data.mission);
+    if (command === 'collect_flight_report') return { withoutAirData: args.request.withoutAirData, localEventId: args.request.localEventId, mission: args.request.mission, air: { points: args.request.withoutAirData ? [] : [{ pm25: 10 }, { pm25: 20 }] }, media: { folder: 'Immediate-Media' }, photos: [] };
+    if (command === 'save_flight_report') return { ...saved(args.data.mission), withoutAirData: args.data.withoutAirData, localEventId: args.data.localEventId };
   });
 });
 afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
 describe('task-owned reports', () => {
+  it('keeps a completed FlightHub receipt visible without inventing flight times from request or check times', async () => {
+    missions = []; reports = [];
+    const event = { ...completedWithoutAir, statusCheckedAt: Date.parse('2026-09-22T07:30:00+08:00') };
+    await act(async () => root.render(<FlightReportPanel tabs={tabs} ready onPrepare={prepare} openAir={() => {}} openMedia={() => {}} flightEvent={event} />));
+    const row = document.querySelector('tbody tr')!;
+    expect(row.textContent).toContain('司空已确认飞行结束');
+    expect(row.textContent).toContain('实际飞行时间待补全');
+    expect(row.textContent).toContain('未关联可飞采样任务');
+    expect(row.textContent).toContain('任务发起时间');
+    expect(row.textContent).not.toContain('尚无飞行记录');
+    expect(row.textContent).not.toContain('等待平台同步');
+    expect(row.textContent).not.toContain('07:30:00');
+    expect(row.querySelector<HTMLAnchorElement>('a')?.href).toBe(DJI_PLAN_URL);
+    expect(row.querySelector('td:last-child button')?.textContent).toBe('生成报告');
+    await click('生成报告');
+    expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
+    await click('补充时间');
+    expect([...document.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]')].every(input => !input.value)).toBe(true);
+  });
+  it('uses synchronized DJI times in the row and photo matching without manual input or Airins', async () => {
+    missions = []; reports = [];
+    const startTime = Date.parse('2026-09-22T20:19:00+08:00');
+    const endTime = startTime + 1260000;
+    const event: LocalFlightEvent = { ...completedWithoutAir, flightTime: { startTime, endTime, durationMs: 1260000, source: 'dji-plan', precision: 'minute' } };
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    const row = document.querySelector('tbody tr')!;
+    expect(row.textContent).toContain('20:19');
+    expect(row.textContent).toContain('20:40');
+    expect(row.textContent).toContain('执行时长 21 分钟');
+    expect(row.textContent).not.toContain('待补全');
+    expect(row.textContent).toContain('未关联可飞采样任务');
+    await click('生成报告');
+    expect(document.querySelector('dialog')?.textContent).toContain('司空实际时间');
+    expect(button('补充时间')).toBeUndefined();
+    expect(button('修改时间')).toBeDefined();
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ withoutAirData: true, localEventId: event.id, mission: { missionId: 0, missionName: event.name, startTime, endTime, geoLocation: '' } }) }));
+    expect(document.querySelector('dialog')?.textContent).not.toContain('请填写任务名称');
+  });
+  it('keeps the Airins mission ID while using actual DJI time for the report', async () => {
+    reports = [];
+    const event: LocalFlightEvent = { ...completedWithoutAir, name: first.missionName, flightTime: { startTime: first.startTime - 60000, endTime: first.endTime, durationMs: first.endTime - first.startTime + 60000, source: 'dji-plan', precision: 'minute' } };
+    missions = [first];
+    await act(async () => root.render(<FlightReportPanel tabs={tabs} ready flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await click('生成报告');
+    expect(document.querySelector('dialog')?.textContent).toContain('司空实际时间');
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ mission: { ...first, startTime: event.flightTime!.startTime } }) }));
+  });
+  it.each(['flying', 'paused', 'flight_error', 'submitted', 'submitting', 'uncertain'])('does not interpret missing sampling as no flight for %s', status => {
+    expect(localFlightTimeDisplay({ ...completedWithoutAir, status }).label).not.toBe('尚无飞行记录');
+  });
+  it('refreshes sampling once when a flight completes and merges the matching task', async () => {
+    missions = []; reports = [];
+    const props = { tabs, ready: true, onPrepare: prepare, openAir() {}, openMedia() {} };
+    await act(async () => root.render(<FlightReportPanel {...props} flightEvent={{ ...completedWithoutAir, status: 'flying' }} />));
+    missions = [{ ...first, missionName: completedWithoutAir.name }];
+    await act(async () => root.render(<FlightReportPanel {...props} flightEvent={completedWithoutAir} />));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'list_flight_missions')).toHaveLength(2);
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
+    expect(document.querySelector('tbody')?.textContent).not.toContain('实际飞行时间待补全');
+    expect(button('生成报告')).toBeDefined();
+    await act(async () => root.render(<FlightReportPanel {...props} flightEvent={{ ...completedWithoutAir }} flightRecords={[completedWithoutAir]} />));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'list_flight_missions')).toHaveLength(2);
+  });
+  it('refreshes late sampling records when returning to the task page', async () => {
+    missions = []; reports = [];
+    const props = { tabs, ready: true, onPrepare: prepare, openAir() {}, openMedia() {}, flightEvent: completedWithoutAir };
+    await act(async () => root.render(<FlightReportPanel {...props} active />));
+    await act(async () => root.render(<FlightReportPanel {...props} active={false} />));
+    missions = [{ ...first, missionName: completedWithoutAir.name }];
+    await act(async () => root.render(<FlightReportPanel {...props} active />));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'list_flight_missions')).toHaveLength(2);
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
+    expect(button('生成报告')).toBeDefined();
+  });
   it('merges by mission ID, keeps latest report, preserves unknown legacy reports and same-name tasks', () => {
     const old = { ...saved(), id: 'old', createdAt: 1 };
     const legacy = { ...saved(), id: 'legacy', mission: null };
@@ -55,7 +132,7 @@ describe('task-owned reports', () => {
   it('loads tasks and generates a report only for the selected row, then replaces its action with open', async () => {
     await render();
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
-    expect(document.querySelectorAll('tbody td:last-child button')).toHaveLength(2);
+    expect(document.querySelectorAll('tbody td:last-child button')).toHaveLength(4);
     expect(button('打开 Word')).toBeDefined();
     await click('生成报告');
     expect(document.querySelector('dialog[open]')?.textContent).toContain('北侧巡飞');
@@ -65,8 +142,123 @@ describe('task-owned reports', () => {
     expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ mission: second }) }));
     await click('生成并保存 Word 快报');
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
-    expect([...document.querySelectorAll('tbody td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开 Word']);
+    expect([...document.querySelectorAll('tbody td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告', '打开 Word', '打开文件夹', '重新生成报告']);
     expect(button('生成报告')).toBeUndefined();
+  });
+  it('uses the same primary action and dialog for tasks with and without Airins data', async () => {
+    reports = [];
+    await act(async () => root.render(<FlightReportPanel tabs={tabs} ready flightRecords={[completedWithoutAir]} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    const actions = [...document.querySelectorAll<HTMLButtonElement>('tbody td:last-child button')];
+    expect(actions).toHaveLength(3);
+    expect(actions.every(action => action.textContent === '生成报告' && action.className === 'primary-button')).toBe(true);
+    await act(async () => actions[2].click());
+    expect(document.querySelector('dialog')?.textContent).toContain('暂无可飞数据');
+    expect(button('自动匹配并读取资料')).toBeDefined();
+    expect(document.querySelectorAll('dialog')).toHaveLength(1);
+    expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
+    const labels = [...document.querySelectorAll('.report-material-label')].map(item => item.textContent);
+    expect(labels).toEqual(['飞行时间北京时间', '司空照片', '可飞采样']);
+    expect(document.querySelector('.report-dialog-footer button')?.textContent).toBe('自动匹配并读取资料');
+    await click('关闭');
+    await click('生成报告');
+    expect(document.querySelector('dialog')?.textContent).not.toContain('暂无可飞数据');
+    expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
+    expect([...document.querySelectorAll('.report-material-label')].map(item => item.textContent)).toEqual(labels);
+    expect(document.querySelector('.report-dialog-footer button')?.textContent).toBe('自动匹配并读取资料');
+  });
+  it('regenerates from the report row and opens the newly saved version', async () => {
+    await render();
+    const row = button('打开 Word').closest('tr')!;
+    expect([...row.querySelectorAll('td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告']);
+    await click('重新生成报告');
+    expect(document.querySelector('dialog')?.textContent).toContain('重新生成巡飞报告');
+    expect(document.querySelector('dialog')?.textContent).toContain(first.missionName);
+    await click('自动匹配并读取资料');
+    ipc.invoke.mockResolvedValueOnce({ ...saved(first), id: 'new-version', createdAt: Date.now() + 1 });
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: true, data: expect.objectContaining({ mission: first }) }));
+    await click('打开 Word');
+    expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report', { id: 'new-version' });
+    await click('打开文件夹');
+    expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report_directory', { id: 'new-version' });
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
+    await click('生成报告');
+    await click('自动匹配并读取资料');
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: false, data: expect.objectContaining({ mission: second }) }));
+  });
+  it('prefills confirmed flight times when regenerating a report without Airins data', async () => {
+    missions = [];
+    const mission = { ...first, missionId: 0, missionName: completedWithoutAir.name };
+    reports = [{ ...saved(mission), withoutAirData: true, localEventId: completedWithoutAir.id }];
+    await act(async () => root.render(<FlightReportPanel tabs={[tabs[1]]} ready={false} mediaReady flightRecords={[completedWithoutAir]} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await click('重新生成报告');
+    expect(document.querySelector('dialog')?.textContent).toContain('暂无可飞数据');
+    expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
+    await click('修改时间');
+    expect([...document.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]')].every(input => !!input.value)).toBe(true);
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ withoutAirData: true, localEventId: completedWithoutAir.id, mission }) }));
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: true, charts: ['', ''] }));
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
+  });
+  it('explicitly skips unavailable Airins data for an existing mission and saves blank charts', async () => {
+    await render(); await click('生成报告');
+    ipc.invoke.mockRejectedValueOnce(new Error('可飞未返回任务数据'));
+    await click('自动匹配并读取资料');
+    expect(document.querySelector('dialog [role="alert"]')?.textContent).toContain('可飞未返回任务数据');
+    const checkbox = document.querySelector<HTMLInputElement>('dialog input[type="checkbox"]')!;
+    await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
+    expect(document.querySelector('dialog')?.textContent).toContain('暂无可飞数据');
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, withoutAirData: true, localEventId: null, mission: second } });
+    expect(document.querySelector('dialog')?.textContent).toContain('报告对应内容留空');
+    expect(document.querySelector('dialog')?.textContent).not.toContain('全部为 0');
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ charts: ['', ''], data: expect.objectContaining({ withoutAirData: true }) }));
+  });
+  it('generates without an Airins tab or monitoring readiness using explicit Beijing flight times', async () => {
+    reports = [];
+    await act(async () => root.render(<FlightReportPanel tabs={[tabs[1]]} ready={false} mediaReady flightRecords={[completedWithoutAir]} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    expect(document.querySelector('.page-heading')?.textContent).not.toContain('无可飞数据生成报告');
+    expect(document.querySelector('tbody td:last-child button')?.textContent).toBe('生成报告');
+    await click('生成报告');
+    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await click('自动匹配并读取资料');
+    expect(document.querySelector('dialog [role="alert"]')?.textContent).toContain('实际飞行起止时间');
+    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
+    expect(button('收起').getAttribute('aria-expanded')).toBe('true');
+    const fields = [...document.querySelectorAll<HTMLInputElement>('dialog input')];
+    await act(async () => {
+      ['无采样巡飞', '2026-09-22T07:00:05', '2026-09-22T07:20:05'].forEach((value, i) => {
+        fields[i].value = value; fields[i].dispatchEvent(new window.Event('input', { bubbles: true }));
+      });
+    });
+    await click('收起');
+    expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
+    expect(document.querySelector('.report-material-value')?.textContent).toContain('07:00:05');
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, withoutAirData: true, localEventId: completedWithoutAir.id, mission: { missionId: 0, missionName: '无采样巡飞', startTime: Date.parse('2026-09-22T07:00:05+08:00'), endTime: Date.parse('2026-09-22T07:20:05+08:00'), geoLocation: '' } } });
+    await click('生成并保存 Word 快报');
+    expect(button('打开 Word')).toBeDefined();
+    expect(document.querySelector('tbody')?.textContent).not.toContain('任务编号 0');
+    expect(document.querySelector('tbody a')?.textContent).toBe('司空任务 ↗');
+    expect(ipc.invoke).not.toHaveBeenCalledWith('list_flight_missions', expect.anything());
+  });
+  it('requires verified media readiness even in the mode without Airins', async () => {
+    await act(async () => root.render(<FlightReportPanel tabs={[tabs[1]]} ready={false} flightRecords={[completedWithoutAir]} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await click('生成报告');
+    expect(button('自动匹配并读取资料').disabled).toBe(true);
+    expect(document.querySelector('dialog')?.textContent).toContain('登录司空媒体库');
+  });
+  it('keeps independent reports with no Airins ID and attaches a local event by its ID', () => {
+    const event = { id: 'local-flight', name: '已完成巡飞', observedAt: '2026-09-22 07:00:00', status: 'completed' };
+    const report = { ...saved({ ...first, missionId: 0 }), id: 'photo-only', withoutAirData: true, localEventId: event.id };
+    const other = { ...report, id: 'other-flight', localEventId: null };
+    const tasks = patrolTasks([], [report, other], event);
+    expect(tasks).toHaveLength(2);
+    expect(tasks.find(task => task.localEvent)?.report?.id).toBe(report.id);
   });
   it('closes the modal without saving and shows collection errors inside it', async () => {
     await render(); await click('生成报告');
@@ -210,6 +402,8 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
     await click('打开 Word');
     expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report', { id: 'report-11' });
+    await click('打开文件夹');
+    expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report_directory', { id: 'report-11' });
     expect(ipc.invoke).not.toHaveBeenCalledWith('list_flight_missions', expect.anything());
     await click('完成工作准备'); expect(prepare).toHaveBeenCalledOnce();
   });
@@ -236,4 +430,14 @@ describe('task-owned reports', () => {
     expect(button('生成并保存 Word 快报')).toBeUndefined();
     expect(document.body.textContent).toContain('任务页面已变化');
   });
+});
+
+it('keeps cleared missions and reports hidden after reload while showing new tasks', () => {
+  const cutoff = Date.now();
+  const oldReport = { id: 'old', createdAt: cutoff - 1, mission: first } as FlightSummary;
+  const laterReport = { ...oldReport, id: 'late', createdAt: cutoff + 1 };
+  const newMission = { ...second, startTime: cutoff + 1 };
+  const newEvent = { ...completedWithoutAir, id: 'new-event' };
+  const tasks = patrolTasks([first, newMission], [oldReport, laterReport], newEvent, [], cutoff);
+  expect(tasks.map(task => task.key).sort()).toEqual(['event-new-event', 'mission-12']);
 });

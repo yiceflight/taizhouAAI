@@ -1,9 +1,10 @@
 import type { WeatherCheck } from './weather';
 export type Mission = { missionId:number; missionName:string; startTime:number; endTime:number; geoLocation:string };
 export type Point = { time:number; pm25:number|null; longitude:number|null; latitude:number|null };
-export type CollectedFlight = { mission:Mission; air:{ url:string;missionId:number;unit:string;points:Point[] }; media:{url:string;folder:string;files:string[]};photos:{name:string;dataUrl:string;kind:string}[] };
-export type FlightSummary = { id:string;createdAt:number;title:string;path:string;photoCount:number;pointCount:number;warning:string;mission?:Mission|null;airUrl?:string;mediaUrl?:string };
-export type LocalFlightEvent = { id:string; observedAt:string; name:string; status:string; source?:string; error?:string|null; launchAt?:number|null; statusCheckError?:string|null; statusCheckedAt?:number|null; weatherOverrideConfirmedAt?:number|null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null };
+export type CollectedFlight = { withoutAirData?:boolean; localEventId?:string|null; mission:Mission; air:{ url:string;missionId:number;unit:string;points:Point[] }; media:{url:string;folder:string;files:string[]};photos:{name:string;dataUrl:string;kind:string}[] };
+export type FlightSummary = { withoutAirData?:boolean; localEventId?:string|null; id:string;createdAt:number;title:string;path:string;photoCount:number;pointCount:number;warning:string;mission?:Mission|null;airUrl?:string;mediaUrl?:string };
+export type FlightTime = { startTime: number; endTime: number; durationMs: number; source: 'dji-plan'; precision: 'minute' };
+export type LocalFlightEvent = { id:string; observedAt:string; name:string; status:string; source?:string; error?:string|null; launchAt?:number|null; statusCheckError?:string|null; statusCheckedAt?:number|null; weatherOverrideConfirmedAt?:number|null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
 
 export type PatrolTask = { key: string; mission: Mission | null; report: FlightSummary | null; localEvent?: LocalFlightEvent };
 export type FlightWeather = {
@@ -13,6 +14,7 @@ export type FlightWeather = {
 };
 export const AIRINS_HISTORY_URL = 'https://aai.airins.cn/sniff/HistoryCloud';
 export const DJI_MEDIA_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/media';
+export const DJI_PLAN_URL = DJI_MEDIA_URL.replace('#/media', '#/plan');
 export function airinsMissionUrl(mission: Mission): string {
   return `${AIRINS_HISTORY_URL}?missionId=${encodeURIComponent(mission.missionId)}`;
 }
@@ -38,7 +40,7 @@ export function localFlightDisplay(event: LocalFlightEvent): { label: string; ac
     submitting: ['正在提交起飞请求', '等待司空回执'],
     submitted: ['起飞请求已提交', '等待司空确认执行'],
     flying: ['正在执飞', '等待飞行结束'],
-    completed: ['飞行已结束', '等待可飞任务同步'],
+    completed: ['飞行已结束', '未关联可飞采样任务'],
     flight_error: ['执飞异常', '请到司空核查飞行记录'],
     paused: ['任务暂停', '请到司空核查任务'],
     uncertain: ['结果待核查', '请到司空核查 · 不自动重试'],
@@ -50,10 +52,39 @@ export function localFlightDisplay(event: LocalFlightEvent): { label: string; ac
   const [label, action] = states[event.status] ?? ['任务状态待核查', '请核查任务状态'];
   return { label: event.resolvedAt ? `已结束处理 · 原状态：${label}` : label, action: event.resolvedAt ? '已保留任务记录' : action, submitted };
 }
-export function patrolTasks(missions: Mission[], reports: FlightSummary[], localEvent?: LocalFlightEvent | null, records: LocalFlightEvent[] = []): PatrolTask[] {
+// FlightHub execution and Airins sampling are independent records. A missing
+// Airins match does not negate the flight receipt or supply actual flight times.
+export function localFlightMission(event: LocalFlightEvent): Mission | null {
+  const time = event.flightTime;
+  if (event.status !== 'completed' || !time || time.source !== 'dji-plan' || time.precision !== 'minute'
+    || !Number.isFinite(time.startTime) || !Number.isFinite(time.endTime) || time.startTime <= 0
+    || time.durationMs <= 0 || time.durationMs >= 86400000 || time.endTime - time.startTime !== time.durationMs) return null;
+  return { missionId: 0, missionName: event.name, startTime: time.startTime, endTime: time.endTime, geoLocation: '' };
+}
+export const flightMinuteTime = (value: number) => new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+export function localFlightTimeDisplay(event: LocalFlightEvent): { label: string; detail: string } {
+  const mission = localFlightMission(event);
+  if (mission) return { label: `${flightMinuteTime(mission.startTime)} 至 ${flightMinuteTime(mission.endTime)}`, detail: `司空实际时间 · 执行时长 ${event.flightTime!.durationMs / 60000} 分钟（分钟精度）` };
+  const confirmed: Record<string, string> = {
+    completed: '司空已确认飞行结束',
+    flying: '司空已确认正在执飞',
+    paused: '司空任务已暂停',
+    flight_error: '司空执行异常，请核查飞行记录',
+  };
+  if (confirmed[event.status]) return { label: '实际飞行时间待补全', detail: confirmed[event.status] };
+  if (['submitting', 'submitted', 'uncertain'].includes(event.status)) {
+    return { label: '飞行结果待核查', detail: '尚未取得实际飞行起止时间' };
+  }
+  return { label: '尚无飞行记录', detail: '' };
+}
+export function patrolTasks(missions: Mission[], reports: FlightSummary[], localEvent?: LocalFlightEvent | null, records: LocalFlightEvent[] = [], clearedAt = 0): PatrolTask[] {
   const tasks = new Map<string, PatrolTask>();
+  if (clearedAt > 0) {
+    missions = missions.filter(mission => mission.startTime > clearedAt);
+    reports = reports.filter(report => report.createdAt > clearedAt && (!report.mission || report.mission.startTime > clearedAt));
+  }
   for (const report of [...reports].sort((a, b) => b.createdAt - a.createdAt)) {
-    const key = report.mission ? `mission-${report.mission.missionId}` : `report-${report.id}`;
+    const key = report.mission?.missionId ? `mission-${report.mission.missionId}` : report.localEventId ? `event-${report.localEventId}` : `report-${report.id}`;
     if (!tasks.has(key)) tasks.set(key, { key, mission: report.mission ?? null, report });
   }
   for (const mission of missions) {
@@ -62,11 +93,17 @@ export function patrolTasks(missions: Mission[], reports: FlightSummary[], local
   }
   for (const event of [...records, ...(localEvent ? [localEvent] : [])]) {
     if (event.status === 'dismissed') continue;
+    const linked = tasks.get(`event-${event.id}`);
+    if (linked) {
+      linked.localEvent = event;
+      if (!linked.report && !linked.mission?.missionId) linked.mission = localFlightMission(event);
+      continue;
+    }
     const matches = [...tasks.values()].filter(task => task.mission?.missionName === event.name);
     if (matches.length === 1) {
       matches[0].localEvent = event;
     } else {
-      tasks.set(`event-${event.id}`, { key: `event-${event.id}`, mission: null, report: null, localEvent: event });
+      tasks.set(`event-${event.id}`, { key: `event-${event.id}`, mission: localFlightMission(event), report: null, localEvent: event });
     }
   }
   const start = (task: PatrolTask) => task.mission?.startTime ?? task.report?.createdAt ?? (task.localEvent ? Date.parse(`${task.localEvent.observedAt.replace(' ', 'T')}+08:00`) : 0);
@@ -75,6 +112,7 @@ export function patrolTasks(missions: Mission[], reports: FlightSummary[], local
 
 export const beijingTime = (value:number) => new Date(value).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false});
 export function flightCharts(data:CollectedFlight):[string,string] {
+  if (data.withoutAirData) return ['', ''];
   const points = [...data.air.points].sort((a,b)=>a.time-b.time);
   const chart = (route:boolean) => {
     const canvas=document.createElement('canvas');canvas.width=1400;canvas.height=610;

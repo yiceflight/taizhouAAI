@@ -39,6 +39,19 @@ pub struct Event {
     weather_checks: Vec<WeatherCheck>,
     #[serde(default)]
     resolved_at: Option<i64>,
+    #[serde(default)]
+    flight_time: Option<FlightTime>,
+    #[serde(default)]
+    flight_time_checked_at: Option<i64>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlightTime {
+    start_time: i64,
+    end_time: i64,
+    duration_ms: i64,
+    source: String,
+    precision: String,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +71,7 @@ pub struct View {
     threshold: f64,
     delay_minutes: u32,
     records: Vec<Event>,
+    tasks_cleared_at: Option<i64>,
 }
 fn current(db: &Connection) -> Result<Option<Event>, String> {
     setting(db, "flight_event")?
@@ -94,12 +108,50 @@ fn replace_current(tx: &rusqlite::Transaction<'_>, event: &Event) -> Result<(), 
 }
 pub fn view(db: &Connection) -> Result<View, String> {
     reconcile_restriction(db, &crate::settings::read(db)?, now())?;
-    let mut stmt = db.prepare("SELECT value FROM monitor_settings WHERE key LIKE 'flight_history:%' OR key LIKE 'flight_restricted:%' ORDER BY json_extract(value, '$.observedAt') DESC LIMIT 30").map_err(|e| e.to_string())?;
+    let mut stmt = db.prepare("SELECT value FROM monitor_settings AS records WHERE (key LIKE 'flight_history:%' OR key LIKE 'flight_restricted:%') AND NOT EXISTS (SELECT 1 FROM monitor_settings AS hidden WHERE hidden.key = 'flight_task_hidden:' || json_extract(records.value, '$.id')) ORDER BY json_extract(value, '$.observedAt') DESC LIMIT 30").map_err(|e| e.to_string())?;
     let raw = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     let mut records = raw.iter().map(|v| serde_json::from_str::<Event>(v).map_err(|e| e.to_string())).collect::<Result<Vec<_>,_>>()?;
     let mut ids = std::collections::HashSet::new();
     records.retain(|event| ids.insert(event.id.clone()));
-    Ok(View { enabled: enabled(db)?, event: current(db)?, threshold: crate::settings::read(db)?.potassium_threshold, delay_minutes: delay(db)?, records })
+    let event = match current(db)? {
+        Some(event) if setting(db, &format!("flight_task_hidden:{}", event.id))?.is_none() => Some(event),
+        _ => None,
+    };
+    let tasks_cleared_at = setting(db, "flight_tasks_cleared_at")?.map(|value| value.parse::<i64>().map_err(|e| e.to_string())).transpose()?;
+    Ok(View { enabled: enabled(db)?, event, threshold: crate::settings::read(db)?.potassium_threshold, delay_minutes: delay(db)?, records, tasks_cleared_at })
+}
+// Keep receipts and duplicate-flight guards intact. Failed preparation can be
+// archived and released: no launch request was sent (unlike uncertain/flight_error).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearTasksResult {
+    preserved_current_task: bool,
+}
+fn clear_tasks(db: &Connection, confirmed: bool, at: i64) -> Result<ClearTasksResult, String> {
+    if !confirmed { return Err("请先确认清空任务列表。".into()); }
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    if let Some(mut event) = current(&tx)?.filter(|event| event.status == "failed") {
+        event.resolved_at = Some(at);
+        archive(&tx, &event)?;
+        tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
+        // Clearing a failure must not immediately dispatch another automatic flight.
+        if !event.preview && event.source != "preview"
+            && setting(&tx, "flight_episode")?.is_none_or(|episode| episode.is_empty()) {
+            put(&tx, "flight_episode", &event.observed_at)?;
+        }
+    }
+    let preserved = current(&tx)?.filter(|event| !terminal(event));
+    let preserved_id = preserved.as_ref().map(|event| event.id.as_str());
+    tx.execute("INSERT OR IGNORE INTO monitor_settings(key, value) SELECT 'flight_task_hidden:' || json_extract(value, '$.id'), 'true' FROM monitor_settings WHERE (key='flight_event' OR key LIKE 'flight_history:%' OR key LIKE 'flight_restricted:%') AND (?1 IS NULL OR json_extract(value, '$.id') != ?1)", [preserved_id]).map_err(|e| e.to_string())?;
+    put(&tx, "flight_tasks_cleared_at", &at.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ClearTasksResult { preserved_current_task: preserved.is_some() })
+}
+#[tauri::command]
+pub fn clear_task_list(app: tauri::AppHandle, confirmed: bool) -> Result<ClearTasksResult, String> {
+    let state = app.state::<Flight>();
+    let _gate = state.gate.lock().unwrap();
+    clear_tasks(&database(&app)?, confirmed, chrono::Utc::now().timestamp_millis())
 }
 fn archive(db: &Connection, event: &Event) -> Result<(), String> {
     put(db, &format!("flight_history:{}", event.id), &serde_json::to_string(event).map_err(|e| e.to_string())?)
@@ -142,7 +194,8 @@ fn new_event(time: String, potassium: Option<f64>, preview: bool) -> Event {
     Event { id: uuid::Uuid::new_v4().to_string(), observed_at: time, potassium,
         name: format!("{}-{}-{}", if preview { "司空填写演练" } else { "钾离子超标巡查" }, &suffix[..8], &suffix[8..]),
         status: "preparing".into(), error: None, preview, source: if preview { "preview" } else { "auto" }.into(), launch_at: None,
-        status_check_error: None, status_checked_at: None, weather_override_confirmed_at: None, weather_checks: Vec::new(), resolved_at: None }
+        status_check_error: None, status_checked_at: None, weather_override_confirmed_at: None, weather_checks: Vec::new(), resolved_at: None,
+        flight_time: None, flight_time_checked_at: None }
 }
 #[cfg(test)]
 fn observe(db: &mut Connection, at: chrono::NaiveDateTime, weather_allowed: bool) -> Result<Option<Event>, String> {
@@ -338,6 +391,38 @@ fn apply_observation(db: &Connection, id: &str, name: &str, status: &str) -> Res
     }
     save(db, &event)
 }
+// Enrichment is independent of the flight state machine: completed flights
+// remain terminal, including while an older record is being backfilled.
+fn apply_flight_time(db: &Connection, id: &str, name: &str, result: &serde_json::Value) -> Result<(), String> {
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    let live = current(&tx)?;
+    let is_current = live.as_ref().is_some_and(|event| event.id == id);
+    let stored = if is_current { live } else {
+        setting(&tx, &format!("flight_history:{id}"))?
+            .map(|value| serde_json::from_str::<Event>(&value).map_err(|e| e.to_string())).transpose()?
+    };
+    let Some(mut event) = stored.filter(|event| event.name == name && event.status == "completed" && !event.preview) else { return Ok(()); };
+    let now = chrono::Utc::now().timestamp_millis();
+    event.flight_time_checked_at = Some(now);
+    if result["url"] == PLAN_URL && result["name"] == name && result["status"] == "执行成功" {
+        if let Ok(time) = serde_json::from_value::<FlightTime>(result["flightTime"].clone()) {
+            let duration = time.end_time.checked_sub(time.start_time);
+            if time.source == "dji-plan" && time.precision == "minute"
+                && time.start_time > 0 && time.end_time <= now
+                && time.start_time % 60000 == 0 && time.end_time % 60000 == 0
+                && time.duration_ms > 0 && time.duration_ms < 86400000 && duration == Some(time.duration_ms) {
+                event.flight_time = Some(time);
+            }
+        }
+    }
+    if is_current { save(&tx, &event)?; }
+    if !is_current || setting(&tx, &format!("flight_history:{id}"))?.is_some() { archive(&tx, &event)?; }
+    tx.commit().map_err(|e| e.to_string())
+}
+fn needs_flight_time(event: &Event, now: i64) -> bool {
+    event.status == "completed" && !event.preview && event.flight_time.is_none()
+        && event.flight_time_checked_at.is_none_or(|checked| now.saturating_sub(checked) >= 60000)
+}
 fn record_check_error(db: &Connection, id: &str, name: &str, message: &str) -> Result<(), String> {
     let Some(mut event) = current(db)? else { return Ok(()); };
     if event.id != id || event.name != name || !trackable(&event) { return Ok(()); }
@@ -388,14 +473,26 @@ async fn watch(app: &tauri::AppHandle, expected_id: Option<&str>) -> Result<(), 
     let _status_gate = state.status_gate.lock().await;
     let event = current(&database(app)?)?;
     if expected_id.is_some_and(|id| event.as_ref().is_none_or(|e| e.id != id)) { return Err("任务已变化，请查看当前任务后重试。".into()); }
-    let Some(event) = event.filter(trackable) else { return Ok(()); };
+    let now = chrono::Utc::now().timestamp_millis();
+    let event = event.filter(|event| trackable(event) || needs_flight_time(event, now));
+    let event = if event.is_some() || expected_id.is_some() { event } else {
+        // Retained completed tasks also need enrichment after upgrading. Hidden
+        // records are excluded by view(); an active flight always takes priority.
+        view(&database(app)?)?.records.into_iter().find(|event| needs_flight_time(event, now))
+    };
+    let Some(event) = event else { return Ok(()); };
     let result = app.state::<Bridge>().flight_status(&event.id, &event.name).await;
     let _gate = state.gate.lock().unwrap();
     let db = database(app)?;
+    if event.status == "completed" {
+        apply_flight_time(&db, &event.id, &event.name, result.as_ref().unwrap_or(&serde_json::Value::Null))?;
+        return result.map(|_| ());
+    }
     match result {
         Ok(result) if result["url"] == PLAN_URL && result["name"] == event.name => {
             if let Some(status) = result["status"].as_str().filter(|s| matches!(*s, "执行中" | "已暂停" | "已挂起" | "执行成功" | "部分执行" | "执行失败" | "执行终止" | "待执行")) {
                 apply_observation(&db, &event.id, &event.name, status)?;
+                if status == "执行成功" { apply_flight_time(&db, &event.id, &event.name, &result)?; }
                 Ok(())
             } else {
                 let message = "司空列表未识别到该任务状态，请检查平台页面或日期范围。";
@@ -562,6 +659,112 @@ pub async fn open_prepared_flight(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clear_task_list_preserves_receipts_guards_and_allows_new_records() {
+        let db = db();
+        let mut event = new_event("2026-10-09 09:00:00".into(), Some(2.), false);
+        event.status = "completed".into();
+        save(&db, &event).unwrap();
+        archive(&db, &event).unwrap();
+        put(&db, "flight_episode", &event.observed_at).unwrap();
+        put(&db, "flight_last_hour", &event.observed_at).unwrap();
+        assert!(!clear_tasks(&db, true, 12345).unwrap().preserved_current_task);
+        let visible = view(&db).unwrap();
+        assert!(visible.event.is_none());
+        assert!(visible.records.is_empty());
+        assert_eq!(visible.tasks_cleared_at, Some(12345));
+        assert_eq!(current(&db).unwrap().unwrap().id, event.id);
+        assert!(setting(&db, &format!("flight_history:{}", event.id)).unwrap().is_some());
+        assert_eq!(setting(&db, "flight_episode").unwrap(), Some(event.observed_at.clone()));
+        assert_eq!(setting(&db, "flight_last_hour").unwrap(), Some(event.observed_at.clone()));
+        // A new task within the same observed hour must remain visible.
+        event.id = uuid::Uuid::new_v4().to_string();
+        save(&db, &event).unwrap();
+        assert_eq!(view(&db).unwrap().event.unwrap().id, event.id);
+    }
+    #[test]
+    fn clear_task_list_preserves_unresolved_tasks_and_clears_history() {
+        for status in ["countdown", "preparing", "ready", "submitting", "submitted", "uncertain", "flying", "paused", "flight_error"] {
+            let db = db();
+            let mut old = new_event("2026-10-09 08:00:00".into(), None, false);
+            old.status = "completed".into();
+            archive(&db, &old).unwrap();
+            let mut event = new_event("2026-10-09 09:00:00".into(), None, false);
+            event.status = status.into();
+            event.weather_checks.push(recorded_weather("creation", true, false));
+            save(&db, &event).unwrap();
+            archive(&db, &event).unwrap();
+            let original = setting(&db, "flight_event").unwrap();
+            assert!(clear_tasks(&db, false, 12345).is_err());
+            assert!(setting(&db, "flight_tasks_cleared_at").unwrap().is_none());
+            for at in [12345, 12346] {
+                assert!(clear_tasks(&db, true, at).unwrap().preserved_current_task, "{status}");
+                let visible = view(&db).unwrap();
+                assert_eq!(visible.event.unwrap().id, event.id);
+                assert!(visible.records.iter().all(|record| record.id == event.id));
+                assert_eq!(visible.tasks_cleared_at, Some(at));
+                assert_eq!(setting(&db, "flight_event").unwrap(), original);
+                assert!(setting(&db, &format!("flight_task_hidden:{}", event.id)).unwrap().is_none());
+                assert!(setting(&db, &format!("flight_task_hidden:{}", old.id)).unwrap().is_some());
+            }
+            // The preserved task can still receive completion and remain visible.
+            event.status = "completed".into();
+            save(&db, &event).unwrap();
+            assert_eq!(view(&db).unwrap().event.unwrap().status, "completed");
+        }
+    }
+    #[test]
+    fn clearing_failed_tasks_removes_rows_and_releases_manual_launch_without_replaying() {
+        for source in ["manual", "auto", "preview"] {
+            let mut db = db();
+            let mut event = new_event("2026-10-11 19:00:00".into(), None, source == "preview");
+            event.source = source.into();
+            event.status = "failed".into();
+            event.error = Some("计划填写失败；未发送起飞请求".into());
+            event.weather_checks.push(recorded_weather("creation", true, false));
+            save(&db, &event).unwrap();
+            put(&db, "flight_handled:2026-10-11 19:00:00", &event.id).unwrap();
+            reading(&db, "2026-10-11 19:00:00", Some(2.));
+            assert!(!clear_tasks(&db, true, 12345).unwrap().preserved_current_task);
+            recover(&db).unwrap();
+            let visible = view(&db).unwrap();
+            assert!(visible.event.is_none());
+            assert!(visible.records.is_empty());
+            assert!(current(&db).unwrap().is_none());
+            let receipt: Event = serde_json::from_str(&setting(&db, &format!("flight_history:{}", event.id)).unwrap().unwrap()).unwrap();
+            assert_eq!(receipt.status, "failed");
+            assert_eq!(receipt.error, event.error);
+            assert_eq!(receipt.weather_checks.len(), 1);
+            assert_eq!(receipt.resolved_at, Some(12345));
+            assert_eq!(setting(&db, "flight_handled:2026-10-11 19:00:00").unwrap(), Some(event.id.clone()));
+            assert!(observe_with_weather(&mut db, parse("2026-10-11 19:00:00").unwrap(), true, None).unwrap().is_none());
+            if source != "preview" {
+                // Even an unhandled later exceeded hour cannot replay a cleared failure.
+                reading(&db, "2026-10-11 20:00:00", Some(2.));
+                assert!(observe_with_weather(&mut db, parse("2026-10-11 20:00:00").unwrap(), true, None).unwrap().is_none());
+            }
+            let next = begin_manual(&db, false).unwrap();
+            assert_ne!(next.id, event.id);
+            assert_eq!(view(&db).unwrap().event.unwrap().id, next.id);
+        }
+    }
+    #[test]
+    fn clear_task_list_rolls_back_visibility_if_cutoff_write_fails() {
+        for status in ["completed", "failed"] {
+            let db = db();
+            let mut event = new_event("2026-10-09 09:00:00".into(), None, false);
+            event.status = status.into();
+            save(&db, &event).unwrap();
+            let original = setting(&db, "flight_event").unwrap();
+            db.execute_batch("CREATE TRIGGER reject_clear BEFORE INSERT ON monitor_settings WHEN NEW.key='flight_tasks_cleared_at' BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+            assert!(clear_tasks(&db, true, 12345).is_err());
+            assert_eq!(view(&db).unwrap().event.unwrap().id, event.id);
+            assert_eq!(setting(&db, "flight_event").unwrap(), original);
+            assert!(setting(&db, "flight_episode").unwrap().is_none());
+            assert!(setting(&db, &format!("flight_task_hidden:{}", event.id)).unwrap().is_none());
+            assert!(setting(&db, &format!("flight_history:{}", event.id)).unwrap().is_none());
+        }
+    }
     fn recorded_weather(stage: &str, allowed: bool, missing: bool) -> WeatherCheck {
         let weather = serde_json::from_value(serde_json::json!({
             "location": "泰州环境监测 Dock 3", "latitude": 32.434525, "longitude": 119.92992,
@@ -624,6 +827,71 @@ mod tests {
         let mut e = current(db).unwrap().unwrap();
         e.status = "dismissed".into();
         save(db, &e).unwrap();
+    }
+    fn time_receipt(event: &Event) -> serde_json::Value {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-09-22T20:19:00+08:00").unwrap().timestamp_millis();
+        serde_json::json!({"url": PLAN_URL, "name": event.name, "status": "执行成功", "flightTime": {
+            "startTime": start, "endTime": start + 1260000, "durationMs": 1260000, "source": "dji-plan", "precision": "minute"
+        }})
+    }
+    #[test]
+    fn completed_flight_time_backfills_without_reopening_the_state_machine() {
+        let db = db();
+        let mut event = new_event("2026-09-22 20:18:24".into(), None, false);
+        event.status = "completed".into();
+        save(&db, &event).unwrap();
+        assert!(!trackable(&event));
+        assert!(needs_flight_time(&event, chrono::Utc::now().timestamp_millis()));
+        apply_flight_time(&db, &event.id, &event.name, &time_receipt(&event)).unwrap();
+        let updated = current(&db).unwrap().unwrap();
+        assert_eq!(updated.flight_time.as_ref().unwrap().duration_ms, 1260000);
+        assert_eq!(updated.status, "completed");
+        assert!(!needs_flight_time(&updated, chrono::Utc::now().timestamp_millis()));
+        apply_observation(&db, &event.id, &event.name, "执行中").unwrap();
+        apply_flight_time(&db, &event.id, &event.name, &serde_json::Value::Null).unwrap();
+        assert_eq!(current(&db).unwrap().unwrap().flight_time, updated.flight_time);
+        let raw = serde_json::to_value(updated).unwrap();
+        assert!(raw["flightTime"]["startTime"].as_i64().is_some());
+        recover(&db).unwrap();
+        assert_eq!(current(&db).unwrap().unwrap().status, "completed");
+    }
+    #[test]
+    fn flight_time_late_receipt_updates_archive_not_a_new_current_task() {
+        let mut db = db();
+        let mut old = new_event("2026-09-22 20:18:24".into(), None, false);
+        old.status = "completed".into();
+        save(&db, &old).unwrap();
+        let next = new_event("2026-09-23 07:00:00".into(), None, false);
+        let tx = db.transaction().unwrap();
+        replace_current(&tx, &next).unwrap();
+        tx.commit().unwrap();
+        apply_flight_time(&db, &old.id, &old.name, &time_receipt(&old)).unwrap();
+        assert_eq!(current(&db).unwrap().unwrap().id, next.id);
+        assert!(current(&db).unwrap().unwrap().flight_time.is_none());
+        let archived: Event = serde_json::from_str(&setting(&db, &format!("flight_history:{}", old.id)).unwrap().unwrap()).unwrap();
+        assert_eq!(archived.flight_time.unwrap().duration_ms, 1260000);
+    }
+    #[test]
+    fn flight_time_rejects_wrong_task_source_and_invalid_duration() {
+        let db = db();
+        let mut event = new_event("2026-09-22 20:18:24".into(), None, false);
+        event.status = "completed".into();
+        for (field, value) in [
+            ("name", serde_json::json!("other")), ("url", serde_json::json!("https://other.test")),
+            ("status", serde_json::json!("执行中")), ("durationMs", serde_json::json!(1)),
+            ("startTime", serde_json::json!(-1)), ("endTime", serde_json::json!(i64::MAX)),
+            ("source", serde_json::json!("planned")), ("precision", serde_json::json!("second")),
+        ] {
+            save(&db, &event).unwrap();
+            let mut receipt = time_receipt(&event);
+            if matches!(field, "name" | "url" | "status") { receipt[field] = value; }
+            else { receipt["flightTime"][field] = value; }
+            apply_flight_time(&db, &event.id, &event.name, &receipt).unwrap();
+            let updated = current(&db).unwrap().unwrap();
+            assert!(updated.flight_time.is_none(), "{field}");
+            assert!(!needs_flight_time(&updated, chrono::Utc::now().timestamp_millis()));
+            assert_eq!(updated.status, "completed");
+        }
     }
     #[test]
     fn observed_plan_status_requires_matching_event_and_explicit_completion() {

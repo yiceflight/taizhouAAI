@@ -30,6 +30,29 @@ export async function readFlightStatus(name, expectedUrl) {
   const states = ['待执行', '执行中', '任务执行', '已暂停', '已挂起', '部分执行', '执行成功', '执行失败', '执行终止'];
   const visible = e => e.getClientRects().length > 0;
   const label = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
+  const flightTime = row => {
+    // FlightHub renders planned and actual times side by side. Never use
+    // the planned group, the request time, or the time of this observation.
+    const groups = row.querySelectorAll('.duration-box .time-content');
+    if (groups.length !== 2) return null;
+    const start = label(groups[1].querySelector('.start-time') || groups[1]);
+    const end = label(groups[1].querySelector('.end-time') || groups[1]);
+    const clock = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+    if (!clock.test(start) || !clock.test(end)) return null;
+    let date = null;
+    for (let previous = row.previousElementSibling; previous; previous = previous.previousElementSibling) {
+      const text = label(previous);
+      if (/^\d{4}-\d{2}-\d{2}(?:今天|昨天)?$/.test(text)) { date = text.slice(0, 10); break; }
+    }
+    if (!date) return null;
+    const startTime = Date.parse(`${date}T${start}:00+08:00`);
+    let endTime = Date.parse(`${date}T${end}:00+08:00`);
+    if (!Number.isFinite(startTime) || new Date(startTime + 8 * 3600000).toISOString().slice(0, 10) !== date) return null;
+    if (endTime < startTime) endTime += 86400000;
+    const durationMs = endTime - startTime;
+    if (durationMs <= 0 || durationMs >= 86400000 || endTime > Date.now()) return null;
+    return { startTime, endTime, durationMs, source: 'dji-plan', precision: 'minute' };
+  };
   const read = () => {
     const rows = [...document.querySelectorAll('tr,[role="row"]')].filter(visible).filter(row =>
       [...row.querySelectorAll('*')].some(e => visible(e) && !e.children.length && label(e) === name));
@@ -39,7 +62,7 @@ export async function readFlightStatus(name, expectedUrl) {
     const found = [...new Set(states.filter(state => [...rows[0].querySelectorAll('*')].some(e =>
       visible(e) && new RegExp(`^${state}(?:[（(]\\d+/\\d+[）)])?$`).test(label(e))))
       .map(state => state === '任务执行' ? '执行中' : state))];
-    return found.length === 1 ? found[0] : null;
+    return found.length === 1 ? { status: found[0], flightTime: found[0] === '执行成功' ? flightTime(rows[0]) : null } : null;
   };
   const observations = [];
   for (const tabName of ['未完成', '已结束', '已完成']) {
@@ -51,7 +74,10 @@ export async function readFlightStatus(name, expectedUrl) {
     const status = read();
     if (status) observations.push(status);
   }
-  return { url: location.href, name, status: observations.length === 1 ? observations[0] : null };
+  // A just-finished task can briefly remain in both tabs. Accept identical
+  // receipts only; conflicting states or times still require another read.
+  const unique = [...new Map(observations.map(value => [JSON.stringify(value), value])).values()];
+  return { url: location.href, name, status: unique.length === 1 ? unique[0].status : null, flightTime: unique.length === 1 ? unique[0].flightTime : null };
 }
 
 // Read-only: FlightHub uses a prefixed Ant modal for weather blocking and other

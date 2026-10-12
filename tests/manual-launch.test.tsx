@@ -143,33 +143,26 @@ describe('manual launch confirmation', () => {
     await click('确认执行任务');
     expect(action).not.toHaveBeenCalled();
   });
-  it('shows failure details without launching and only dismisses after confirmation', async () => {
-    const d=data(2);
-    d.flight.event={id:'failed-auto',observedAt:'2026-10-08 09:00:00',potassium:2,name:'原自动任务',status:'failed',error:'天气条件未通过：阵风 6.1 m/s',preview:false,source:'auto'};
-    const action=await render(d);
-    await click('查看失败详情');
-    expect(document.querySelector('dialog')?.textContent).toContain('阵风 6.1 m/s');
-    expect(document.querySelector('dialog')?.textContent).toContain('触发数据时间');
-    expect(action).not.toHaveBeenCalled();
-    await click('关闭');
-    await click('更多 ⋯');
-    await click('暂不执行本次任务');
-    expect(action).not.toHaveBeenCalled();
-    expect(document.querySelector('dialog')?.textContent).toContain('不会关闭自动巡查');
-    await click('继续保留提醒');
-    expect(action).not.toHaveBeenCalled();
-    await click('更多 ⋯');await click('暂不执行本次任务');await click('确认暂不执行');
-    expect(action).toHaveBeenCalledExactlyOnceWith('dismiss_flight',{eventId:'failed-auto'});
-  });
-  it('does not dismiss a task that changed after opening the confirmation', async () => {
+  it('removes a completed status when polling finishes a flight without taking an action', async () => {
     const d=data();
-    d.flight.event={id:'failed-auto',observedAt:'',potassium:2,name:'原任务',status:'failed',error:'准备失败',preview:false,source:'auto'};
+    d.flight.event={id:'active-task',observedAt:'',potassium:2,name:'原任务',status:'flying',error:null,preview:false,source:'auto'};
     const action=await render(d);
-    await click('更多 ⋯');await click('暂不执行本次任务');
-    d.flight.event={...d.flight.event,status:'flying'};await render(d,action);
-    expect(button('确认暂不执行').hasAttribute('disabled')).toBe(true);
-    await click('确认暂不执行');expect(action).not.toHaveBeenCalled();
-    expect(document.querySelector('dialog')?.textContent).toContain('任务状态已变化');
+    expect(document.querySelector('.drone-status-copy')?.textContent).toContain('正在执飞');
+    d.flight.event={...d.flight.event,status:'completed'};await render(d,action);
+    expect(document.querySelector('.drone-status-copy')).toBeNull();
+    expect(button('立即执行任务').disabled).toBe(false);
+    expect(action).not.toHaveBeenCalled();
+  });
+  it('offers manual retry after failure without requiring dismissal of a status reminder', async () => {
+    const d=data(2);
+    d.flight.event={id:'failed-auto',observedAt:'2026-10-08 09:00:00',potassium:2,name:'原自动任务',status:'failed',error:'准备失败',preview:false,source:'auto'};
+    const action=await render(d);
+    expect(document.querySelector('.drone-status-copy')).toBeNull();
+    expect(button('查看失败详情')).toBeUndefined();
+    expect(button('更多 ⋯')).toBeUndefined();
+    await click('重新发起任务');
+    expect(document.querySelector('dialog')).not.toBeNull();
+    expect(action).not.toHaveBeenCalled();
   });
   it('requires explicit confirmation from the header launch entrance', async () => {
     const action = await render(data(), undefined, true);

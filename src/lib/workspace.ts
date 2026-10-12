@@ -1,3 +1,4 @@
+import type { FlightTime } from './flightReport';
 import { weatherPasses, type WeatherView, type WeatherCheck } from './weather';
 export type BrowserTab = { session: string; id: number; title: string; url: string; status: string };
 export type BridgeStatus = { connected: boolean; clients: number; versions: string[]; tabs: BrowserTab[]; error: string | null };
@@ -9,8 +10,8 @@ export type HourRow = { time: string; potassium: number | null };
 export type NoFlyPeriod = { start: string; end: string };
 export type WorkspaceSettings = { potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[] };
 export const defaultSettings: WorkspaceSettings = { potassiumThreshold: 1.0, pm25Threshold: 60, takeoffDelayMinutes: 5, requireManualConfirmation: true, noFlyPeriods: [{ start: '05:00', end: '08:00' }] };
-export type FlightEvent = { id: string; observedAt: string; potassium: number | null; name: string; status: 'countdown' | 'preparing' | 'ready' | 'submitting' | 'submitted' | 'uncertain' | 'flying' | 'paused' | 'completed' | 'flight_error' | 'failed' | 'not_flown' | 'restricted' | 'canceled' | 'dismissed'; error: string | null; preview: boolean; source?: string; launchAt?: number | null; statusCheckError?: string | null; statusCheckedAt?: number | null; weatherOverrideConfirmedAt?: number | null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null };
-export type MonitorView = { weather?: WeatherView; enabled: boolean; syncing: boolean; lastAttempt: string | null; lastSuccess: string | null; error: string | null; total: number; rows: HourRow[]; queryThrough: string | null; settings: WorkspaceSettings; flight: { enabled: boolean; threshold: number; delayMinutes?: number; event: FlightEvent | null; records?: FlightEvent[] } };
+export type FlightEvent = { id: string; observedAt: string; potassium: number | null; name: string; status: 'countdown' | 'preparing' | 'ready' | 'submitting' | 'submitted' | 'uncertain' | 'flying' | 'paused' | 'completed' | 'flight_error' | 'failed' | 'not_flown' | 'restricted' | 'canceled' | 'dismissed'; error: string | null; preview: boolean; source?: string; launchAt?: number | null; statusCheckError?: string | null; statusCheckedAt?: number | null; weatherOverrideConfirmedAt?: number | null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
+export type MonitorView = { weather?: WeatherView; enabled: boolean; syncing: boolean; lastAttempt: string | null; lastSuccess: string | null; error: string | null; total: number; rows: HourRow[]; queryThrough: string | null; settings: WorkspaceSettings; flight: { enabled: boolean; threshold: number; delayMinutes?: number; event: FlightEvent | null; records?: FlightEvent[]; tasksClearedAt?: number | null } };
 export const siteLabels: Record<SiteHealth['state'], string> = { blocked: '等待插件', unchecked: '待验证', not_open: '待打开', ready: '已验证', login_required: '需登录', forbidden: '无访问权限', page_required: '需打开业务页', error: '检测异常' };
 export const hourTime = (value: string) => new Date(value.replace(' ', 'T') + '+08:00').getTime();
 export function noFlyPeriod(settings: WorkspaceSettings | undefined, now = Date.now()): NoFlyPeriod | undefined {
@@ -33,6 +34,10 @@ export function flightDisplay(data: MonitorView | null, now = Date.now()) {
     if (record.id === event?.id || ids.has(record.id)) return false;
     ids.add(record.id); return true;
   }) };
+}
+// Only a pending or ongoing execution belongs in the overview's current status.
+export function isCurrentFlightEvent(event: FlightEvent | null | undefined) {
+  return !!event && ['countdown', 'preparing', 'ready', 'submitting', 'submitted', 'uncertain', 'flying', 'paused'].includes(event.status);
 }
 export function potassiumReading(data: MonitorView | null, now = Date.now()) {
   const latest = data?.rows[0];

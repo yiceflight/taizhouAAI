@@ -99,3 +99,43 @@ it('cancels no-fly drafts without saving and restores the morning default only i
   expect(onClose).toHaveBeenCalledOnce();
   expect(ipc.invoke).not.toHaveBeenCalled();
 });
+
+const clickText = async (text: string) => { await act(async () => [...document.querySelectorAll('button')].find(b => b.textContent === text)!.click()); };
+it('clears only after confirmation, refreshes tasks and keeps unsaved settings open', async () => {
+  const cleared = vi.fn(async () => {});
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} onTasksCleared={cleared} />));
+  await clickText('清空任务列表');
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  await clickText('暂不清空');
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  await clickText('清空任务列表');
+  ipc.invoke.mockResolvedValueOnce({ preservedCurrentTask: false });
+  await clickText('确认清空');
+  expect(ipc.invoke).toHaveBeenCalledExactlyOnceWith('clear_task_list', { confirmed: true });
+  expect(cleared).toHaveBeenCalledOnce();
+  expect(onSaved).not.toHaveBeenCalled();
+  expect(onClose).not.toHaveBeenCalled();
+  expect(document.querySelector('[role="status"]')?.textContent).toContain('任务列表已清空');
+});
+it('keeps the confirmation available and shows storage errors on clear failure', async () => {
+  await render();
+  await clickText('清空任务列表');
+  ipc.invoke.mockRejectedValueOnce('任务记录写入失败');
+  await clickText('确认清空');
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain('任务记录写入失败');
+  expect(document.querySelector('[role="status"]')).toBeNull();
+  expect(onClose).not.toHaveBeenCalled();
+});
+
+it('reports successful history clearing while retaining a current task', async () => {
+  const cleared = vi.fn(async () => {});
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} onTasksCleared={cleared} />));
+  await clickText('清空任务列表');
+  expect(document.body.textContent).toContain('当前正在执行或待核查的任务会保留');
+  ipc.invoke.mockResolvedValueOnce({ preservedCurrentTask: true });
+  await clickText('确认清空');
+  expect(cleared).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="status"]')?.textContent).toContain('历史任务已清空。当前正在执行或待核查的任务已保留');
+  expect(document.querySelector('[role="alert"]')).toBeNull();
+  expect(onSaved).not.toHaveBeenCalled();
+});

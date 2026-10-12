@@ -274,3 +274,36 @@ test('a missing review panel cannot reach the final confirmation', async()=>{
   assert.equal(evaluations,0);
   assert.equal(stored[`flight-submit-${job.eventId}`],undefined);
 });
+
+test('completed flight reads actual minute times, ignores planned times, and handles midnight', async () => {
+  const name = '手动巡查-20260922-20-ba0c4948';
+  for (const [date, start, end, expectedStart, expectedEnd] of [
+    ['2026-09-22', '20:19', '20:40', '2026-09-22T20:19:00+08:00', '2026-09-22T20:40:00+08:00'],
+    ['2026-09-22', '23:55', '00:16', '2026-09-22T23:55:00+08:00', '2026-09-23T00:16:00+08:00'],
+    ['2026-09-22', '--', '--', null, null],
+    ['2026-09-22', '20:19', '--', null, null],
+    ['2026-09-22', '20:19', '20:19', null, null],
+    ['2026-02-30', '20:19', '20:40', null, null],
+    ['', '20:19', '20:40', null, null],
+  ]) {
+    const { window, document } = parseHTML(`<button role="tab">已结束</button><table><tr><td>${date} 今天</td></tr><tr><td><div class="duration-box"><div class="time-content"><div class="start-time">19:00</div><div class="end-time">19:50</div></div><div class="time-content"><div class="start-time">${start}</div><div class="end-time">${end}</div></div></div></td><td>${name}</td><td>执行成功 (9/9)</td></tr></table>`);
+    window.HTMLElement.prototype.getClientRects = () => [1];
+    const result = await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() });
+    assert.equal(result.status, '执行成功');
+    if (!expectedStart) assert.equal(result.flightTime, null);
+    else {
+      assert.equal(result.flightTime.startTime, Date.parse(expectedStart));
+      assert.equal(result.flightTime.endTime, Date.parse(expectedEnd));
+      assert.equal(result.flightTime.durationMs, 21 * 60000);
+      assert.equal(result.flightTime.precision, 'minute');
+      assert.equal(result.flightTime.source, 'dji-plan');
+    }
+  }
+});
+
+test('a finished row briefly appearing in both tabs does not lose its receipt', async () => {
+  const { window, document } = parseHTML(`<button role="tab">未完成</button><button role="tab">已结束</button><table><tr><td>${job.name}</td><td>执行成功 (9/9)</td></tr></table>`);
+  window.HTMLElement.prototype.getClientRects = () => [1];
+  const result = await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() });
+  assert.equal(result.status, '执行成功');
+});

@@ -198,6 +198,8 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .advanced-panel > p { margin: 14px 0; color: #5c7665; font-size: 13px; }
 .wizard-fields { display: grid; gap: 16px; }
 .wizard-fields > label { display: grid; gap: 8px; font-size: 13px; color: #486a54; }
+.wizard-fields > .checkbox-label { display: flex; align-items: center; }
+.checkbox-label input { flex-shrink: 0; accent-color: #286c4e; }
 .wizard-fields > button { justify-self: start; }
 .wizard-fields .notice { margin: 0; }
 .compact.setup-steps li { font-size: 12px; padding: 10px; }
@@ -234,14 +236,16 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .manual-launch-metrics dt { font-size: 12px; color: #657b6c; margin-bottom: 5px; }
 .manual-launch-metrics dd { margin: 0; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .manual-launch-dialog .settings-footer { justify-content: flex-end; }
-.settings-dialog form { display: flex; flex-direction: column; max-height: calc(100dvh - 44px); }
+.settings-dialog form { display: flex; flex-direction: column; max-height: calc(100dvh - 44px); overflow: hidden; }
+.settings-dialog form > .settings-header, .settings-dialog form > .settings-footer { flex-shrink: 0; }
 .settings-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; border-bottom: 1px solid #e2eae4; }
 .settings-header h2 { font-size: 20px; margin-bottom: 4px; }
 .settings-header p, .settings-help { font-size: 12px; color: #657b6c; }
 .settings-header .icon-button { font-size: 22px; border: 0; }
-.settings-body { padding: 0 24px; overflow: auto; }
+.settings-body { min-height: 0; margin-block: 12px; padding: 0 24px; overflow: auto; overscroll-behavior: contain; scroll-padding-block: 12px; }
 .settings-section { border: 0; border-bottom: 1px solid #e2eae4; padding: 20px 0; margin: 0; min-width: 0; }
-.settings-section:last-of-type { border-bottom: 0; }
+.settings-section:first-of-type { padding-top: 12px; }
+.settings-section:last-of-type { border-bottom: 0; padding-bottom: 12px; }
 .settings-section legend { float: left; width: 100%; margin-bottom: 14px; padding: 0; font-weight: 600; font-size: 14px; }
 .settings-section legend + * { clear: both; }
 .settings-fields { display: grid; grid-template-columns: 1fr; gap: 18px; }
@@ -406,5 +410,36 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .report-dialog .settings-header > .text-button { flex-shrink: 0; white-space: nowrap; }
 .report-dialog .settings-header p { margin: 6px 0 0; overflow-wrap: anywhere; }
 .report-dialog .report-dialog-body { overflow-y: auto; overscroll-behavior: contain; margin: 0; border: 0; border-radius: 0; padding: 20px; }
-.report-flight-time { margin: 0 0 18px; line-height: 1.7; }
-.report-dialog .button-row { justify-content: flex-end; flex-wrap: wrap; }
+.report-materials { border: 1px solid #d7e2da; border-radius: 8px; overflow: hidden; }
+.report-material-row { display: flex; align-items: flex-start; gap: 16px; padding: 16px; }
+.report-material-row + .report-material-row, .report-flight-fields + .report-material-row { border-top: 1px solid #e2eae4; }
+.report-material-label { flex: 0 0 70px; color: #61776a; font-size: 13px; line-height: 1.7; }
+.report-material-label small, .report-material-value small { display: block; color: #657b6c; font-size: 12px; font-weight: 400; line-height: 1.7; }
+.report-material-value { flex: 1; min-width: 0; line-height: 1.7; }
+.report-material-value strong { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.report-material-value .checkbox-label { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12px; color: #486a54; }
+.report-material-value .checkbox-label input { margin: 0; }
+.report-material-row > .text-button { flex-shrink: 0; padding: 0; font-size: 12px; line-height: 1.9; }
+.report-flight-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 16px 16px; }
+.report-flight-fields label { display: grid; gap: 6px; min-width: 0; color: #486a54; font-size: 12px; }
+.report-flight-fields .report-flight-name { grid-column: 1 / -1; }
+.report-flight-fields input { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid #c7d6ce; border-radius: 6px; color: #243d33; background: #fff; }
+.report-dialog .flight-preview { margin-top: 16px; }
+.report-dialog-body > .notice { margin: 16px 0 0; }
+.report-dialog-footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; flex-shrink: 0; padding: 16px 20px; border-top: 1px solid #e2eae4; }
+@media (max-width: 520px) {
+  .report-dialog .report-dialog-body { padding: 16px; }
+  .report-material-row { gap: 10px; padding: 12px; flex-wrap: wrap; }
+  .report-material-label { flex-basis: 56px; }
+  .report-material-row > .text-button { margin-left: 66px; }
+  .report-flight-fields { grid-template-columns: 1fr; padding: 0 12px 12px; }
+  .report-dialog-footer { padding: 12px 16px; }
+}
+
+.task-clear-content { display: grid; gap: 12px; }
+.task-clear-content > .settings-help, .task-clear-content > .notice { margin: 0; }
+.task-clear-content > .task-clear-button { justify-self: start; }
+.settings-section .task-clear-button { color: #b44831; border-color: #dba99d; }
+.task-clear-confirm p { margin-top: 8px; }
+.task-clear-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.task-clear-actions .secondary-button { margin-top: 0; }

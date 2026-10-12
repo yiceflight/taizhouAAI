@@ -207,6 +207,17 @@ pub fn require_started(app: &tauri::AppHandle) -> Result<(), String> {
     }
     Ok(())
 }
+// Photo-only reports depend on FlightHub and the bridge, not monitoring or Airins.
+pub fn require_report_media(app: &tauri::AppHandle) -> Result<(), String> {
+    check_report_media(view(app))
+}
+fn check_report_media(state: View) -> Result<(), String> {
+    if !state.plugin_ready { return Err(state.plugin_message); }
+    if !state.sites.iter().any(|site| site.id == "dji" && site.state == "ready") {
+        return Err("请先登录司空媒体库并完成可用性验证。".into());
+    }
+    Ok(())
+}
 pub async fn refresh(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<Readiness>();
     if state.checking.swap(true, Ordering::SeqCst) {
@@ -545,6 +556,19 @@ mod tests {
             },
             cache,
         )
+    }
+    #[test]
+    fn photo_only_report_requires_only_verified_flight_hub_and_compatible_plugin() {
+        let (mut bridge, mut cache) = fixture();
+        bridge.tabs.retain(|tab| tab.tab.url.starts_with("https://fh.dji.com"));
+        cache.retain(|entry| entry.health.id == "dji");
+        assert!(!evaluate(&bridge, &cache, false, false).ready);
+        assert!(check_report_media(evaluate(&bridge, &cache, false, false)).is_ok());
+        cache[0].health.state = "login_required".into();
+        assert!(check_report_media(evaluate(&bridge, &cache, false, false)).is_err());
+        cache[0].health.state = "ready".into();
+        bridge.versions = vec!["0.5.0".into()];
+        assert!(check_report_media(evaluate(&bridge, &cache, false, false)).is_err());
     }
     #[test]
     fn gates_all_sites_and_preserves_started_on_loss_for_recovery() {

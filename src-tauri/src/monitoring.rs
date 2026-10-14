@@ -184,7 +184,7 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
     tx.commit().map_err(|e| e.to_string())
 }
 async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String> {
-    crate::readiness::require_ready(app)?;
+    crate::readiness::require_monitoring(app, false)?;
     let monitor = app.state::<Monitor>();
     if monitor.busy.swap(true, Ordering::SeqCst) {
         return Err("小时同步正在进行中".into());
@@ -218,7 +218,7 @@ async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String
     }
     .await;
     *monitor.error.lock().unwrap() = result.as_ref().err().cloned();
-    if result.is_ok() && trigger_flight && crate::readiness::require_ready(app).is_ok() {
+    if result.is_ok() && trigger_flight {
         // Flight preparation has its own persistent status; a failure must not
         // turn a successful measurement import into a reported sync failure.
         if let Err(error) = crate::flight::after_sync(app).await {
@@ -238,7 +238,7 @@ pub fn start(app: tauri::AppHandle) {
                         .load(Ordering::SeqCst)
                     {
                         let _ = crate::readiness::refresh(&app).await;
-                        if crate::readiness::require_ready(&app).is_ok() {
+                        if crate::readiness::require_monitoring(&app, true).is_ok() {
                             let _ = sync(&app, true).await;
                         }
                     }
@@ -292,13 +292,13 @@ pub async fn verify_first_sync(app: &tauri::AppHandle) -> Result<(), String> {
 }
 #[tauri::command]
 pub async fn sync_monitoring(app: tauri::AppHandle) -> Result<(), String> {
-    crate::readiness::require_started(&app)?;
+    crate::readiness::require_monitoring(&app, true)?;
     sync(&app, true).await
 }
 #[tauri::command]
 pub fn set_monitoring_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     if enabled {
-        crate::readiness::require_ready(&app)?;
+        crate::readiness::require_monitoring(&app, false)?;
     }
     put(
         &database(&app)?,

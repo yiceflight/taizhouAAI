@@ -18,6 +18,7 @@ const report: BridgeDiagnosticReport = {
   ],
 };
 beforeEach(() => {
+  vi.useFakeTimers();
   const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
   vi.stubGlobal('window', window); vi.stubGlobal('document', window.document);
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -25,7 +26,7 @@ beforeEach(() => {
   ipc.invoke.mockReset().mockResolvedValue(report); ipc.isTauri.mockReturnValue(true);
   root = createRoot(document.getElementById('root')!);
 });
-afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
+afterEach(async () => { await act(async () => root.unmount()); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const mount = () => act(async () => root.render(<StrictMode><BridgeDiagnostics /></StrictMode>));
 const button = (text: string) => [...document.querySelectorAll('button')].find(b => b.textContent === text)!;
 
@@ -60,6 +61,66 @@ it('prevents overlapping diagnostic requests', async () => {
   await mount();
   expect(button('正在诊断…').disabled).toBe(true);
   expect(ipc.invoke).toHaveBeenCalledTimes(1);
+  await act(async () => vi.advanceTimersByTimeAsync(15000));
+  expect(ipc.invoke).toHaveBeenCalledTimes(1);
   await act(async () => finish(report));
   expect(button('重新诊断').disabled).toBe(false);
+});
+
+const connectedReport: BridgeDiagnosticReport = {
+  ...report, checkedAt: '2026-10-14T03:00:00Z',
+  checks: report.checks.map(check => check.id === 'plugin'
+    ? { ...check, state: 'pass', detail: '收到插件的有效心跳', suggestion: '' } : check),
+};
+
+it('automatically replaces a missing heartbeat with a connected result and detects a later disconnect', async () => {
+  await mount();
+  expect(document.body.textContent).toContain('无法据此判断插件是否已安装');
+  ipc.invoke.mockResolvedValue(connectedReport);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(document.body.textContent).toContain('收到插件的有效心跳');
+  expect(document.body.textContent).not.toContain('无法据此判断插件是否已安装');
+  await act(async () => button('复制诊断结果').click());
+  expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(diagnosticText(connectedReport));
+  ipc.invoke.mockResolvedValue(report);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(document.body.textContent).toContain('无法据此判断插件是否已安装');
+  expect(document.body.textContent).not.toContain('收到插件的有效心跳');
+});
+
+it('keeps the previous report visible during a refresh, clears it on failure and automatically recovers', async () => {
+  ipc.invoke.mockResolvedValue(connectedReport);
+  await mount();
+  let fail!: (error: string) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(document.body.textContent).toContain('收到插件的有效心跳');
+  await act(async () => vi.advanceTimersByTimeAsync(10000));
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+  await act(async () => fail('连接中断'));
+  expect(document.body.textContent).not.toContain('收到插件的有效心跳');
+  expect(document.body.textContent).toContain('诊断未完成：连接中断');
+  expect(button('复制诊断结果').disabled).toBe(true);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(document.body.textContent).toContain('收到插件的有效心跳');
+  expect(document.body.textContent).not.toContain('诊断未完成');
+});
+
+it('pauses while hidden, refreshes immediately on return and removes its timer on unmount', async () => {
+  const render = (active: boolean) => act(async () => root.render(<StrictMode><BridgeDiagnostics active={active} /></StrictMode>));
+  await render(false);
+  await act(async () => vi.advanceTimersByTimeAsync(10000));
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  await render(true);
+  expect(ipc.invoke).toHaveBeenCalledTimes(1);
+  await render(false);
+  await act(async () => vi.advanceTimersByTimeAsync(10000));
+  expect(ipc.invoke).toHaveBeenCalledTimes(1);
+  ipc.invoke.mockResolvedValue(connectedReport);
+  await render(true);
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+  expect(document.body.textContent).toContain('收到插件的有效心跳');
+  await act(async () => root.render(null));
+  await act(async () => vi.advanceTimersByTimeAsync(10000));
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
 });

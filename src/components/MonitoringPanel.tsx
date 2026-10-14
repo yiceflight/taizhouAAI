@@ -115,7 +115,7 @@ function MonitoringChart({ rows, settings }: { rows: HourRow[]; settings: Worksp
   </div>;
 }
 
-type Props = { data: MonitorView | null; busy: boolean; ready: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void; onAir?: () => void; reportGenerating?: boolean };
+type Props = { data: MonitorView | null; busy: boolean; ready: boolean; flightReady?: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void; onAir?: () => void; reportGenerating?: boolean };
 function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
   return <svg className={`refresh-icon${spinning ? ' is-spinning' : ''}`} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
     <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
@@ -124,7 +124,7 @@ function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
     <path d="M21 20v-5h-5" />
   </svg>;
 }
-export function MonitoringPanel({ data, busy, ready, started, action, onPrepare, onFlight, onAir, reportGenerating }: Props) {
+export function MonitoringPanel({ data, busy, ready, flightReady = ready, started, action, onPrepare, onFlight, onAir, reportGenerating }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('chart');
   const [range, setRange] = useState<Range>(24);
   const latest = data?.rows[0];
@@ -154,7 +154,7 @@ export function MonitoringPanel({ data, busy, ready, started, action, onPrepare,
     {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>查看运行状态 →</button>}</div>}
     <section id="monitoring-task-details" className={`task-details ${pending ? 'task-callout' : 'data-card'}`} aria-label="巡查任务详情">
       <div className="section-heading"><h3>巡查任务</h3><button className="text-button" onClick={onFlight}>查看任务 →</button></div>
-      <DroneStatus data={data} ready={ready} started={started} busy={busy} action={action} onFlight={onFlight} onAir={onAir} reportGenerating={reportGenerating} />
+      <DroneStatus data={data} ready={flightReady} started={started} busy={busy} action={action} onFlight={onFlight} onAir={onAir} reportGenerating={reportGenerating} />
       {pending && plan && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>
         {plan.status === 'uncertain' && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
       </div>}

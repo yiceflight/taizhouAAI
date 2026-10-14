@@ -29,7 +29,7 @@ export function useWorkspace() {
     finally { if (!priority) lock.current = false; pendingActions.current -= 1; setActing(pendingActions.current > 0); }
   }, [refresh]);
   useEffect(() => {
-    if (!readiness?.ready || readiness.started || readiness.checking || acting || lock.current || autoStartAttempted.current) return;
+    if (!(readiness?.monitoringReady ?? readiness?.ready) || readiness.started || readiness.checking || acting || lock.current || autoStartAttempted.current) return;
     // One automatic attempt per launch. A failed first sync stays visible and
     // can be retried explicitly, rather than looping on every status poll.
     autoStartAttempted.current = true;

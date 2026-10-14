@@ -176,6 +176,20 @@ fn restrict(db: &Connection, event: &mut Event, reason: String) -> Result<(), St
     save(db, event)
 }
 fn recover(db: &Connection) -> Result<(), String> {
+    // Older clients released an uncertain task on explicit refresh and guarded
+    // it only with flight_episode. Restore that reservation before interpreting
+    // the legacy timestamp as an hourly marker.
+    if current(db)?.is_none() {
+        if let Some(hour) = setting(db, "flight_episode")?.filter(|s| !s.is_empty()) {
+            let legacy: Option<String> = db.query_row(
+                "SELECT value FROM monitor_settings WHERE key LIKE 'flight_history:%' AND json_extract(value, '$.status')='uncertain' AND json_extract(value, '$.observedAt')=?1 AND json_extract(value, '$.resolvedAt') IS NULL ORDER BY rowid DESC LIMIT 1",
+                [&hour], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+            if let Some(raw) = legacy {
+                let event: Event = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                save(db, &event)?;
+            }
+        }
+    }
     if let Some(mut event) = current(db)? {
         match event.status.as_str() {
             "countdown" => { event.status = "canceled".into(); event.error = Some("客户端重启，已取消原倒计时。".into()); }
@@ -209,6 +223,20 @@ fn observe_with_weather(db: &mut Connection, at: chrono::NaiveDateTime, weather_
     let Some((time, Some(k))) = latest else { return Ok(None); };
     let age = at - parse(&time)?;
     if age < Duration::zero() || age > Duration::hours(3) { return Ok(None); }
+    // Failed means no launch request was sent. All sources, including manual
+    // and preview attempts, release their slot on the next valid source hour.
+    // Keep the original receipt and handled-hour guards in the same transaction.
+    if let Some(event) = current(&tx)?.filter(|e| e.status == "failed") {
+        // Manual creation timestamps include minutes/seconds; monitoring::parse
+        // deliberately accepts only whole-hour observation timestamps.
+        let failed_at = chrono::NaiveDateTime::parse_from_str(&event.observed_at, "%Y-%m-%d %H:%M:%S")
+            .map_err(|_| "失败任务时间格式错误")?;
+        if parse(&time)?.and_utc().timestamp().div_euclid(3600) > failed_at.and_utc().timestamp().div_euclid(3600) {
+            archive(&tx, &event)?;
+            tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
+            put(&tx, "flight_episode", "")?;
+        }
+    }
     let settings = crate::settings::read(&tx)?;
     if k > settings.potassium_threshold {
         if let Some(reason) = settings.no_fly_reason(parse(&time)?).or_else(|| settings.no_fly_reason(at)) {
@@ -220,7 +248,7 @@ fn observe_with_weather(db: &mut Connection, at: chrono::NaiveDateTime, weather_
                 put(&tx, &key, &serde_json::to_string(&record).map_err(|e| e.to_string())?)?;
                 if setting(&tx, &format!("flight_handled:{time}"))?.is_none() { put(&tx, &format!("flight_handled:{time}"), &record.id)?; }
                 let previous = current(&tx)?;
-                if previous.as_ref().is_none_or(|e| terminal(e) || (e.source == "auto" && e.status == "failed")) {
+                if previous.as_ref().is_none_or(terminal) {
                     replace_current(&tx, &record)?;
                     put(&tx, "flight_episode", "")?;
                 }
@@ -229,22 +257,14 @@ fn observe_with_weather(db: &mut Connection, at: chrono::NaiveDateTime, weather_
             return Ok(None);
         }
     }
-    // A failed preparation never sent a launch request. New valid hourly data
-    // releases that automatic attempt; keep its receipt and same-hour dedup.
-    // Submitted/uncertain flights and intentional cancellations stay guarded.
-    if let Some(event) = current(&tx)?.filter(|e| e.source == "auto" && !e.preview && e.status == "failed") {
-        if parse(&time)? > parse(&event.observed_at)? {
-            put(&tx, &format!("flight_history:{}", event.id), &serde_json::to_string(&event).map_err(|e| e.to_string())?)?;
-            tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
-            put(&tx, "flight_episode", "")?;
-        }
-    }
     if k <= crate::settings::read(&tx)?.potassium_threshold {
         put(&tx, "flight_episode", "")?;
         tx.commit().map_err(|e| e.to_string())?;
         return Ok(None);
     }
-    if !weather_allowed || !enabled(&tx)? || setting(&tx, "flight_episode")?.is_some_and(|s| !s.is_empty())
+    // Legacy episode timestamps now suppress only that hour (and older data).
+    // Persistent handled-hour receipts remain authoritative across restarts.
+    if !weather_allowed || !enabled(&tx)? || setting(&tx, "flight_episode")?.is_some_and(|hour| !hour.is_empty() && hour >= time)
         || current(&tx)?.is_some_and(|e| !terminal(&e))
         || setting(&tx, &format!("flight_handled:{time}"))?.is_some() {
         // Persist the released failure even when current weather or settings
@@ -313,23 +333,31 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
         let db = database(app)?;
         if !current(&db)?.is_some_and(|e| e.id == event.id && e.status == "preparing") { return Ok(()); }
         if let Some(reason) = restriction_reason(&db, &event, now())? { restrict(&db, &mut event, reason)?; return Ok(()); }
-        if let Err(error) = crate::readiness::require_started(app) {
+        if let Err(error) = crate::readiness::require_flight(app) {
             event.status = "failed".into(); event.error = Some(error.clone()); save(&db, &event)?; return Err(error);
         }
         if needs_confirmation(&db, &event)? { event.status = "ready".into(); save(&db, &event)?; return Ok(()); }
         event.status = "submitting".into(); save(&db, &event)?;
     }
     let result = app.state::<Bridge>().submit_flight(&event.id, &event.name).await;
+    let state = app.state::<Flight>();
+    let _gate = state.gate.lock().unwrap();
+    apply_submission_result(&database(app)?, &event.id, &event.name, result)
+}
+fn apply_submission_result(db: &Connection, id: &str, name: &str, result: Result<serde_json::Value, String>) -> Result<(), String> {
+    let Some(mut event) = current(db)? else { return Ok(()); };
+    if event.id != id || event.name != name || event.status != "submitting" { return Ok(()); }
     match result {
         Ok(data) if data["status"] == "submitted" && data["submitted"] == true && data["name"] == event.name => {
             event.status = "submitted".into(); event.error = None;
         }
         Ok(_) => { event.status = "uncertain".into(); event.error = Some("未获得可核对的提交回执，请到司空核查；不会自动重试。".into()); }
+        // Persist the definitive first receipt before the draft can disappear.
+        Err(error) if is_confirmed_weather_block(&error) => return record_weather_block(db, &mut event, &error),
         Err(error) if error.contains("取消") => { event.status = "canceled".into(); event.error = None; }
         Err(error) => { event.status = "uncertain".into(); event.error = Some(format!("{error} 请到司空核查；不会自动重试。")); }
     }
-    update_current(app, &event)?;
-    Ok(())
+    save(db, &event)
 }
 fn prevent_restricted_launch(app: &tauri::AppHandle, event: &mut Event) -> Result<bool, String> {
     let state = app.state::<Flight>(); let _gate = state.gate.lock().unwrap();
@@ -341,6 +369,7 @@ fn prevent_restricted_launch(app: &tauri::AppHandle, event: &mut Event) -> Resul
     Ok(false)
 }
 pub async fn after_sync(app: &tauri::AppHandle) -> Result<(), String> {
+    if crate::readiness::require_flight(app).is_err() { return Ok(()); }
     crate::weather::refresh(app, false).await;
     let check = creation_weather(app);
     let state = app.state::<Flight>();
@@ -370,7 +399,7 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
         claim_due(&database(app)?, chrono::Utc::now().timestamp_millis())?
     };
     if let Some(mut event) = pending {
-        if let Err(error) = crate::readiness::require_started(app) {
+        if let Err(error) = crate::readiness::require_flight(app) {
             event.status = "failed".into(); event.error = Some(format!("起飞前检查失败：{error}")); update_current(app, &event)?;
         } else { execute(app, event).await?; }
     }
@@ -423,50 +452,39 @@ fn needs_flight_time(event: &Event, now: i64) -> bool {
     event.status == "completed" && !event.preview && event.flight_time.is_none()
         && event.flight_time_checked_at.is_none_or(|checked| now.saturating_sub(checked) >= 60000)
 }
+fn is_confirmed_weather_block(message: &str) -> bool {
+    // The adapter emits this receipt only for the exact event's original draft.
+    // A missing row, truncated receipt or generic error cannot prove no flight.
+    message.starts_with("司空平台天气阻飞：") && message.ends_with("；未继续执行")
+}
+fn record_weather_block(db: &Connection, event: &mut Event, message: &str) -> Result<(), String> {
+    event.status = "not_flown".into();
+    event.status_checked_at = Some(chrono::Utc::now().timestamp_millis());
+    event.status_check_error = None;
+    event.error = Some(match event.error.as_deref() {
+        Some(original) if original != message => format!("{original}\n司空核查：{message}"),
+        _ => message.into(),
+    });
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    if setting(&tx, "flight_episode")?.is_none_or(|s| s.is_empty()) {
+        put(&tx, "flight_episode", &event.observed_at)?;
+    }
+    archive(&tx, event)?;
+    save(&tx, event)?;
+    tx.commit().map_err(|e| e.to_string())
+}
 fn record_check_error(db: &Connection, id: &str, name: &str, message: &str) -> Result<(), String> {
     let Some(mut event) = current(db)? else { return Ok(()); };
     if event.id != id || event.name != name || !trackable(&event) { return Ok(()); }
     event.status_checked_at = Some(chrono::Utc::now().timestamp_millis());
-    // The v0.7.10 adapter only emits this receipt after reading this event's
-    // exact original draft. A missing row or generic error proves nothing.
-    if matches!(event.status.as_str(), "ready" | "uncertain") && message.starts_with("司空平台天气阻飞：") && message.ends_with("；未继续执行") {
-        event.status = "not_flown".into();
-        event.status_check_error = None;
-        event.error = Some(match event.error.as_deref() {
-            Some(original) if original != message => format!("{original}\n司空核查：{message}"),
-            _ => message.into(),
-        });
-        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
-        if setting(&tx, "flight_episode")?.is_none_or(|s| s.is_empty()) {
-            put(&tx, "flight_episode", &event.observed_at)?;
-        }
-        archive(&tx, &event)?;
-        save(&tx, &event)?;
-        return tx.commit().map_err(|e| e.to_string());
+    if matches!(event.status.as_str(), "ready" | "uncertain") && is_confirmed_weather_block(message) {
+        return record_weather_block(db, &mut event, message);
     }
     event.status_check_error = Some(message.chars().take(180).collect());
     save(db, &event)
 }
-fn handle_unmatched_status(db: &Connection, id: &str, name: &str, manual: bool) -> Result<bool, String> {
-    let message = "司空列表未识别到该任务状态，请检查平台页面或日期范围。";
-    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
-    record_check_error(&tx, id, name, message)?;
-    let event = current(&tx)?.filter(|e| e.id == id && e.name == name && e.status == "uncertain");
-    let released = if let Some(mut event) = event.filter(|_| manual) {
-        // Explicit refresh releases the local reservation only. Keep the
-        // unresolved outcome in history; absence is not proof of no flight.
-        event.status_check_error = Some(format!("{message} 已手动刷新并解除本地任务占用，原起飞结果仍未确认。"));
-        archive(&tx, &event)?;
-        tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
-        // Restoring the launch button must not dispatch another automatic
-        // flight on the next sync. A normal reading can rearm a later episode.
-        if setting(&tx, "flight_episode")?.is_none_or(|s| s.is_empty()) {
-            put(&tx, "flight_episode", &event.observed_at)?;
-        }
-        true
-    } else { false };
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(released)
+fn handle_unmatched_status(db: &Connection, id: &str, name: &str) -> Result<(), String> {
+    record_check_error(db, id, name, "司空列表未识别到该任务状态，请检查平台页面或日期范围；结果未确认，继续核查以避免重复起飞。")
 }
 async fn watch(app: &tauri::AppHandle, expected_id: Option<&str>) -> Result<(), String> {
     let state = app.state::<Flight>();
@@ -496,7 +514,8 @@ async fn watch(app: &tauri::AppHandle, expected_id: Option<&str>) -> Result<(), 
                 Ok(())
             } else {
                 let message = "司空列表未识别到该任务状态，请检查平台页面或日期范围。";
-                if handle_unmatched_status(&db, &event.id, &event.name, expected_id.is_some())? { Ok(()) } else { Err(message.into()) }
+                handle_unmatched_status(&db, &event.id, &event.name)?;
+                Err(message.into())
             }
         }
         Ok(_) => { record_check_error(&db, &event.id, &event.name, "司空状态回执不匹配。")?; Err("司空状态回执不匹配。".into()) }
@@ -537,7 +556,7 @@ pub fn cancel_flight(app: tauri::AppHandle, event_id: String) -> Result<(), Stri
 }
 #[tauri::command]
 pub fn set_flight_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    if enabled { crate::readiness::require_started(&app)?; }
+    if enabled { crate::readiness::require_flight(&app)?; }
     let state = app.state::<Flight>(); let _gate = state.gate.lock().unwrap();
     let mut db = database(&app)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -564,8 +583,8 @@ fn close_reviewed(db: &Connection, id: &str, expected_status: &str, confirmed: b
     archive(&tx, &event)?;
     tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
     // Releasing a real draft/exception must not immediately dispatch a new flight.
-    // Normal hourly data can rearm a later episode. Preview and preparation-failure
-    // disposition preserve the existing episode policy.
+    // A newer source hour may dispatch after explicit resolution; the reviewed
+    // hour must not replay. Preview and preparation failures keep existing receipts.
     if !event.preview && event.source != "preview" && event.status != "failed"
         && setting(&tx, "flight_episode")?.is_none_or(|s| s.is_empty()) {
         put(&tx, "flight_episode", &event.observed_at)?;
@@ -605,9 +624,10 @@ fn begin_manual_with_weather(db: &Connection, preview: bool, retry_event_id: Opt
 #[cfg(test)]
 fn begin_manual(db: &Connection, preview: bool) -> Result<Event, String> { begin_manual_request(db, preview, None, false) }
 async fn begin(app: tauri::AppHandle, preview: bool, retry_event_id: Option<String>, weather_override_confirmed: bool) -> Result<(), String> {
-    crate::readiness::require_started(&app)?;
+    crate::readiness::require_flight(&app)?;
     let state = app.state::<Flight>();
     if state.busy.swap(true, Ordering::SeqCst) { return Err("巡飞任务正在处理，请稍候。".into()); }
+    crate::weather::refresh(&app, true).await;
     let event = {
         let _gate = state.gate.lock().unwrap();
         database(&app).and_then(|db| begin_manual_with_weather(&db, preview, retry_event_id.as_deref(), weather_override_confirmed, Some(creation_weather(&app))))
@@ -739,9 +759,10 @@ mod tests {
             assert_eq!(setting(&db, "flight_handled:2026-10-11 19:00:00").unwrap(), Some(event.id.clone()));
             assert!(observe_with_weather(&mut db, parse("2026-10-11 19:00:00").unwrap(), true, None).unwrap().is_none());
             if source != "preview" {
-                // Even an unhandled later exceeded hour cannot replay a cleared failure.
+                // Clearing keeps same-hour dedup, but does not suppress a new hour.
                 reading(&db, "2026-10-11 20:00:00", Some(2.));
-                assert!(observe_with_weather(&mut db, parse("2026-10-11 20:00:00").unwrap(), true, None).unwrap().is_none());
+                let next = observe_with_weather(&mut db, parse("2026-10-11 20:00:00").unwrap(), true, None).unwrap().unwrap();
+                cancel(&db, &next.id).unwrap();
             }
             let next = begin_manual(&db, false).unwrap();
             assert_ne!(next.id, event.id);
@@ -944,13 +965,15 @@ mod tests {
         assert!(observe(&mut db, t, true).unwrap().is_none());
         dismiss(&db);
         reading(&db, "2026-09-22 10:00:00", Some(2.));
-        assert!(observe(&mut db, t, true).unwrap().is_none());
+        let next = observe(&mut db, t, true).unwrap().unwrap();
+        assert_ne!(event.id, next.id);
+        dismiss(&db);
         reading(&db, "2026-09-22 10:00:00", None);
         assert!(observe(&mut db, t, true).unwrap().is_none());
         reading(&db, "2026-09-22 10:00:00", Some(0.5));
         observe(&mut db, t, true).unwrap();
         reading(&db, "2026-09-22 10:00:00", Some(2.));
-        assert!(observe(&mut db, t, true).unwrap().is_some());
+        assert!(observe(&mut db, t, true).unwrap().is_none());
         dismiss(&db);
         reading(&db, "2026-09-22 10:00:00", Some(0.5));
         observe(&mut db, t, true).unwrap();
@@ -1210,22 +1233,122 @@ mod tests {
         }
     }
     #[test]
-    fn new_hour_does_not_replace_active_uncertain_manual_or_preview_tasks() {
-        for status in ["countdown", "preparing", "ready", "submitting", "submitted", "uncertain", "flying", "paused", "flight_error", "canceled", "completed", "dismissed", "manual_failed", "preview_failed"] {
-            let mut db = db();
-            let mut event = failed_automatic(&mut db);
-            match status {
-                "manual_failed" => event.source = "manual".into(),
-                "preview_failed" => event.preview = true,
-                _ => event.status = status.into(),
+    fn new_hour_does_not_replace_active_or_uncertain_tasks_of_any_source() {
+        for source in ["auto", "manual", "preview"] {
+            for status in ["countdown", "preparing", "ready", "submitting", "submitted", "uncertain", "flying", "paused", "flight_error"] {
+                let mut db = db();
+                let mut event = failed_automatic(&mut db);
+                event.source = source.into(); event.preview = source == "preview";
+                event.status = status.into();
+                save(&db, &event).unwrap();
+                reading(&db, "2026-10-08 20:00:00", Some(1.36));
+                assert!(observe(&mut db, parse("2026-10-08 20:00:00").unwrap(), true).unwrap().is_none(), "{source}/{status}");
+                let actual = current(&db).unwrap().unwrap();
+                assert_eq!(actual.id, event.id, "{source}/{status}");
+                assert_eq!(actual.status, event.status, "{source}/{status}");
             }
-            save(&db, &event).unwrap();
-            reading(&db, "2026-10-08 20:00:00", Some(1.36));
-            assert!(observe(&mut db, parse("2026-10-08 20:00:00").unwrap(), true).unwrap().is_none(), "{status}");
-            let actual = current(&db).unwrap().unwrap();
-            assert_eq!(actual.id, event.id, "{status}");
-            assert_eq!(actual.status, event.status, "{status}");
         }
+    }
+    fn failed_at(db: &Connection, source: &str, time: &str) -> Event {
+        let mut event = new_event(time.into(), None, source == "preview");
+        event.source = source.into(); event.status = "failed".into();
+        event.error = Some("客户端中断，未发送起飞请求；请核查原计划。".into());
+        event.weather_checks.push(recorded_weather("creation", true, false));
+        save(db, &event).unwrap();
+        event
+    }
+    #[test]
+    fn next_valid_hour_releases_all_pre_submission_failures_and_preserves_receipts() {
+        for source in ["auto", "manual", "preview", ""] {
+            let mut db = db(); configure(&db, 1.0, 5, false);
+            let failed = failed_at(&db, source, if source == "auto" { "2026-10-13 23:00:00" } else { "2026-10-13 23:27:11" });
+            let original = serde_json::to_value(&failed).unwrap();
+            put(&db, "flight_handled:2026-10-13 23:00:00", "prior-auto-attempt").unwrap();
+            // Advancing wall time alone, or receiving late values in the same
+            // source hour, must not replay that hour.
+            for time in ["2026-10-13 23:00:00"] {
+                reading(&db, time, Some(2.));
+                assert!(observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), true).unwrap().is_none(), "{source}");
+                assert_eq!(current(&db).unwrap().unwrap().id, failed.id);
+            }
+            recover(&db).unwrap();
+            reading(&db, "2026-10-14 00:00:00", Some(2.));
+            // Release occupancy even while weather blocks the new flight.
+            assert!(observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), false).unwrap().is_none(), "{source}");
+            assert!(current(&db).unwrap().is_none(), "{source}");
+            let archived: serde_json::Value = serde_json::from_str(&setting(&db, &format!("flight_history:{}", failed.id)).unwrap().unwrap()).unwrap();
+            assert_eq!(archived, original);
+            assert_eq!(setting(&db, "flight_handled:2026-10-13 23:00:00").unwrap().as_deref(), Some("prior-auto-attempt"));
+            assert!(setting(&db, "flight_handled:2026-10-14 00:00:00").unwrap().is_none());
+            recover(&db).unwrap();
+            let next = observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), true).unwrap().unwrap();
+            assert_eq!(next.source, "auto"); assert_eq!(next.status, "countdown");
+            assert_ne!(next.id, failed.id);
+            assert!(observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), true).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn manual_failure_rollover_honors_missing_data_normal_values_and_no_fly_hours() {
+        for (time, value, restricted) in [("2026-10-14 00:00:00", Some(0.5), false),
+            ("2026-10-14 00:00:00", None, false), ("2026-10-14 05:00:00", Some(2.), true)] {
+            let mut db = db(); morning_restriction(&db);
+            let failed = failed_at(&db, "manual", "2026-10-13 23:27:11");
+            reading(&db, time, value);
+            assert!(observe(&mut db, parse(time).unwrap(), true).unwrap().is_none());
+            let event = current(&db).unwrap();
+            if value.is_none() { assert_eq!(event.unwrap().id, failed.id); }
+            else {
+                assert!(setting(&db, &format!("flight_history:{}", failed.id)).unwrap().is_some());
+                if restricted { assert_eq!(event.unwrap().status, "restricted"); }
+                else { assert!(event.is_none()); }
+            }
+        }
+    }
+    #[test]
+    fn failed_task_rollover_is_atomic_when_archival_fails() {
+        let mut db = db();
+        let failed = failed_at(&db, "manual", "2026-10-13 23:27:11");
+        reading(&db, "2026-10-14 00:00:00", Some(2.));
+        db.execute_batch("CREATE TRIGGER reject_archive BEFORE INSERT ON monitor_settings WHEN NEW.key LIKE 'flight_history:%' BEGIN SELECT RAISE(ABORT, 'fixture archive failure'); END;").unwrap();
+        assert!(observe(&mut db, parse("2026-10-14 00:00:00").unwrap(), true).is_err());
+        assert_eq!(current(&db).unwrap().unwrap().id, failed.id);
+        assert!(setting(&db, "flight_handled:2026-10-14 00:00:00").unwrap().is_none());
+    }
+    #[test]
+    fn consecutive_hours_survive_restart_weather_failure_and_completion() {
+        let path = std::env::temp_dir().join(format!("hourly-flights-{}.sqlite3", uuid::Uuid::new_v4()));
+        let mut db = crate::monitoring::connect(&path).unwrap();
+        put(&db, "flight_launch_enabled", "true").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.no_fly_periods.clear();
+        settings.require_manual_confirmation = false;
+        put(&db, "workspace_settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        for hour in 0..24 {
+            let time = format!("2026-10-11 {hour:02}:00:00");
+            let at = parse(&time).unwrap();
+            reading(&db, &time, Some(2.));
+            // Weather initially blocks every new hour without consuming it.
+            assert!(observe(&mut db, at, false).unwrap().is_none());
+            assert!(setting(&db, &format!("flight_handled:{time}")).unwrap().is_none());
+            let event = observe(&mut db, at, true).unwrap().unwrap();
+            assert_eq!(event.observed_at, time);
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+            let mut finished = event.clone();
+            match hour % 4 {
+                0 => { finished.status = "submitted".into(); save(&db, &finished).unwrap(); apply_observation(&db, &event.id, &event.name, "执行成功").unwrap(); }
+                1 => { finished.status = "uncertain".into(); save(&db, &finished).unwrap(); record_check_error(&db, &event.id, &event.name, "司空平台天气阻飞：风速过高；未继续执行").unwrap(); }
+                2 => { finished.status = "failed".into(); save(&db, &finished).unwrap(); }
+                _ => { cancel(&db, &event.id).unwrap(); }
+            }
+            drop(db);
+            db = crate::monitoring::connect(&path).unwrap();
+            recover(&db).unwrap();
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+        }
+        assert_eq!(db.query_row("SELECT count(*) FROM monitor_settings WHERE key LIKE 'flight_handled:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 24);
+        assert_eq!(db.query_row("SELECT count(*) FROM monitor_settings WHERE key LIKE 'flight_history:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 23);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn countdown_claim_cancel_and_persisted_episode() {
@@ -1283,11 +1406,13 @@ mod tests {
         assert_eq!(setting(&db, &format!("flight_handled:{time}")).unwrap().as_deref(), Some(automatic.id.as_str()));
         assert!(observe(&mut db, t, true).unwrap().is_none());
         reading(&db, "2026-09-22 10:00:00", Some(2.));
-        assert!(observe(&mut db, t, true).unwrap().is_none());
+        let next = observe(&mut db, t, true).unwrap().unwrap();
+        assert_eq!(next.source, "auto");
+        cancel(&db, &next.id).unwrap();
         reading(&db, "2026-09-22 10:00:00", Some(0.5));
         observe(&mut db, t, true).unwrap();
         reading(&db, "2026-09-22 10:00:00", Some(2.));
-        assert_eq!(observe(&mut db, t, true).unwrap().unwrap().source, "auto");
+        assert!(observe(&mut db, t, true).unwrap().is_none());
     }
     #[test]
     fn dynamic_threshold_delay_and_latest_confirmation_gate() {
@@ -1418,7 +1543,87 @@ mod tests {
         assert!(begin_manual_request(&db, false, Some(&event.id), false).is_err());
     }
     #[test]
-    fn confirmed_weather_block_restores_normal_manual_launch_without_automatic_retry() {
+    fn first_submission_weather_receipt_releases_next_hour_without_draft_recheck() {
+        let mut db = db();
+        let hour = "2026-10-13 14:00:00";
+        reading(&db, hour, Some(2.));
+        let mut event = observe(&mut db, parse(hour).unwrap(), true).unwrap().unwrap();
+        event.status = "submitting".into();
+        event.weather_checks.push(recorded_weather("creation", true, false));
+        save(&db, &event).unwrap();
+        // The draft may be closed immediately after this first, definitive receipt.
+        let receipt = "司空平台天气阻飞：在线天气风速过高；未继续执行";
+        apply_submission_result(&db, &event.id, &event.name, Err(receipt.into())).unwrap();
+        let blocked = current(&db).unwrap().unwrap();
+        assert_eq!(blocked.status, "not_flown");
+        assert_eq!(blocked.error.as_deref(), Some(receipt));
+        assert_eq!(blocked.weather_checks.len(), 1);
+        assert!(blocked.status_check_error.is_none());
+        assert!(setting(&db, &format!("flight_history:{}", event.id)).unwrap().is_some());
+        handle_unmatched_status(&db, &event.id, &event.name).unwrap();
+        recover(&db).unwrap();
+        assert_eq!(current(&db).unwrap().unwrap().status, "not_flown");
+        assert!(observe(&mut db, parse(hour).unwrap(), true).unwrap().is_none());
+        assert_eq!(setting(&db, &format!("flight_handled:{hour}")).unwrap().as_deref(), Some(event.id.as_str()));
+        let next_hour = "2026-10-13 15:00:00";
+        reading(&db, next_hour, Some(2.));
+        assert!(observe(&mut db, parse(next_hour).unwrap(), false).unwrap().is_none());
+        assert!(setting(&db, &format!("flight_handled:{next_hour}")).unwrap().is_none());
+        let next = observe(&mut db, parse(next_hour).unwrap(), true).unwrap().unwrap();
+        assert_ne!(next.id, event.id);
+        assert_eq!(next.observed_at, next_hour);
+    }
+    #[test]
+    fn submission_weather_receipt_takes_precedence_over_cancel_wording() {
+        let db = db();
+        for (error, expected) in [
+            ("司空平台天气阻飞：请取消任务后等待天气恢复；未继续执行", "not_flown"),
+            ("用户已取消本次作业", "canceled"),
+        ] {
+            let mut event = new_event("2026-10-13 14:00:00".into(), Some(2.), false);
+            event.status = "submitting".into(); save(&db, &event).unwrap();
+            apply_submission_result(&db, &event.id, &event.name, Err(error.into())).unwrap();
+            assert_eq!(current(&db).unwrap().unwrap().status, expected);
+        }
+        let mut event = new_event("2026-10-13 15:00:00".into(), Some(2.), false);
+        event.status = "submitting".into(); save(&db, &event).unwrap();
+        apply_submission_result(&db, &event.id, &event.name,
+            Ok(serde_json::json!({"status":"submitted", "submitted":true, "name":event.name}))).unwrap();
+        assert_eq!(current(&db).unwrap().unwrap().status, "submitted");
+    }
+    #[test]
+    fn submission_without_definitive_weather_receipt_keeps_next_hour_blocked() {
+        for result in [
+            Err("请求超时".into()),
+            Err("司空平台天气阻飞：风速过高".into()),
+            Err("司空平台要求人工确认：风速过高；未继续执行".into()),
+            Ok(serde_json::json!({"status":"submitted", "submitted":true, "name":"other-plan"})),
+        ] {
+            let mut db = db();
+            let mut event = new_event("2026-10-13 14:00:00".into(), Some(2.), false);
+            event.status = "submitting".into(); save(&db, &event).unwrap();
+            apply_submission_result(&db, &event.id, &event.name, result).unwrap();
+            assert_eq!(current(&db).unwrap().unwrap().status, "uncertain");
+            recover(&db).unwrap();
+            reading(&db, "2026-10-13 15:00:00", Some(2.));
+            assert!(observe(&mut db, parse("2026-10-13 15:00:00").unwrap(), true).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn late_submission_weather_receipt_cannot_replace_another_task_or_known_flight() {
+        let db = db();
+        for status in ["submitting", "submitted", "flying", "paused", "completed"] {
+            let mut event = new_event("2026-10-13 14:00:00".into(), Some(2.), false);
+            event.status = status.into(); save(&db, &event).unwrap();
+            let receipt = || Err("司空平台天气阻飞：风速过高；未继续执行".into());
+            apply_submission_result(&db, "other-id", &event.name, receipt()).unwrap();
+            apply_submission_result(&db, &event.id, "other-name", receipt()).unwrap();
+            if status != "submitting" { apply_submission_result(&db, &event.id, &event.name, receipt()).unwrap(); }
+            assert_eq!(serde_json::to_value(current(&db).unwrap().unwrap()).unwrap(), serde_json::to_value(event).unwrap());
+        }
+    }
+    #[test]
+    fn confirmed_weather_block_retries_only_on_a_new_hour() {
         let mut db = db();
         let mut event = new_event("2026-10-11 14:00:00".into(), None, false);
         event.status = "uncertain".into(); event.error = Some("原提交超时回执".into());
@@ -1434,11 +1639,14 @@ mod tests {
         assert!(checked.error.as_ref().unwrap().contains("原提交超时回执"));
         assert!(checked.error.as_ref().unwrap().contains("12.75m/s"));
         assert!(checked.status_check_error.is_none());
+        reading(&db, "2026-10-11 14:00:00", Some(2.));
+        assert!(observe(&mut db, parse("2026-10-11 14:00:00").unwrap(), true).unwrap().is_none());
+        recover(&db).unwrap();
         reading(&db, "2026-10-11 15:00:00", Some(2.));
-        assert!(observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true).unwrap().is_none());
-        let manual = begin_manual(&db, false).unwrap();
-        assert_ne!(manual.id, event.id);
-        assert_eq!(manual.source, "manual");
+        assert!(observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), false).unwrap().is_none());
+        let next = observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true).unwrap().unwrap();
+        assert_ne!(next.id, event.id);
+        assert_eq!(next.source, "auto");
         assert!(view(&db).unwrap().records.iter().any(|r| r.id == event.id && r.status == "not_flown"));
     }
     #[test]
@@ -1453,28 +1661,36 @@ mod tests {
         }
     }
     #[test]
-    fn explicit_refresh_releases_unresolved_reservation_and_preserves_history_without_auto_launch() {
+    fn explicit_refresh_preserves_unknown_submission_until_platform_confirms_outcome() {
         let mut db = db();
         let mut event = new_event("2026-10-11 14:00:00".into(), None, false);
-        event.status = "uncertain".into(); event.source = "manual".into();
-        event.error = Some("原起飞请求超时".into()); save(&db, &event).unwrap();
-        assert!(!handle_unmatched_status(&db, &event.id, &event.name, false).unwrap());
-        assert!(begin_manual(&db, false).is_err());
-        assert!(!handle_unmatched_status(&db, "stale-id", &event.name, true).unwrap());
-        assert!(handle_unmatched_status(&db, &event.id, &event.name, true).unwrap());
-        assert!(current(&db).unwrap().is_none());
-        let history = view(&db).unwrap().records.remove(0);
-        assert_eq!(history.status, "uncertain");
-        assert_eq!(history.error, event.error);
-        assert!(history.status_check_error.unwrap().contains("解除本地任务占用"));
+        event.status = "uncertain".into(); event.error = Some("原起飞请求超时".into());
+        save(&db, &event).unwrap();
+        for _ in 0..2 {
+            handle_unmatched_status(&db, &event.id, &event.name).unwrap();
+            assert_eq!(current(&db).unwrap().unwrap().id, event.id);
+            assert!(begin_manual(&db, false).is_err());
+        }
+        recover(&db).unwrap();
         reading(&db, "2026-10-11 15:00:00", Some(2.));
         assert!(observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true).unwrap().is_none());
-        record_check_error(&db, &event.id, &event.name, "迟到的回执").unwrap();
-        assert!(current(&db).unwrap().is_none());
-        let next = begin_manual(&db, false).unwrap();
-        assert_ne!(next.id, event.id);
-        assert!(!handle_unmatched_status(&db, &event.id, &event.name, true).unwrap());
-        assert_eq!(current(&db).unwrap().unwrap().id, next.id);
+        apply_observation(&db, &event.id, &event.name, "执行成功").unwrap();
+        assert!(observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true).unwrap().is_some());
+    }
+    #[test]
+    fn upgrade_restores_legacy_unknown_reservation_but_not_completed_history() {
+        for status in ["uncertain", "completed"] {
+            let mut db = db();
+            let mut event = new_event("2026-10-11 14:00:00".into(), Some(2.), false);
+            event.status = status.into();
+            archive(&db, &event).unwrap();
+            put(&db, "flight_episode", &event.observed_at).unwrap();
+            recover(&db).unwrap();
+            reading(&db, "2026-10-11 15:00:00", Some(2.));
+            let next = observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true).unwrap();
+            assert_eq!(next.is_none(), status == "uncertain");
+            if status == "uncertain" { assert_eq!(current(&db).unwrap().unwrap().id, event.id); }
+        }
     }
     #[test]
     fn explicit_refresh_does_not_release_known_pending_or_active_flights() {
@@ -1482,7 +1698,7 @@ mod tests {
         for status in ["submitted", "flying", "paused", "submitting"] {
             let mut event = new_event("2026-10-11 14:00:00".into(), None, false);
             event.status = status.into(); save(&db, &event).unwrap();
-            assert!(!handle_unmatched_status(&db, &event.id, &event.name, true).unwrap());
+            handle_unmatched_status(&db, &event.id, &event.name).unwrap();
             assert_eq!(current(&db).unwrap().unwrap().status, status);
             assert!(begin_manual(&db, false).is_err());
         }
@@ -1548,7 +1764,7 @@ mod tests {
             let mut event = new_event("2026-10-11 10:00:00".into(), Some(2.), false);
             event.status = status.into(); save(&db, &event).unwrap(); recover(&db).unwrap();
             assert!(trackable(&current(&db).unwrap().unwrap()));
-            assert!(!handle_unmatched_status(&db, &event.id, &event.name, true).unwrap());
+            handle_unmatched_status(&db, &event.id, &event.name).unwrap();
             assert_eq!(current(&db).unwrap().unwrap().status, status);
             apply_observation(&db, &event.id, &event.name, "待执行").unwrap();
             assert_eq!(current(&db).unwrap().unwrap().status, "submitted");

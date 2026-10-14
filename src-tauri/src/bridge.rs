@@ -42,6 +42,10 @@ struct Heartbeat {
     session: String,
     version: String,
     tabs: Vec<BrowserTab>,
+    #[serde(default)]
+    busy: bool,
+    #[serde(default, rename = "singleJob")]
+    single_job: bool,
 }
 struct Client {
     version: String,
@@ -52,6 +56,7 @@ struct Pending {
     session: String,
     tab_id: i64,
     sent: bool,
+    queued_at: Instant,
     job: Value,
     result: oneshot::Sender<Result<Value, String>>,
 }
@@ -193,21 +198,44 @@ async fn heartbeat(
             "minimumExtensionVersion": crate::readiness::MIN_VERSION }),
         ));
     }
-    let jobs: Vec<Value> = inner
-        .pending
-        .iter_mut()
-        .filter(|(_, p)| p.session == input.session && !p.sent)
-        .map(|(id, p)| {
-            p.sent = true;
-            {
-                let mut job = p.job.clone();
-                job["id"] = json!(id);
-                job["tabId"] = json!(p.tab_id);
-                job
-            }
-        })
+    // A worker executing a batch still renews its lease and tab inventory,
+    // without claiming more work that it cannot execute yet.
+    if input.busy {
+        return Ok(Json(json!({ "ok": true, "jobs": [], "keepAliveSupported": true })));
+    }
+    let jobs = claim_jobs(&mut inner, &input.session, input.single_job);
+    Ok(Json(json!({ "ok": true, "jobs": jobs, "keepAliveSupported": true, "singleJobSupported": true })))
+}
+
+fn job_priority(job: &Value) -> u8 {
+    match job["type"].as_str().unwrap_or("") {
+        "dji-weather" | "dji-submit" | "dji-status" => 0,
+        "dji-prepare" | "dji-open-prepared" | "jiangsu-hourly" | "airins-realtime" => 1,
+        "airins-health-open" => 2,
+        "site-health" | "jiangsu-health" | "dji-health-open" => 3,
+        "dji-tasks" => 5,
+        _ => 4,
+    }
+}
+fn claim_jobs(inner: &mut Inner, session: &str, single: bool) -> Vec<Value> {
+    // A worker reload must not claim another job while the preceding operation
+    // has an outstanding receipt. Busy heartbeats likewise never claim work.
+    if single && inner.pending.values().any(|p| p.session == session && p.sent) {
+        return vec![];
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut candidates: Vec<_> = inner.pending.iter_mut()
+        .filter(|(_, p)| p.session == session && !p.sent
+            && p.job["expiresAt"].as_i64().is_none_or(|at| at > now))
         .collect();
-    Ok(Json(json!({ "ok": true, "jobs": jobs })))
+    candidates.sort_by_key(|(_, p)| (job_priority(&p.job), p.queued_at));
+    candidates.into_iter().take(if single { 1 } else { usize::MAX }).map(|(id, p)| {
+        p.sent = true;
+        let mut job = p.job.clone();
+        job["id"] = json!(id);
+        job["tabId"] = json!(p.tab_id);
+        job
+    }).collect()
 }
 
 // Read-only probe: never register a browser session or deliver queued jobs.
@@ -416,7 +444,7 @@ impl Bridge {
         .await
     }
     pub async fn request(&self, session: String, tab_id: i64, job: Value) -> Result<Value, String> {
-        let timeout = if ["site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
+        let timeout = if ["dji-tasks", "dji-weather", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
             .iter()
             .any(|kind| job["type"] == *kind)
         {
@@ -445,9 +473,11 @@ impl Bridge {
                 && job["type"] != "dji-submit"
                 && job["type"] != "dji-open-prepared"
                 && job["type"] != "dji-status"
+                && job["type"] != "dji-tasks"
                 && job["type"] != "airins-realtime"
                 && job["type"] != "airins-health-open"
                 && job["type"] != "dji-health-open"
+                && job["type"] != "dji-weather"
                 && job["type"] != "jiangsu-health"
             {
                 let tab = client
@@ -458,7 +488,13 @@ impl Bridge {
                 if tab.status != "complete" {
                     return Err("页面尚未加载完成，请稍后重试。".into());
                 }
-            } else if (job["type"] == "airins-health-open" || job["type"] == "dji-health-open")
+            } else if job["type"] == "dji-tasks"
+                && (tab_id != -1
+                    || job.as_object().is_none_or(|value| value.keys().any(|key| !matches!(key.as_str(), "type" | "cursor" | "includeHistory")))
+                    || job.get("includeHistory").is_some_and(|value| !value.is_boolean()))
+            {
+                return Err("司空任务同步参数无效。".into());
+            } else if (job["type"] == "airins-health-open" || job["type"] == "dji-health-open" || job["type"] == "dji-weather")
                 && (tab_id != -1 || job.as_object().is_none_or(|value| value.len() != 1))
             {
                 return Err("后台网站验证任务参数无效。".into());
@@ -466,20 +502,25 @@ impl Bridge {
                 && (tab_id < -1 || job.as_object().is_none_or(|value| value.len() != 1))
             {
                 return Err("江苏大气站验证任务参数无效。".into());
-            } else if job["type"] != "airins-realtime"
+            } else if job["type"] != "dji-tasks"
+                && job["type"] != "airins-realtime"
                 && job["type"] != "airins-health-open"
                 && job["type"] != "dji-health-open"
+                && job["type"] != "dji-weather"
                 && job["type"] != "jiangsu-health"
                 && (tab_id != -1 || job["submit"] != (job["type"] == "dji-submit"))
             {
                 return Err("司空任务类型与提交标记不匹配。".into());
             }
+            let mut job = job;
+            job["expiresAt"] = json!(chrono::Utc::now().timestamp_millis() + timeout as i64 * 1000);
             inner.pending.insert(
                 id.clone(),
                 Pending {
                     session,
                     tab_id,
                     sent: false,
+                    queued_at: Instant::now(),
                     job,
                     result: tx,
                 },
@@ -502,6 +543,34 @@ pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_job_dispatch_prioritizes_new_weather_between_background_jobs() {
+        let mut inner = Inner::default();
+        let mut insert = |id: &str, kind: &str, session: &str, expires: i64| {
+            let (tx, _) = oneshot::channel();
+            inner.pending.insert(id.into(), Pending { session: session.into(), tab_id: -1,
+                sent: false, queued_at: Instant::now(), job: json!({"type":kind,"expiresAt":expires}), result: tx });
+        };
+        let future = chrono::Utc::now().timestamp_millis() + 100000;
+        insert("history", "dji-tasks", "a", future);
+        insert("media", "flight-dji-image", "a", future);
+        insert("other-weather", "dji-weather", "b", future);
+        insert("expired-weather", "dji-weather", "a", 1);
+        let first = claim_jobs(&mut inner, "a", true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["id"], "media");
+        assert!(claim_jobs(&mut inner, "a", true).is_empty());
+        inner.pending.remove("media");
+        let (tx, _) = oneshot::channel();
+        inner.pending.insert("new-weather".into(), Pending { session: "a".into(), tab_id: -1,
+            sent: false, queued_at: Instant::now(), job: json!({"type":"dji-weather","expiresAt":future}), result: tx });
+        assert_eq!(claim_jobs(&mut inner, "a", true)[0]["id"], "new-weather");
+        inner.pending.remove("new-weather");
+        assert_eq!(claim_jobs(&mut inner, "a", true)[0]["id"], "history");
+        assert!(!inner.pending["other-weather"].sent);
+        assert!(!inner.pending["expired-weather"].sent);
+    }
+
     #[test]
     fn diagnostic_receipt_requires_authorization_and_never_creates_a_session() {
         tauri::async_runtime::block_on(async {
@@ -606,7 +675,7 @@ mod tests {
         assert!(inner.clients.is_empty());
     }
     #[test]
-    fn background_site_health_jobs_require_fixed_parameters_and_allow_missing_tabs() {
+    fn background_read_only_jobs_require_fixed_parameters_and_allow_missing_tabs() {
         tauri::async_runtime::block_on(async {
             let bridge = Bridge::default();
             let session = Uuid::new_v4().to_string();
@@ -618,7 +687,7 @@ mod tests {
                     last_seen: Instant::now(),
                 },
             );
-            for kind in ["airins-health-open", "dji-health-open", "jiangsu-health"] {
+            for kind in ["airins-health-open", "dji-health-open", "jiangsu-health", "dji-weather", "dji-tasks"] {
                 let invalid_tab = if kind == "jiangsu-health" { -2 } else { 1 };
                 for (tab_id, job) in [
                     (invalid_tab, json!({"type":kind})),
@@ -645,6 +714,44 @@ mod tests {
         });
     }
     #[test]
+    fn dji_task_sync_accepts_history_options_and_rejects_invalid_parameters() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let session = Uuid::new_v4().to_string();
+            bridge.0.lock().unwrap().clients.insert(session.clone(), Client {
+                version: crate::readiness::MIN_VERSION.into(),
+                tabs: vec![],
+                last_seen: Instant::now(),
+            });
+            for job in [
+                json!({"type":"dji-tasks", "cursor":null, "includeHistory":true}),
+                json!({"type":"dji-tasks", "cursor":null, "includeHistory":false}),
+                json!({"type":"dji-tasks", "cursor":{"after":"committed-page"}, "includeHistory":true}),
+            ] {
+                let request = bridge.request(session.clone(), -1, job.clone());
+                // Poll once to register the request, without waiting for a browser.
+                let mut request = Box::pin(request);
+                assert!(tokio::time::timeout(Duration::from_millis(10), &mut request).await.is_err(),
+                    "valid sync parameters must be queued instead of rejected: {job}");
+                let pending = bridge.0.lock().unwrap().pending.drain().next().unwrap().1;
+                assert_eq!(pending.tab_id, -1);
+                assert_eq!(pending.job["cursor"], job["cursor"]);
+                assert_eq!(pending.job["includeHistory"], job["includeHistory"]);
+                pending.result.send(Ok(json!({"tasks":[]}))).unwrap();
+                assert_eq!(request.await.unwrap(), json!({"tasks":[]}));
+            }
+            for job in [
+                json!({"type":"dji-tasks", "includeHistory":"false"}),
+                json!({"type":"dji-tasks", "includeHistory":null}),
+                json!({"type":"dji-tasks", "includeHistory":true, "submit":true}),
+                json!({"type":"dji-tasks", "includeHistory":true, "url":"https://example.test"}),
+            ] {
+                assert_eq!(bridge.request(session.clone(), -1, job).await.unwrap_err(), "司空任务同步参数无效。");
+                assert!(!bridge.busy());
+            }
+        });
+    }
+    #[test]
     fn old_plugin_is_visible_but_cannot_receive_work_and_recovers_after_reload() {
         tauri::async_runtime::block_on(async {
             let bridge = Bridge::default();
@@ -654,6 +761,8 @@ mod tests {
             headers.insert("x-taizhou-bridge", "1".parse().unwrap());
             let session = Uuid::new_v4().to_string();
             let input = |version: &str| Heartbeat {
+                busy: false,
+                single_job: false,
                 session: session.clone(),
                 version: version.into(),
                 tabs: vec![BrowserTab {
@@ -721,6 +830,8 @@ mod tests {
             headers.insert("x-taizhou-bridge", "1".parse().unwrap());
             let session = Uuid::new_v4().to_string();
             let input = || Heartbeat {
+                busy: false,
+                single_job: false,
                 session: session.clone(),
                 version: crate::readiness::MIN_VERSION.into(),
                 tabs: ["http://61.155.4.60:18080/", "https://fh.dji.com/", "https://aai.airins.cn/sniff"]
@@ -742,6 +853,13 @@ mod tests {
                 if bridge.0.lock().unwrap().pending.len() == 3 { break; }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            let mut keepalive = input();
+            keepalive.busy = true;
+            bridge.0.lock().unwrap().clients.get_mut(&session).unwrap().last_seen = Instant::now() - TTL + Duration::from_secs(1);
+            let renewed = heartbeat(State(bridge.clone()), headers.clone(), Json(keepalive)).await.unwrap();
+            assert_eq!(renewed.0["jobs"], json!([]));
+            assert!(bridge.0.lock().unwrap().pending.values().all(|pending| !pending.sent));
+            assert!(bridge.0.lock().unwrap().clients[&session].last_seen.elapsed() < Duration::from_secs(1));
             let delivered = heartbeat(State(bridge.clone()), headers.clone(), Json(input())).await.unwrap();
             let jobs = delivered.0["jobs"].as_array().unwrap();
             assert_eq!(jobs.len(), 3, "all sites must be delivered without another heartbeat");
@@ -776,6 +894,8 @@ mod tests {
                 State(bridge.clone()),
                 headers.clone(),
                 Json(Heartbeat {
+                    busy: false,
+                single_job: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![BrowserTab {
@@ -828,6 +948,8 @@ mod tests {
                 State(bridge.clone()),
                 headers.clone(),
                 Json(Heartbeat {
+                    busy: false,
+                single_job: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],
@@ -840,6 +962,8 @@ mod tests {
                 State(bridge.clone()),
                 headers.clone(),
                 Json(Heartbeat {
+                    busy: false,
+                single_job: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],

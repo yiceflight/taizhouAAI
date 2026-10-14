@@ -109,16 +109,16 @@ describe('manual launch confirmation', () => {
     await act(async () => finish(false));
     expect(button('刷新状态').disabled).toBe(false);
   });
-  it.each(['windSpeed', 'windGusts'] as const)('prohibits a manual launch at 12 m/s (%s)', async field => {
+  it.each(['windSpeed', 'windGusts'] as const)('prohibits manual launch when DJI says unsafe regardless of wind (%s)', async field => {
     const d = data(2);
-    d.weather!.allowed = false; d.weather!.level = 'unsafe'; d.weather!.current![field] = 12;
+    d.weather!.allowed = false; d.weather!.level = 'unsafe'; d.weather!.current![field] = 0;
     const action = await render(d);
-    expect(button('风速超限 · 禁止起飞').disabled).toBe(true);
-    await click('风速超限 · 禁止起飞');
+    expect(button('司空气象未通过').disabled).toBe(true);
+    await click('司空气象未通过');
     expect(document.querySelector('dialog')).toBeNull();
     expect(action).not.toHaveBeenCalled();
   });
-  it.each(['windSpeed', 'windGusts'] as const)('blocks a confirmed override when wind reaches 12 m/s (%s)', async field => {
+  it.each(['windSpeed', 'windGusts'] as const)('blocks a confirmed override when DJI changes its verdict (%s)', async field => {
     const d = data(2);
     d.weather!.allowed = false; d.weather!.level = 'caution'; d.weather!.current![field] = 11.99;
     const action = await render(d); await click('手动强制起飞');
@@ -170,7 +170,7 @@ describe('manual launch confirmation', () => {
     expect(action).not.toHaveBeenCalled();
     const dialog = document.querySelector('dialog[open]')!;
     expect(dialog).not.toBeNull();
-    for (const text of ['当前钾离子未超标', '阴 · 25.7 °C', '1.97 m/s', '3 m/s', '0 mm', '0.2 μg/m³', '> 1 μg/m³', '数据时间：', '天气时刻：']) expect(dialog.textContent).toContain(text);
+    for (const text of ['当前钾离子未超标', '阴 · 25.7 °C', '1.97 m/s', '机场降雨', '预报湿度', '0.2 μg/m³', '> 1 μg/m³', '数据时间：', '天气时刻：']) expect(dialog.textContent).toContain(text);
     await click('取消');
     expect(action).not.toHaveBeenCalled();
     expect(document.querySelector('dialog')).toBeNull();
@@ -224,7 +224,7 @@ describe('manual launch confirmation', () => {
     await click('立即执行任务');
     await act(async () => vi.advanceTimersByTime(601000));
     expect(button('确认强制起飞').hasAttribute('disabled')).toBe(true);
-    expect(document.querySelector('dialog')?.textContent).toContain('天气条件未通过或数据已过期');
+    expect(document.querySelector('dialog')?.textContent).toContain('气象数据不可用');
     await click('确认强制起飞');
     expect(action).not.toHaveBeenCalled();
   });

@@ -5,7 +5,8 @@ export type BridgeStatus = { connected: boolean; clients: number; versions: stri
 export type ReportSummary = { id: string; createdAt: number; source: string; title: string; truncated: boolean };
 export const tabKey = (tab: BrowserTab) => `${tab.session}:${tab.id}`;
 export type SiteHealth = { id: string; state: 'blocked' | 'unchecked' | 'not_open' | 'ready' | 'login_required' | 'forbidden' | 'page_required' | 'error'; message: string; checkedAt: string | null; session: string | null; tabId: number | null; url: string | null };
-export type Readiness = { pluginReady: boolean; pluginMessage: string; pluginUpdateRequired: boolean; minimumExtensionVersion: string; checking: boolean; sites: SiteHealth[]; ready: boolean; started: boolean };
+export type Readiness = {
+  monitoringReady?: boolean; flightReady?: boolean; reportReady?: boolean; pluginReady: boolean; pluginMessage: string; pluginUpdateRequired: boolean; minimumExtensionVersion: string; checking: boolean; sites: SiteHealth[]; ready: boolean; started: boolean };
 export type HourRow = { time: string; potassium: number | null };
 export type NoFlyPeriod = { start: string; end: string };
 export type WorkspaceSettings = { potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[] };
@@ -86,7 +87,7 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
   if (event?.status === 'canceled') {
     if (event.preview || event.source === 'preview') return { title: '填写演练 · 已取消', detail: '取消演练不影响自动触发', tone: 'muted' };
     if (event.source === 'manual') return { title: '手动任务已取消', detail: '本次取消不影响自动触发 · 可立即执行任务', tone: 'muted' };
-    return { title: '无人机 · 任务已取消', detail: event.source === 'auto' ? '本轮超标不再自动触发 · 可立即执行任务' : '可立即执行任务', tone: 'muted' };
+    return { title: '无人机 · 任务已取消', detail: event.source === 'auto' ? '该小时不再自动触发 · 新小时重新判断' : '可立即执行任务', tone: 'muted' };
   }
   const { latest, valid, threshold, exceeded } = potassiumReading(data, now);
   if (noFlyPeriod(data.settings, now)) return { title: '禁飞时间 · 不执行起飞', detail: '超标仅记录', tone: 'muted' };

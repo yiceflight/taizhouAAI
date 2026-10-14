@@ -159,6 +159,8 @@ pub fn run() {
             monitoring::set_monitoring_enabled,
             reports::generate_report,
             flight_report::list_flight_missions,
+            flight_report::list_dji_report_tasks,
+            flight_report::sync_dji_report_tasks,
             flight_report::list_flight_reasons,
             flight_report::set_flight_reason,
             flight_weather::list_flight_weather,

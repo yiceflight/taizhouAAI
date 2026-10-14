@@ -52,6 +52,14 @@ describe('automatic workspace startup', () => {
     expect(start).toHaveBeenCalledTimes(1);
   });
 
+  it('starts hourly monitoring while other platforms are offline', async () => {
+    state = { ...state, monitoringReady: true, flightReady: false, reportReady: false, ready: false };
+    await mount();
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(current.readiness?.started).toBe(true);
+    expect(current.readiness?.ready).toBe(false);
+  });
+
   it('does not duplicate a slow initial sync across status polls', async () => {
     let finish!: () => void;
     start.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));

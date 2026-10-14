@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { tabKey, type BrowserTab } from '../lib/workspace';
-import { DJI_MEDIA_URL, DJI_PLAN_URL, airinsMissionUrl, beijingTime, flightCharts, localFlightDisplay, localFlightTimeDisplay, localFlightMission, flightMinuteTime, localFlightOriginLabel, missionOriginLabel, patrolTasks, type FlightWeather, type Mission, type CollectedFlight, type FlightSummary, type LocalFlightEvent } from '../lib/flightReport';
-import { weatherText, type WeatherCheck } from '../lib/weather';
+import { DJI_MEDIA_URL, DJI_PLAN_URL, airinsMissionUrl, beijingTime, flightCharts, localFlightDisplay, localFlightTimeDisplay, localFlightMission, flightMinuteTime, localFlightOriginLabel, missionOriginLabel, patrolTasks, type DjiTask, type FlightWeather, type Mission, type CollectedFlight, type FlightSummary, type LocalFlightEvent } from '../lib/flightReport';
+import { weatherText, currentWeatherText, rainfallText, type WeatherCheck } from '../lib/weather';
 
 const measured = (value: number | null, unit: string) => value == null ? '缺测' : `${value.toFixed(1)} ${unit}`;
 const flightInputTime = (value?: number) => value ? new Date(value + 8 * 3600000).toISOString().slice(0, 19) : '';
@@ -12,8 +12,8 @@ function RecordedWeather({ checks }: { checks: WeatherCheck[] }) {
   const { weather, checkedAt } = creation;
   const sample = weather.current;
   return <>
-    <strong>{sample ? `${weatherText(sample.weatherCode)} · ${measured(sample.temperature, '°C')}` : '当时天气获取不可用'}</strong>
-    {sample && <small>风 {measured(sample.windSpeed, 'm/s')} / 阵风 {measured(sample.windGusts, 'm/s')} · 降水 {measured(sample.precipitation, 'mm')}</small>}
+    <strong>{sample ? `${currentWeatherText(sample)} · ${sample.airworthy != null ? '机场实测 ' : ''}${measured(sample.temperature, '°C')}` : '当时天气获取不可用'}</strong>
+    {sample && <small>{sample.airworthy != null ? <>机场风 {measured(sample.windSpeed, 'm/s')} · 机场降雨 {rainfallText(sample)} · 司空预报 {sample.forecast?.condition ?? '缺测'}</> : <>风 {measured(sample.windSpeed, 'm/s')} / 阵风 {measured(sample.windGusts, 'm/s')} · 降水 {measured(sample.precipitation, 'mm')}</>}</small>}
     <small className={weather.allowed ? '' : 'task-warning'}>{weather.label} · {weather.reasons.join(' ')}</small>
     <small className="task-weather-time">任务创建时刻：{beijingTime(checkedAt)}</small>
     <small className="task-weather-time">天气数据时刻：{sample ? beijingTime(sample.observedAt * 1000) : '未获取'}</small>
@@ -29,6 +29,16 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
   const [flightName, setFlightName] = useState(''), [flightStart, setFlightStart] = useState(''), [flightEnd, setFlightEnd] = useState('');
   const [editingFlight, setEditingFlight] = useState(false);
   const [airKey, setAirKey] = useState('');
+  const [taskPage, setTaskPage] = useState(1);
+  const [pageInput, setPageInput] = useState('');
+  const [includeHistory, setIncludeHistory] = useState(false);
+  const [missionLoading, setMissionLoading] = useState(false);
+  const missionLoadLock = useRef(false);
+  useEffect(() => { setTaskPage(1); setPageInput(''); setIncludeHistory(false); }, [tasksClearedAt]);
+  const [djiTasks, setDjiTasks] = useState<DjiTask[]>([]);
+  const [autoStatus, setAutoStatus] = useState<Record<string, string>>({});
+  const historyPending = useRef(false);
+  const attempts = useRef(new Map<string, number>());
   const [missions, setMissions] = useState<Mission[]>([]);
   const [total, setTotal] = useState(0), [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -60,8 +70,9 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
   const missionSource = useRef(sourceKey);
   missionSource.current = sourceKey;
   useEffect(() => { setMissions([]); if (!preview && !withoutAirData) setSelected(null); setTotal(0); setLoaded(false); }, [sourceKey]);
-  useEffect(() => { if (isTauri()) void invoke<FlightSummary[]>('list_flight_reports').then(setReports).catch(e => setError(String(e))); }, []);
+  useEffect(() => { if (isTauri()) void invoke<FlightSummary[]>('list_flight_reports').then(items => { setReports(items); }).catch(e => setError(String(e))); }, []);
   useEffect(() => { if (isTauri()) void invoke<Record<string, FlightWeather>>('list_flight_weather').then(items => setWeather(current => ({ ...items, ...current }))).catch(e => setWeatherError(`读取历史天气失败：${e}`)); }, []);
+  useEffect(() => { if (isTauri()) void invoke<DjiTask[]>('list_dji_report_tasks').then(items => setDjiTasks(items ?? [])).catch(e => setError(String(e))); }, []);
   const enrichWeather = (items: Mission[]) => {
     if (!items.length) return;
     weatherRequests.current += 1;
@@ -85,27 +96,97 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
     try { await job(); } catch (e) { setError(String(e)); setMessage(''); } finally { lock.current = false; setBusy(false); }
   };
   const load = (more = false) => {
-    if (!selectedAir || !ready) return;
+    if (!selectedAir || !ready || missionLoadLock.current) return;
     const key = tabKey(selectedAir);
-    void run(async () => {
-      const last = missions[missions.length - 1];
-      const result = await invoke<{ missions: Mission[]; total: number }>('list_flight_missions', { session: selectedAir.session, tabId: selectedAir.id, cursorId: more ? last?.missionId : null, cursorTime: more ? last?.startTime : null });
-      if (missionSource.current !== key) return;
-      setMissions(items => more ? [...items, ...result.missions.filter(m => !items.some(i => i.missionId === m.missionId))] : result.missions);
-      setTotal(more && !result.missions.length ? missions.length : result.total);
-      setLoaded(true);
-    });
+    missionLoadLock.current = true; setMissionLoading(true); setError('');
+    // Airins pagination is read-only and independent of the DJI media/report
+    // queue. A long automatic report must not disable browsing older tasks.
+    void (async () => {
+      try {
+        const last = missions[missions.length - 1];
+        const result = await invoke<{ missions: Mission[]; total: number }>('list_flight_missions', { session: selectedAir.session, tabId: selectedAir.id, cursorId: more ? last?.missionId : null, cursorTime: more ? last?.startTime : null });
+        if (missionSource.current !== key) return;
+        setMissions(items => more ? [...items, ...result.missions.filter(m => !items.some(i => i.missionId === m.missionId))] : [...result.missions, ...items.filter(m => !result.missions.some(i => i.missionId === m.missionId))]);
+        setTotal(more && !result.missions.length ? missions.length : result.total);
+        if (more) setIncludeHistory(true);
+        setLoaded(true);
+      } catch (e) { setError(String(e)); }
+      finally { missionLoadLock.current = false; setMissionLoading(false); }
+    })();
   };
   const autoLoaded = useRef('');
   const completedEvents = [...new Set([...(flightRecords ?? []), ...(flightEvent ? [flightEvent] : [])].filter(event => event.status === 'completed').map(event => event.id))].sort().join(',');
   useEffect(() => {
     if (!active || !ready || !sourceKey) autoLoaded.current = '';
     const refreshKey = `${sourceKey}:${completedEvents}`;
-    if (active && ready && sourceKey && !busy && autoLoaded.current !== refreshKey) {
+    if (active && ready && sourceKey && !missionLoading && autoLoaded.current !== refreshKey) {
       autoLoaded.current = refreshKey;
       load();
     }
-  }, [active, ready, sourceKey, busy, completedEvents]);
+  }, [active, ready, sourceKey, missionLoading, completedEvents]);
+  const syncAndGenerate = async () => {
+    const platform = tabs.find(t => t.url.startsWith(DJI_PLAN_URL.split('#')[0]) && t.status === 'complete');
+    if (!isTauri() || !mediaReady || !platform || lock.current || selected) return;
+    await run(async () => {
+      const result = await invoke<{ tasks: DjiTask[]; skipped: number; mediaTabId: number; historyPending?: boolean; historyError?: string | null }>('sync_dji_report_tasks', { session: platform.session });
+      setDjiTasks(result.tasks); setLoaded(true); historyPending.current = !!result.historyPending;
+      setMessage([
+        result.skipped ? `${result.skipped} 条司空记录缺少实际飞行时间，暂不能自动生成报告。` : '',
+        result.historyError ? `最新任务已同步，历史补读稍后重试：${result.historyError}` : result.historyPending ? '最新任务已同步，正在分批补读历史任务。' : '',
+      ].filter(Boolean).join(' '));
+      // Finish the bounded history sweep before photo collection, which may
+      // take minutes per report and otherwise delays every subsequent page.
+      if (result.historyPending && !result.historyError) return;
+      let sampling = missions;
+      if (ready && selectedAir) {
+        try {
+          const result = await invoke<{ missions: Mission[]; total: number }>('list_flight_missions', { session: selectedAir.session, tabId: selectedAir.id, cursorId: null, cursorTime: null });
+          sampling = [...result.missions, ...missions.filter(m => !result.missions.some(n => n.missionId === m.missionId))];
+          setMissions(items => [...result.missions, ...items.filter(m => !result.missions.some(n => n.missionId === m.missionId))]); setTotal(result.total);
+        } catch (e) { setError(`可飞任务同步失败：${e}`); }
+      }
+      const currentReports = await invoke<FlightSummary[]>('list_flight_reports');
+      setReports(currentReports);
+      const pending = patrolTasks(sampling, currentReports, flightEvent, flightRecords, tasksClearedAt ?? 0, result.tasks)
+        .filter(task => (!task.report || (task.report.withoutAirData && ready && selectedAir && task.mission?.missionId)) && task.mission && task.mission.endTime <= Date.now() - 60000
+          && task.djiTask?.mediaReady && !task.djiTask.actualTimeMissing)
+        .sort((a, b) => (attempts.current.get(a.key) ?? 0) - (attempts.current.get(b.key) ?? 0)).slice(0, 3);
+      for (const task of pending) {
+        attempts.current.set(task.key, Date.now());
+        setAutoStatus(state => ({ ...state, [task.key]: task.report ? '正在自动补齐可飞数据…' : '正在自动采集并生成报告…' }));
+        onReportGeneratingChange?.(true);
+        try {
+          const actual = task.djiTask?.mission ?? (task.localEvent ? localFlightMission(task.localEvent) : null);
+          const mission = actual ? { ...task.mission!, startTime: actual.startTime, endTime: actual.endTime } : task.mission!;
+          if (mission.missionId && (!ready || !selectedAir)) throw new Error('等待可飞连接恢复后收录已关联采样');
+          const skipAir = !mission.missionId;
+          const data = await invoke<CollectedFlight>('collect_flight_report', { request: {
+            djiSession: platform.session, djiTabId: result.mediaTabId,
+            localEventId: task.localEvent?.id ?? null, withoutAirData: skipAir, noMedia: !!task.djiTask?.noMedia,
+            ...(!skipAir ? { sniffSession: selectedAir!.session, sniffTabId: selectedAir!.id } : {}), mission,
+          } });
+          const report = await invoke<FlightSummary>('save_flight_report', { data, charts: flightCharts(data), regenerate: !!task.report });
+          setReports(items => [report, ...items.filter(item => item.id !== report.id)]);
+          setAutoStatus(state => ({ ...state, [task.key]: '' }));
+        } catch (e) {
+          setAutoStatus(state => ({ ...state, [task.key]: `自动生成暂未完成，下轮重试：${e}` }));
+        } finally { onReportGeneratingChange?.(false); }
+      }
+    });
+  };
+  const automatic = useRef(syncAndGenerate);
+  automatic.current = syncAndGenerate;
+  useEffect(() => {
+    // Keep running while other app pages are visible. Serialize with the manual
+    // dialog and retry failures without blocking the next scheduled flight.
+    let timer: ReturnType<typeof setTimeout>;
+    let stopped = false;
+    const tick = async () => {
+      try { await automatic.current(); } finally { if (!stopped) timer = setTimeout(tick, historyPending.current ? 5000 : 60000); }
+    };
+    timer = setTimeout(tick, 5000);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, []);
   const startReport = (mission?: Mission | null, event?: LocalFlightEvent | null, report?: FlightSummary) => {
     const actual = !report && event ? localFlightMission(event) : null;
     if (actual) mission = mission ? { ...mission, startTime: actual.startTime, endTime: actual.endTime } : actual;
@@ -132,7 +213,7 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
     const key = sourceKey;
     void run(async () => {
       setMessage(skipAir ? '正在按飞行时间匹配司空航次并下载照片…' : '正在按飞行时间匹配司空航次、读取采样数据和下载照片，请保持平台页面打开…');
-      const data = await invoke<CollectedFlight>('collect_flight_report', { request: { djiSession: selectedDji.session, djiTabId: selectedDji.id, ...(skipAir ? { withoutAirData: true, localEventId } : { sniffSession: selectedAir!.session, sniffTabId: selectedAir!.id }), mission } });
+      const data = await invoke<CollectedFlight>('collect_flight_report', { request: { djiSession: selectedDji.session, djiTabId: selectedDji.id, ...(djiTasks.some(task => task.noMedia && task.mediaReady && task.mission.missionName === mission.missionName && task.mission.startTime === mission.startTime && task.mission.endTime === mission.endTime) ? { noMedia: true } : {}), ...(skipAir ? { withoutAirData: true, localEventId } : { sniffSession: selectedAir!.session, sniffTabId: selectedAir!.id }), mission } });
       if (!skipAir && missionSource.current !== key) { setMessage('任务页面已变化，请重新选择任务。'); return; }
       setPreview(data); setMessage('资料读取完成，请核对后生成 Word 快报。');
     });
@@ -160,7 +241,20 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
     }
   };
   const link = (url: string, label: string) => <a className="task-link" href={url} target="_blank" rel="noreferrer" onClick={event => { if (!openLink) return; event.preventDefault(); openLink(url); }}>{label} ↗</a>;
-  const tasks = patrolTasks(missions, reports, flightEvent, flightRecords, tasksClearedAt ?? 0);
+  const currentTasks = patrolTasks(missions, reports, flightEvent, flightRecords, tasksClearedAt ?? 0, djiTasks);
+  const allTasks = patrolTasks(missions, reports, flightEvent, flightRecords, 0, djiTasks);
+  const tasks = includeHistory ? allTasks : currentTasks;
+  const pageCount = Math.max(1, Math.ceil(tasks.length / 50));
+  const currentPage = Math.min(taskPage, pageCount);
+  const visibleTasks = tasks.slice((currentPage - 1) * 50, currentPage * 50);
+  const hasRemoteMore = total > missions.length;
+  useEffect(() => { setTaskPage(page => Math.min(page, pageCount)); }, [pageCount]);
+  const pageNumbers = [...new Set([1, currentPage - 1, currentPage, currentPage + 1, pageCount])]
+    .filter(page => page >= 1 && page <= pageCount).sort((a, b) => a - b);
+  const jumpPage = () => {
+    const page = Number(pageInput);
+    if (Number.isInteger(page) && page >= 1 && page <= pageCount) { setTaskPage(page); setPageInput(''); }
+  };
   const displayStart = preview?.mission.startTime ?? (selected?.missionId ? selected.startTime : Date.parse(`${flightStart}+08:00`));
   const displayEnd = preview?.mission.endTime ?? (selected?.missionId ? selected.endTime : Date.parse(`${flightEnd}+08:00`));
   const selectedEvent = [flightEvent, ...(flightRecords ?? [])].find(event => event?.id === localEventId);
@@ -168,29 +262,38 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
   const formatFlightTime = usingDjiTime ? flightMinuteTime : beijingTime;
   const hasFlightTime = Number.isFinite(displayStart) && Number.isFinite(displayEnd) && displayStart > 0 && displayEnd > displayStart;
   return <div className="report-center">
-    <div className="page-heading"><div><span className="eyebrow">无人机巡飞</span><h2>巡查任务</h2><p>每个任务对应一份报告，飞行结束后核对资料并生成 Word 快报。</p></div><button className="secondary-button" disabled={busy || (ready && !selectedAir)} onClick={() => ready ? load() : onPrepare()}>{busy ? '正在读取…' : ready ? '刷新任务' : '完成工作准备'}</button></div>
+    <div className="page-heading"><div><span className="eyebrow">无人机巡飞</span><h2>巡查任务</h2><p>同步本应用及司空平台任务，飞行结束、媒体上传完成后自动生成 Word 快报。</p></div><button className="secondary-button" disabled={busy} onClick={() => mediaReady ? void syncAndGenerate() : ready ? load() : onPrepare()}>{busy ? '正在读取…' : mediaReady || ready ? '刷新任务' : '完成工作准备'}</button></div>
     {!ready ? <p className="notice">可查看本机已保存的任务与报告；完成工作准备后可读取更多任务；无可飞数据时可单独连接司空生成报告。</p> : !air.length ? <div className="notice"><p>打开可飞历史任务页面后读取巡查任务。</p><button className="secondary-button" onClick={openAir}>打开可飞历史任务 ↗</button></div> : air.length > 1 && <label className="task-source">任务来源<select disabled={busy} value={selectedAir ? tabKey(selectedAir) : ''} onChange={e => setAirKey(e.target.value)}><option value="">请选择可飞页面</option>{air.map(t => <option key={tabKey(t)} value={tabKey(t)}>{t.title} · 页面 {t.id}</option>)}</select></label>}
-    {!selected && <>{message && <p role="status" className="notice success">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}</>}
+    {!selected && <>{message && <p role="status" className="notice">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}</>}
     <section className="history-card"><div className="section-heading"><h3>任务列表</h3><span className="muted">{tasks.length} 个任务 · {tasks.filter(t => t.report).length} 份报告</span></div>
       {weatherError && <p className="task-weather-error" role="status">{weatherError}</p>}
-      {!tasks.length ? <div className="empty-state"><h3>{busy ? '正在读取巡查任务' : loaded ? '暂无巡查任务' : '暂无已保存的任务'}</h3><p>{loaded ? '飞行任务同步到可飞后，刷新列表即可查看。' : '连接可飞平台后读取任务，已保存的报告会显示在对应任务中。'}</p></div> : <div className="report-table-wrap"><table className="report-table task-table"><thead><tr><th>巡查任务 / 来源</th><th>飞行时间（北京时间）</th><th>天气状态</th><th>任务 / 报告状态</th><th>操作</th></tr></thead><tbody>{tasks.map(({ key, mission, report, localEvent }) => {
+      {!tasks.length ? <div className="empty-state"><h3>{busy ? '正在读取巡查任务' : loaded ? '暂无巡查任务' : '暂无已保存的任务'}</h3><p>{loaded ? '飞行结束后将自动同步司空任务并生成报告。' : '连接司空平台后自动同步任务，已保存的报告会显示在对应任务中。'}</p></div> : <div className="report-table-wrap"><table className="report-table task-table"><thead><tr><th>巡查任务 / 来源</th><th>飞行时间（北京时间）</th><th>天气状态</th><th>任务 / 报告状态</th><th>操作</th></tr></thead><tbody>{visibleTasks.map(({ key, mission, report, localEvent, djiTask }) => {
         const localTime = localEvent ? Date.parse(`${localEvent.observedAt.replace(' ', 'T')}+08:00`) : NaN;
         const localState = localEvent ? localFlightDisplay(localEvent) : null;
         const localFlightTime = localEvent ? localFlightTimeDisplay(localEvent) : null;
-        const origin = localEvent ? localFlightOriginLabel(localEvent) : mission?.missionId ? missionOriginLabel(mission) : report?.withoutAirData ? '司空平台任务' : '历史报告';
+        const origin = localEvent ? localFlightOriginLabel(localEvent) : djiTask ? '司空平台任务' : mission?.missionId ? missionOriginLabel(mission) : report?.withoutAirData ? '司空平台任务' : '历史报告';
         const appTask = !!localEvent || origin.startsWith('本应用');
         const ended = !!mission?.endTime && mission.endTime <= Date.now() - 60000;
         const sample = mission?.missionId && weather[mission.missionId]?.startTime === mission.startTime ? weather[mission.missionId] : null;
         const djiTaskUrl = report?.mediaUrl;
         return <tr className={`report-row${appTask ? ' task-row-app' : ''}`} key={key}>
-          <td><strong>{mission?.missionName ?? localEvent?.name ?? report!.title}</strong><small>{mission?.missionId ? `任务编号 ${mission.missionId}${mission.geoLocation ? ` · ${mission.geoLocation}` : ''}` : localEvent ? `本地任务编号 ${localEvent.id.slice(0, 8)}` : report?.withoutAirData ? '无可飞任务记录' : '历史报告'}</small><span className="task-origin">{origin}</span><span className="task-links">{!!mission?.missionId && link(airinsMissionUrl(mission), '可飞任务')}{mission?.missionId || report?.mediaUrl ? link(platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com'), djiTaskUrl ? '司空任务' : '司空平台') : localEvent && <>{localState?.submitted && link(DJI_PLAN_URL, '司空计划')}<span className="muted">{localEvent.resolvedAt ? '已结束本地处理' : localState?.submitted ? '未关联可飞采样任务' : '未提交起飞请求'}</span></>}</span></td>
-          <td>{localEvent && localFlightMission(localEvent) ? <>{localFlightTime?.label}<small>{localFlightTime?.detail}</small></> : mission ? <>{beijingTime(mission.startTime)}<small>至 {mission.endTime ? beijingTime(mission.endTime) : '尚未结束'}</small></> : localEvent ? <>{localFlightTime?.label}{localFlightTime?.detail && <small>{localFlightTime.detail}</small>}{Number.isFinite(localTime) && <small>{origin === '本应用 · 自动巡查' ? '触发数据时间' : '任务发起时间'} {beijingTime(localTime)}</small>}</> : '—'}</td>
-          <td className="task-weather">{localEvent?.weatherChecks?.length ? <RecordedWeather checks={localEvent.weatherChecks} /> : sample ? <><strong>{weatherText(sample.weatherCode)} · {sample.temperature.toFixed(1)} °C</strong><small>风 {sample.windSpeed.toFixed(1)} / 阵风 {sample.windGusts.toFixed(1)} m/s · 降水 {sample.precipitation} mm</small><small title={`补录时间 ${beijingTime(sample.fetchedAt * 1000)}`}>数据时刻 {beijingTime(sample.observedAt * 1000)}</small></> : <span className="muted">{localEvent ? '当时天气未记录' : mission && !ended ? '任务结束后补全' : weatherLoading ? '正在补全…' : '天气待补全'}</span>}</td>
-          <td><span className={`badge ${report ? 'success' : 'warning'}`}>{report ? '已生成报告' : localEvent ? localState?.label : ended ? '待生成报告' : '等待任务结束'}</span>{report && <small>{report.photoCount} 张照片 · {report.withoutAirData ? '可飞数据留空' : `${report.pointCount} 个采样点`}</small>}{report?.warning && <small className="task-warning">{report.warning}</small>}{localEvent?.error && (localEvent.status === 'restricted' ? <small className="task-warning">{localEvent.error}</small> : <details className="task-receipt"><summary>查看原始回执</summary><p>{localEvent.error}</p></details>)}{localEvent?.status === 'failed' && !localEvent.resolvedAt && <small>请在监测总览的巡查任务模块人工核验后重新发起。</small>}{localEvent?.resolvedAt && <small>结束处理时间 {beijingTime(localEvent.resolvedAt)}</small>}{localEvent?.weatherOverrideConfirmedAt && <small>已人工确认 · 本次覆盖天气拦截</small>}{localEvent?.statusCheckError && <small className="task-warning">司空核查：{localEvent.statusCheckError}</small>}</td>
-          <td>{report ? <div className="button-row"><button className="secondary-button" onClick={() => open(report)}>打开 Word</button><button className="secondary-button" title="打开此报告所在文件夹并选中 Word 文件" onClick={() => open(report, true)}>打开文件夹</button><button className="secondary-button" disabled={busy || !mission || !ended} title={!mission ? '历史报告缺少任务资料，请先连接平台刷新任务' : undefined} onClick={() => startReport(mission, localEvent, report)}>重新生成报告</button></div> : mission || localEvent?.status === 'completed' ? <button className="primary-button" disabled={busy || (!!mission && !ended)} onClick={() => startReport(mission, localEvent)}>生成报告</button> : <span className="muted">{localState?.action ?? '—'}</span>}</td>
+          <td><strong>{mission?.missionName ?? localEvent?.name ?? report!.title}</strong><small>{mission?.missionId ? `任务编号 ${mission.missionId}${mission.geoLocation ? ` · ${mission.geoLocation}` : ''}` : djiTask ? '司空已结束任务' : localEvent ? `本地任务编号 ${localEvent.id.slice(0, 8)}` : report?.withoutAirData ? '无可飞任务记录' : '历史报告'}</small><span className="task-origin">{origin}</span><span className="task-links">{!!mission?.missionId && link(airinsMissionUrl(mission), '可飞任务')}{djiTask ? link(DJI_PLAN_URL, '司空计划') : mission?.missionId || report?.mediaUrl ? link(platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com'), djiTaskUrl ? '司空任务' : '司空平台') : localEvent && <>{localState?.submitted && link(DJI_PLAN_URL, '司空计划')}<span className="muted">{localEvent.resolvedAt ? '已结束本地处理' : localState?.submitted ? '未关联可飞采样任务' : '未提交起飞请求'}</span></>}</span></td>
+          <td>{djiTask?.actualTimeMissing ? <>{djiTask.mission.startTime ? flightMinuteTime(djiTask.mission.startTime) : '实际起飞时间未记录'}<small>实际结束时间未记录</small>{!!djiTask.plannedStartTime && <small>计划时间 {flightMinuteTime(djiTask.plannedStartTime)}</small>}</> : djiTask ? <>{flightMinuteTime(djiTask.mission.startTime)} 至 {flightMinuteTime(djiTask.mission.endTime)}<small>司空实际时间（分钟精度）</small></> : localEvent && localFlightMission(localEvent) ? <>{localFlightTime?.label}<small>{localFlightTime?.detail}</small></> : mission ? <>{beijingTime(mission.startTime)}<small>至 {mission.endTime ? beijingTime(mission.endTime) : '尚未结束'}</small></> : localEvent ? <>{localFlightTime?.label}{localFlightTime?.detail && <small>{localFlightTime.detail}</small>}{Number.isFinite(localTime) && <small>{origin === '本应用 · 自动巡查' ? '触发数据时间' : '任务发起时间'} {beijingTime(localTime)}</small>}</> : '—'}</td>
+          <td className="task-weather">{localEvent?.weatherChecks?.length ? <RecordedWeather checks={localEvent.weatherChecks} /> : sample ? <><strong>{weatherText(sample.weatherCode)} · {sample.temperature.toFixed(1)} °C</strong><small>风 {sample.windSpeed.toFixed(1)} / 阵风 {sample.windGusts.toFixed(1)} m/s · 降水 {sample.precipitation} mm</small><small title={`补录时间 ${beijingTime(sample.fetchedAt * 1000)}`}>数据时刻 {beijingTime(sample.observedAt * 1000)}</small></> : <span className="muted">{localEvent ? '当时天气未记录' : weatherLoading ? '正在读取…' : '当时天气未记录'}</span>}</td>
+          <td><span className={`badge ${report ? 'success' : 'warning'}`}>{report ? '已生成报告' : djiTask ? djiTask.actualTimeMissing ? '实际飞行时间不完整' : djiTask.mediaReady ? '待自动生成报告' : '等待媒体上传结束' : localEvent ? localState?.label : ended ? '待生成报告' : '等待任务结束'}</span>{djiTask && djiTask.status !== '执行成功' && <small className="task-warning">司空执行结果：{djiTask.status}</small>}{autoStatus[key] && (!report || report.withoutAirData) && <small className="task-warning">{autoStatus[key]}</small>}{report && <small>{report.photoCount} 张照片 · {report.withoutAirData ? '可飞数据留空' : `${report.pointCount} 个采样点`}</small>}{report?.warning && <small className="task-warning">{report.warning}</small>}{localEvent?.error && (localEvent.status === 'restricted' ? <small className="task-warning">{localEvent.error}</small> : <details className="task-receipt"><summary>查看原始回执</summary><p>{localEvent.error}</p></details>)}{localEvent?.status === 'failed' && !localEvent.resolvedAt && <small>请在监测总览的巡查任务模块人工核验后重新发起。</small>}{localEvent?.resolvedAt && <small>结束处理时间 {beijingTime(localEvent.resolvedAt)}</small>}{localEvent?.weatherOverrideConfirmedAt && <small>已人工确认 · 本次覆盖天气拦截</small>}{localEvent?.statusCheckError && <small className="task-warning">司空核查：{localEvent.statusCheckError}</small>}</td>
+          <td>{report ? <div className="button-row"><button className="secondary-button word-report-button" onClick={() => open(report)} title={report.issueCount != null ? `问题 ${report.issueCount} 个 · 拍摄时间相差不超过 3 秒的照片归为同一问题` : '问题数量待核对'}>打开 Word{(report.issueCount ?? 0) > 0 && <span className="report-issue-badge" aria-label={`${report.issueCount} 个问题`}>{report.issueCount}</span>}</button><button className="secondary-button" title="打开此报告所在文件夹并选中 Word 文件" onClick={() => open(report, true)}>打开文件夹</button><button className="secondary-button" disabled={busy || !mission || !ended} title={!mission ? '历史报告缺少任务资料，请先连接平台刷新任务' : undefined} onClick={() => startReport(mission, localEvent, report)}>重新生成报告</button></div> : mission || localEvent?.status === 'completed' ? <button className="primary-button" disabled={busy || (!!mission && !ended)} onClick={() => startReport(mission, localEvent)}>生成报告</button> : <span className="muted">{localState?.action ?? '—'}</span>}</td>
         </tr>;
       })}</tbody></table></div>}
-      {total > missions.length && !missions.some(mission => mission.startTime <= (tasksClearedAt ?? 0)) && <button className="text-button load-earlier-button" disabled={busy || !ready} onClick={() => load(true)}>加载更早任务（{missions.length} / {total}）</button>}
+      <div className="task-pagination" aria-label="任务分页">
+        <span className="muted">共 {tasks.length} 条 · 50 条/页 · 第 {currentPage} / {pageCount} 页</span>
+        <button className="secondary-button" aria-label="上一页任务" disabled={currentPage === 1} onClick={() => setTaskPage(currentPage - 1)}>上一页</button>
+        {pageNumbers.map((page, index) => <span className="task-page-number" key={page}>{index > 0 && page - pageNumbers[index - 1] > 1 && <span className="muted">…</span>}<button className="secondary-button" aria-label={`第 ${page} 页任务`} aria-current={page === currentPage ? 'page' : undefined} onClick={() => setTaskPage(page)}>{page}</button></span>)}
+        <button className="secondary-button" aria-label="下一页任务" disabled={currentPage === pageCount} onClick={() => setTaskPage(currentPage + 1)}>下一页</button>
+        <form onSubmit={event => { event.preventDefault(); jumpPage(); }}><label>跳至 <input aria-label="任务页码" type="number" min="1" max={pageCount} step="1" value={pageInput} onChange={event => setPageInput(event.target.value)} /> 页</label><button className="text-button" type="submit" disabled={!pageInput || !Number.isInteger(Number(pageInput)) || Number(pageInput) < 1 || Number(pageInput) > pageCount}>跳转</button></form>
+      </div>
+      {allTasks.length > currentTasks.length && <button className="text-button" onClick={() => { setIncludeHistory(value => !value); setTaskPage(1); }}>{includeHistory ? '仅显示当前任务' : `显示历史任务（共 ${allTasks.length} 条）`}</button>}
+      {hasRemoteMore && <button className="text-button load-earlier-button" disabled={missionLoading || !ready || !selectedAir} onClick={() => load(true)}>{missionLoading ? '正在同步历史任务…' : '同步更多可飞历史任务'}</button>}
+
     </section>
     {selected && <dialog ref={builder} className="settings-dialog report-dialog" aria-labelledby="report-dialog-title" onCancel={event => { event.preventDefault(); closeBuilder(); }}>
       <div className="settings-header"><div><h3 id="report-dialog-title">{regenerating ? '重新生成巡飞报告' : '生成巡飞报告'}</h3><p>{preview?.mission.missionName ?? flightName}{selected.missionId ? ` · 任务编号 ${selected.missionId}` : ''}</p></div><button className="text-button" disabled={busy} onClick={closeBuilder} aria-label="关闭生成报告弹窗">关闭</button></div>
@@ -219,7 +322,7 @@ export function FlightReportPanel({ tabs, ready, mediaReady = ready, active = tr
             </div>
           </div>
         </section>
-        {message && <p role="status" className="notice success">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}
+        {message && <p role="status" className="notice">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}
         {!(withoutAirData ? mediaReady : ready) && !preview && <div className="notice warning">{withoutAirData ? '请登录司空媒体库并在运行状态中验证连接。' : '网站状态发生变化，请先恢复连接。'}<button className="text-button" disabled={busy} onClick={() => { closeBuilder(); onPrepare(); }}>前往处理 →</button></div>}
         {preview && <>{!preview.withoutAirData && preview.air.points.length > 0 && preview.air.points.every(p => p.pm25 == null || p.pm25 === 0) && <p className="notice warning">PM2.5 有效读数全部为 0，请核查传感器。此提示也会保留在报告记录中。</p>}<details className="flight-preview"><summary>查看照片与来源</summary><p>{preview.media.folder}</p>{preview.photos.map(p => <figure key={p.name}><img src={p.dataUrl} alt={p.name} /><figcaption>{p.name}</figcaption></figure>)}</details></>}
       </div>

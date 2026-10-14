@@ -1,7 +1,7 @@
 // Fixed, video-derived recipe. Submission uses a separate, explicitly authorized job.
 export const PLAN_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 export const PLAN_RECIPE = Object.freeze({
-  route: '东南火点巡查航线（已验证）',
+  route: '东南火点巡查航线-改',
   device: '泰州环境监测', dock: 'Dock 3', aircraft: 'Matrice 4TD',
   precision: '高精度 RTK', strategy: '立即', returnHeight: 110,
   lostLink: '返航', completion: '自动返航', media: '全部文件', subscriber: '运维',
@@ -30,6 +30,21 @@ export async function readFlightStatus(name, expectedUrl) {
   const states = ['待执行', '执行中', '任务执行', '已暂停', '已挂起', '部分执行', '执行成功', '执行失败', '执行终止'];
   const visible = e => e.getClientRects().length > 0;
   const label = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
+  const all = selector => [...document.querySelectorAll(selector)].filter(visible);
+  const deadline = Date.now() + 60000;
+  const signature = () => all('tbody tr,tr[role="row"]').map(label).join('|');
+  const wait = async (condition = () => true) => {
+    let stable = 0;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (location.href !== expectedUrl) throw new Error('司空计划列表已跳转');
+      if (condition() && !all('[class*="spin-spinning"],[aria-busy="true"]').length) {
+        if (++stable >= 4) return;
+      } else stable = 0;
+    }
+    throw new Error('司空状态查询未完成，请稍后重试；未推断任务结束');
+  };
+  const enabled = e => e && e.getAttribute('aria-disabled') !== 'true' && !/disabled/.test(e.className);
   const flightTime = row => {
     // FlightHub renders planned and actual times side by side. Never use
     // the planned group, the request time, or the time of this observation.
@@ -69,10 +84,46 @@ export async function readFlightStatus(name, expectedUrl) {
     const tabs = [...document.querySelectorAll('[role="tab"],button')].filter(visible).filter(e => label(e) === tabName);
     if (tabs.length !== 1) continue;
     tabs[0].click();
-    await new Promise(resolve => setTimeout(resolve, 900));
-    if (location.href !== expectedUrl) throw new Error('司空计划列表已跳转');
-    const status = read();
-    if (status) observations.push(status);
+    await wait();
+    const dateInput = all('input').find(e => e.placeholder === '开始日期');
+    if (dateInput?.value) {
+      const clear = dateInput.closest('[class*="picker-range"],[class*="calendar-picker"]')?.querySelector('[class*="picker-clear"],[aria-label="close-circle"]');
+      if (!clear) throw new Error('司空日期筛选无法清空，未能核查完整任务范围');
+      clear.click(); await wait(() => !dateInput.value);
+    }
+    const search = all('input').find(e => /按航线或计划名搜索/.test(e.placeholder));
+    if (search && search.value !== name) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (!setter) throw new Error('司空计划搜索不可用');
+      setter.call(search, name);
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      search.dispatchEvent(new Event('change', { bubbles: true }));
+      search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await wait();
+    }
+    // Return to the first page even when the dedicated tab retained old pagination.
+    let previous;
+    while (enabled(previous = all('[title="上一页"],[aria-label="Previous Page"]').find(e => /pagination/.test(e.className)))) {
+      const before = signature();
+      const first = all('[title="1"]').find(e => /pagination/.test(e.className));
+      (first || previous).click(); await wait(() => signature() !== before);
+    }
+    const seen = new Set();
+    let found = null;
+    while (true) {
+      const sig = signature();
+      if (seen.has(sig)) throw new Error('司空状态翻页未生效，未能核查完整任务范围');
+      seen.add(sig);
+      const status = read();
+      if (status) {
+        if (found) throw new Error('同名司空计划不唯一');
+        found = status;
+      }
+      const next = all('[title="下一页"],[aria-label="Next Page"]').find(e => /pagination/.test(e.className));
+      if (!enabled(next)) break;
+      next.click(); await wait(() => signature() !== sig);
+    }
+    if (found) observations.push(found);
   }
   // A just-finished task can briefly remain in both tabs. Accept identical
   // receipts only; conflicting states or times still require another read.

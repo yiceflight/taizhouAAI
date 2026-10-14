@@ -2,11 +2,13 @@ import type { WeatherCheck } from './weather';
 export type Mission = { missionId:number; missionName:string; startTime:number; endTime:number; geoLocation:string };
 export type Point = { time:number; pm25:number|null; longitude:number|null; latitude:number|null };
 export type CollectedFlight = { withoutAirData?:boolean; localEventId?:string|null; mission:Mission; air:{ url:string;missionId:number;unit:string;points:Point[] }; media:{url:string;folder:string;files:string[]};photos:{name:string;dataUrl:string;kind:string}[] };
-export type FlightSummary = { withoutAirData?:boolean; localEventId?:string|null; id:string;createdAt:number;title:string;path:string;photoCount:number;pointCount:number;warning:string;mission?:Mission|null;airUrl?:string;mediaUrl?:string };
+export type FlightSummary = { withoutAirData?:boolean; localEventId?:string|null; id:string;createdAt:number;title:string;path:string;photoCount:number;issueCount?:number|null;pointCount:number;warning:string;mission?:Mission|null;airUrl?:string;mediaUrl?:string };
 export type FlightTime = { startTime: number; endTime: number; durationMs: number; source: 'dji-plan'; precision: 'minute' };
 export type LocalFlightEvent = { id:string; observedAt:string; name:string; status:string; source?:string; error?:string|null; launchAt?:number|null; statusCheckError?:string|null; statusCheckedAt?:number|null; weatherOverrideConfirmedAt?:number|null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
 
-export type PatrolTask = { key: string; mission: Mission | null; report: FlightSummary | null; localEvent?: LocalFlightEvent };
+export type DjiTask = { mission: Mission; status: string; mediaReady: boolean; noMedia?: boolean; taskId?: string; mediaFolderId?: number | null; plannedStartTime?: number; actualTimeMissing?: boolean };
+export const flightKey = (mission: Mission) => `flight-${mission.startTime}-${mission.endTime}-${mission.missionName}`;
+export type PatrolTask = { key: string; mission: Mission | null; report: FlightSummary | null; localEvent?: LocalFlightEvent; djiTask?: DjiTask };
 export type FlightWeather = {
   missionId: number; startTime: number; observedAt: number; fetchedAt: number; source: string;
   status: 'ok' | 'caution' | 'unsafe' | 'unknown'; temperature: number; weatherCode: number;
@@ -77,19 +79,41 @@ export function localFlightTimeDisplay(event: LocalFlightEvent): { label: string
   }
   return { label: '尚无飞行记录', detail: '' };
 }
-export function patrolTasks(missions: Mission[], reports: FlightSummary[], localEvent?: LocalFlightEvent | null, records: LocalFlightEvent[] = [], clearedAt = 0): PatrolTask[] {
+export function patrolTasks(missions: Mission[], reports: FlightSummary[], localEvent?: LocalFlightEvent | null, records: LocalFlightEvent[] = [], clearedAt = 0, djiTasks: DjiTask[] = []): PatrolTask[] {
   const tasks = new Map<string, PatrolTask>();
+  const near = (a: Mission, b: Mission) => a.startTime > 0 && b.startTime > 0 && a.endTime > a.startTime && b.endTime > b.startTime && a.missionName === b.missionName
+    && Math.abs(a.startTime - b.startTime) <= 300000 && Math.abs(a.endTime - b.endTime) <= 300000;
+  // A DJI execution is an identity, not a fuzzy match to another DJI execution.
+  djiTasks = [...new Map(djiTasks.filter(t => (t.mission.startTime || t.plannedStartTime || 0) > clearedAt).map(t => [t.taskId ? `dji-${t.taskId}` : flightKey(t.mission), t])).values()];
   if (clearedAt > 0) {
     missions = missions.filter(mission => mission.startTime > clearedAt);
     reports = reports.filter(report => report.createdAt > clearedAt && (!report.mission || report.mission.startTime > clearedAt));
   }
   for (const report of [...reports].sort((a, b) => b.createdAt - a.createdAt)) {
-    const key = report.mission?.missionId ? `mission-${report.mission.missionId}` : report.localEventId ? `event-${report.localEventId}` : `report-${report.id}`;
+    const key = report.mission?.missionId ? `mission-${report.mission.missionId}` : report.localEventId ? `event-${report.localEventId}` : report.mission ? flightKey(report.mission) : `report-${report.id}`;
     if (!tasks.has(key)) tasks.set(key, { key, mission: report.mission ?? null, report });
   }
   for (const mission of missions) {
     const key = `mission-${mission.missionId}`;
-    tasks.set(key, { key, mission, report: tasks.get(key)?.report ?? null });
+    const aliases = [...tasks.values()].filter(task => task.mission && !task.mission.missionId && near(task.mission, mission)
+      && missions.filter(m => near(m, task.mission!)).length === 1
+      && djiTasks.filter(t => near(t.mission, mission)).length <= 1);
+    const linked = aliases.length === 1 ? aliases[0] : null;
+    if (linked) tasks.delete(linked.key);
+    tasks.set(key, { key, mission, report: tasks.get(key)?.report ?? linked?.report ?? null });
+  }
+  const associationTargets = [...tasks.values()];
+  for (const djiTask of djiTasks) {
+    const mission = djiTask.mission;
+    if ((mission.startTime || djiTask.plannedStartTime || 0) <= clearedAt) continue;
+    const matches = associationTargets.filter(task => task.mission && (task.mission.missionId
+      ? near(task.mission, mission) && djiTasks.filter(t => near(t.mission, task.mission!)).length === 1
+      : flightKey(task.mission) === flightKey(mission)));
+    if (matches.length === 1) matches[0].djiTask = djiTask;
+    else {
+      const key = djiTask.taskId ? `dji-${djiTask.taskId}` : flightKey(mission);
+      tasks.set(key, { key, mission, report: tasks.get(key)?.report ?? null, djiTask });
+    }
   }
   for (const event of [...records, ...(localEvent ? [localEvent] : [])]) {
     if (event.status === 'dismissed') continue;
@@ -99,14 +123,14 @@ export function patrolTasks(missions: Mission[], reports: FlightSummary[], local
       if (!linked.report && !linked.mission?.missionId) linked.mission = localFlightMission(event);
       continue;
     }
-    const matches = [...tasks.values()].filter(task => task.mission?.missionName === event.name);
+    const matches = [...tasks.values()].filter(task => task.mission?.missionName === event.name && (!event.flightTime || Math.abs(task.mission.startTime - event.flightTime.startTime) <= 300000));
     if (matches.length === 1) {
       matches[0].localEvent = event;
     } else {
       tasks.set(`event-${event.id}`, { key: `event-${event.id}`, mission: localFlightMission(event), report: null, localEvent: event });
     }
   }
-  const start = (task: PatrolTask) => task.mission?.startTime ?? task.report?.createdAt ?? (task.localEvent ? Date.parse(`${task.localEvent.observedAt.replace(' ', 'T')}+08:00`) : 0);
+  const start = (task: PatrolTask) => (task.mission?.startTime || task.djiTask?.plannedStartTime) ?? task.report?.createdAt ?? (task.localEvent ? Date.parse(`${task.localEvent.observedAt.replace(' ', 'T')}+08:00`) : 0);
   return [...tasks.values()].sort((a, b) => start(b) - start(a));
 }
 

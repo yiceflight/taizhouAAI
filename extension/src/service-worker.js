@@ -1,4 +1,6 @@
+import { collectDjiWeather, openDjiWeather } from './dji-weather.js';
 import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from './site-health.js';
+import { readDjiTasks } from './dji-tasks.js';
 import { airinsReport, djiReport } from './flight-report.js';
 import { SITE_PATTERNS, allowedUrl, evaluationValue, pageSnapshot } from "./bridge-core.js";
 import { queryJiangsuHourly, normalizeHourly, prepareJiangsuForHealth, findJiangsuApi } from "./jiangsu.js";
@@ -15,6 +17,8 @@ const sessionReady = (async () => {
 })();
 let polling = false;
 let rerunRequested = false;
+let keepingAlive = false;
+let keepAliveSupported = false;
 let capturing = false;
 const debuggerSession = createDebuggerSession(chrome.debugger, allowedUrl);
 
@@ -34,17 +38,17 @@ async function capture(tabId, job) {
     const tab = await chrome.tabs.get(tabId);
     if (!allowedUrl(tab.url)) throw new Error("仅支持三个已授权业务网站");
     if (tab.status !== "complete") throw new Error("页面尚未加载完成");
-    if (job?.type?.startsWith('flight-dji')) await chrome.tabs.update(tabId,{active:true});
     attached = await debuggerSession.acquire(tabId);
+    if (job?.type === 'dji-weather' || job?.type?.startsWith('flight-dji')) await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
     const flight = job?.type?.startsWith('flight-');
-    const expression = flight ? `(${(job.type.startsWith('flight-dji') ? djiReport : airinsReport).toString()})(${JSON.stringify(job)})` : null;
+    const expression = job?.type === "dji-weather" ? `(${collectDjiWeather.toString()})()` : flight ? `(${(job.type.startsWith('flight-dji') ? djiReport : airinsReport).toString()})(${JSON.stringify(job)})` : null;
     const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
       expression: (job?.type === "site-health" ? `Promise.race([(${checkSiteHealth.toString()})((${findJiangsuApi.toString()})), new Promise(resolve => setTimeout(() => resolve({url:location.href,state:"error",message:"验证超时，请检查网络后重试"}), 15000))])` : expression) || (job?.type === "jiangsu-hourly" ? `Promise.race([(${queryJiangsuHourly.toString()})(${JSON.stringify(job.startTime)}, ${JSON.stringify(job.endTime)}, (${findJiangsuApi.toString()})), new Promise((_, reject) => setTimeout(() => reject(new Error("江苏大气站查询超时")), 35000))])` : `(${pageSnapshot.toString()})()`), awaitPromise: true, returnByValue: true,
     });
     const data = evaluationValue(response);
     const current = await chrome.tabs.get(tabId);
     if (!allowedUrl(data.url) || current.url !== data.url || new URL(data.url).origin !== new URL(tab.url).origin) throw new Error("采集期间页面发生跳转，请重试");
-    if (job?.type === "site-health") return data;
+    if (["site-health", "dji-weather"].includes(job?.type)) return data;
     if (flight) {
       if (job.type === 'flight-dji-image' && !data.dataUrl) throw new Error('未取得照片原图，请关闭照片预览后重试；若持续失败，请更新司空适配器');
       if (new TextEncoder().encode(JSON.stringify(data)).length > 20000000) throw new Error('巡飞资料超过单次传输限制');
@@ -54,6 +58,7 @@ async function capture(tabId, job) {
     if (!data.text && data.tables.length === 0) throw new Error("页面没有可采集的正文或表格；请登录并打开具体业务页面");
     return data;
   } finally {
+    if (job?.type === 'dji-weather' || job?.type?.startsWith('flight-dji')) await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
     await debuggerSession.release(tabId, attached);
     capturing = false;
   }
@@ -227,9 +232,13 @@ async function watchFlight(job) {
       if (typeof issue === 'string' && issue) throw new Error(issue);
     } finally { await debuggerSession.release(draft.id, attached); }
   }
-  const key = `flight-monitor-${job.eventId}`;
+  const key = 'flight-monitor-tab';
   let tab = await chrome.storage.local.get(key).then(value => value[key]);
   tab = Number.isInteger(tab) ? await chrome.tabs.get(tab).catch(() => null) : null;
+  if (!tab || tab.url !== PLAN_URL) {
+    tab = (await chrome.tabs.query({ url: 'https://fh.dji.com/*' })).find(t => t.url === PLAN_URL);
+    if (tab) await chrome.storage.local.set({ [key]: tab.id });
+  }
   if (!tab || tab.url !== PLAN_URL) {
     tab = await chrome.tabs.create({ url: PLAN_URL, active: false });
     await chrome.storage.local.set({ [key]: tab.id });
@@ -252,22 +261,75 @@ async function watchFlight(job) {
     return result;
   } finally { await debuggerSession.release(tab.id, attached); }
 }
+async function syncDjiTasks(job) {
+  const project = PLAN_URL.split('#')[0];
+  const tabs = await chrome.tabs.query({ url: 'https://fh.dji.com/*' });
+  const mediaKey = 'flight-report-media-tab';
+  const oldKeys = ['flight-task-sync-tab', 'flight-task-history-tab'];
+  const saved = await chrome.storage.local.get([mediaKey, ...oldKeys]);
+  // An existing project page supplies the login context; neither its URL nor
+  // its rendered filters/pagination is changed by task synchronization.
+  const candidates = tabs.filter(tab => tab.status === 'complete' && tab.url?.split('#')[0] === project);
+  const tab = candidates.find(tab => !oldKeys.some(key => saved[key] === tab.id)) || candidates[0];
+  if (!tab) throw new Error('请先登录并打开泰州项目，任务同步会复用该页面');
+  const attached = await debuggerSession.acquire(tab.id);
+  let result;
+  try {
+    const response = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
+      expression: `(${readDjiTasks.toString()})(${JSON.stringify(tab.url)}, ${JSON.stringify({ cursor: job.cursor, includeHistory: job.includeHistory })})`,
+      awaitPromise: true, returnByValue: true,
+    });
+    result = evaluationValue(response);
+    if ((await chrome.tabs.get(tab.id)).url !== tab.url || result.url !== PLAN_URL) throw new Error('司空任务同步期间页面已切换');
+  } finally { await debuggerSession.release(tab.id, attached); }
+  const mediaPrefix = PLAN_URL.replace('#/plan', '#/media');
+  let media = tabs.find(t => t.id === saved[mediaKey] && t.url?.startsWith(mediaPrefix))
+    || tabs.find(t => t.url?.startsWith(mediaPrefix));
+  if (!media) media = await chrome.tabs.create({ url: mediaPrefix + '?page=1&size=50', active: false });
+  await chrome.storage.local.set({ [mediaKey]: media.id });
+  // Retire only obsolete, extension-owned background list tabs, never a user's
+  // active page, a changed page, or a flight draft/monitor page.
+  const obsolete = [...new Set(['flight-task-sync-tab', 'flight-task-history-tab'].map(key => saved[key]))]
+    .filter(id => Number.isInteger(id) && id !== tab.id && tabs.some(t => t.id === id && !t.active && t.url === PLAN_URL));
+  if (obsolete.length) await chrome.tabs.remove(obsolete).catch(() => {});
+  await chrome.storage.local.remove(oldKeys.filter(key => !tabs.some(t => t.id === saved[key]) || obsolete.includes(saved[key])));
+  return { ...result, mediaTabId: media.id };
+}
+async function bridgeTabs() {
+  return (await chrome.tabs.query({ url: SITE_PATTERNS })).filter(tab => allowedUrl(tab.url)).slice(0, 100)
+    .map(({ id, title, url, status }) => ({ id, title: (title || '').slice(0, 1000), url, status }));
+}
+async function keepAlive() {
+  if (keepingAlive || !keepAliveSupported) return;
+  keepingAlive = true;
+  try {
+    // No CDP operations and no job claims while the existing batch runs.
+    await post('heartbeat', { version: chrome.runtime.getManifest().version, tabs: await bridgeTabs(), busy: true });
+  } catch {
+    // A transient failure must not cancel or replay a potentially submitted job.
+  } finally { keepingAlive = false; }
+}
 async function heartbeat() {
-  if (polling) { rerunRequested = true; return; }
+  if (polling) { rerunRequested = true; await keepAlive(); return; }
   polling = true;
   let preparedSite = false;
   try {
-    const tabs = (await chrome.tabs.query({ url: SITE_PATTERNS })).filter((tab) => allowedUrl(tab.url)).slice(0, 100)
-      .map(({ id, title, url, status }) => ({ id, title: (title || "").slice(0, 1000), url, status }));
+    const tabs = await bridgeTabs();
     await debuggerSession.maintain(tabs);
-    const response = await post("heartbeat", { version: chrome.runtime.getManifest().version, tabs });
+    const response = await post("heartbeat", { version: chrome.runtime.getManifest().version, tabs, singleJob: true });
+    keepAliveSupported = response.keepAliveSupported === true;
+    // Return to native scheduling after every job so newly queued weather can
+    // pass background work. Older clients retain the legacy batch protocol.
+    if (response.singleJobSupported && response.jobs?.length) rerunRequested = true;
     for (const job of prioritizeHealthJobs(response.jobs || [], tabs)) {
-      if (!["dji-submit", "dji-open-prepared", "dji-status", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image", "airins-realtime"].includes(job.type) || !Number.isInteger(job.tabId)) continue;
+      if (Number.isFinite(job.expiresAt) && Date.now() >= job.expiresAt) continue;
+      if (!["dji-tasks", "dji-weather", "dji-submit", "dji-open-prepared", "dji-status", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image", "airins-realtime"].includes(job.type) || !Number.isInteger(job.tabId)) continue;
       let result;
-      try { result = { data: job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, capture) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, capture) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, capture) : await capture(job.tabId, job) }; }
+      try { result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, capture) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, capture) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, capture) : await capture(job.tabId, job) }; }
       catch (error) { result = { error: (error.message || String(error)).split("\n")[0].slice(0, 300) }; }
       if (['airins-health-open', 'dji-health-open', 'jiangsu-health'].includes(job.type) && result.data) preparedSite = true;
-      await post("complete", { id: job.id, ...result });
+      // A timed-out receipt returns 404; it must not discard other delivered jobs.
+      try { await post("complete", { id: job.id, ...result }); } catch { /* Never replay a job. */ }
     }
     await chrome.action.setBadgeText({ text: "" });
     await chrome.action.setTitle({ title: "桌面客户端已连接" });

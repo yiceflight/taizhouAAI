@@ -4,8 +4,8 @@ import { targetSites, type TargetSite } from '../config/sites';
 import { siteLabels, type Readiness } from '../lib/workspace';
 import { BridgeDiagnostics } from './BridgeDiagnostics';
 
-type Props = { state: Readiness | null; busy: boolean; onCheck: () => void; openSite: (site: TargetSite) => void; onHistory: () => void };
-export function SetupPanel({ state, busy, onCheck, openSite, onHistory }: Props) {
+type Props = { state: Readiness | null; busy: boolean; active?: boolean; onCheck: () => void; openSite: (site: TargetSite) => void; onHistory: () => void };
+export function SetupPanel({ state, busy, active = true, onCheck, openSite, onHistory }: Props) {
   const [directory, setDirectory] = useState<{path:string;platform:string} | null>(null);
   const [message, setMessage] = useState('');
   const [opening, setOpening] = useState(false);
@@ -17,7 +17,7 @@ export function SetupPanel({ state, busy, onCheck, openSite, onHistory }: Props)
   return <div className="setup-workspace">
     <div className="page-heading"><div><span className="eyebrow">运行状态</span><h2>{!state ? '正在检测运行状态' : state.ready ? '运行正常' : '运行状态待处理'}</h2><p>查看浏览器连接与网站验证状态，异常时请按下方提示处理。</p></div><button className="text-button" onClick={onHistory}>查看巡查任务与报告 →</button></div>
     <ol className="setup-steps" aria-label="运行状态检查">{['浏览器连接', '网站验证'].map((label, index) => <li key={label} className={index < step ? 'done' : index === step ? 'current' : ''} aria-current={index === step ? 'step' : undefined}><span>{index < step ? '✓' : index + 1}</span><div>{label}<small>{index < step ? index === 0 ? '已连接' : '全部通过' : index === step ? !state || state.checking ? '检测中' : '待处理' : '等待浏览器连接'}</small></div></li>)}</ol>
-    <BridgeDiagnostics />
+    <BridgeDiagnostics active={active} />
     {step === 0 ? <section className="setup-card">
       <div className="section-heading"><div><h3>{state?.pluginUpdateRequired ? '必须更新 Chrome 插件' : conflict ? '先解决客户端连接冲突' : '连接 Chrome 插件'}</h3><p>{state?.pluginMessage || '正在检查本机插件连接…'}</p></div><span className="badge warning">{state ? '未就绪' : '检测中'}</span></div>
       {conflict ? <div className="notice warning"><strong>请查看本机连接诊断</strong><p>端口异常和多个浏览器会话需要分别处理，请按诊断结果中的建议操作。</p><button className="secondary-button" disabled={busy} onClick={onCheck}>重新检测连接</button></div> : <>
@@ -25,7 +25,7 @@ export function SetupPanel({ state, busy, onCheck, openSite, onHistory }: Props)
       </>}
       {message && <p className="notice" role="status">{message}</p>}
     </section> : <>
-      <section className="setup-card"><div className="section-heading"><div><h3>三个网站均需验证通过 <span className="inline-count">{passed} / 3</span></h3><p>系统会在 Chrome 后台自动打开缺失的平台页面；请完成登录，登录状态会自动复查。</p></div><button className="secondary-button" disabled={busy || state?.checking} onClick={onCheck}>{state?.checking ? '正在验证…' : '重新验证全部'}</button></div>
+      <section className="setup-card"><div className="section-heading"><div><h3>各平台连接状态 <span className="inline-count">{passed} / 3</span></h3><p>系统会在 Chrome 后台自动打开缺失的平台页面；请完成登录，登录状态会自动复查。江苏大气站就绪即可监测；起飞需司空就绪，可飞异常不影响监测与起飞。</p></div><button className="secondary-button" disabled={busy || state?.checking} onClick={onCheck}>{state?.checking ? '正在验证…' : '重新验证全部'}</button></div>
         <div className="health-list">{targetSites.map((site, index) => { const health = state?.sites.find(s => s.id === site.id); return <article className="health-row" key={site.id}><span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 1}</span><div className="health-copy"><h4>{site.name}</h4><p>{health?.message || '等待检测'}</p><small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small></div><span className={`badge ${health?.state === 'ready' ? 'success' : 'warning'}`}>{health ? siteLabels[health.state] : '待验证'}</span><button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button></article>; })}</div>
       </section>
     </>}

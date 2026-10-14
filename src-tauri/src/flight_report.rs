@@ -53,6 +53,10 @@ pub struct Media {
     pub url: String,
     pub folder: String,
     pub files: Vec<String>,
+    #[serde(default)]
+    pub file_pages: HashMap<String, usize>,
+    #[serde(default)]
+    pub no_media: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +83,8 @@ pub struct Collected {
 #[serde(rename_all = "camelCase")]
 pub struct CollectRequest {
     #[serde(default)]
+    pub no_media: bool,
+    #[serde(default)]
     pub without_air_data: bool,
     #[serde(default)]
     pub local_event_id: Option<String>,
@@ -88,9 +94,11 @@ pub struct CollectRequest {
     pub sniff_tab_id: Option<i64>,
     pub mission: Mission,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
+    #[serde(default)]
+    pub supersedes_report_id: Option<String>,
     #[serde(default)]
     pub without_air_data: bool,
     #[serde(default)]
@@ -100,6 +108,8 @@ pub struct Summary {
     pub title: String,
     pub path: String,
     pub photo_count: usize,
+    #[serde(default)]
+    pub issue_count: Option<usize>,
     pub point_count: usize,
     pub warning: String,
     #[serde(default)]
@@ -166,6 +176,19 @@ fn source(url: &str, dji: bool) -> Result<(), String> {
     }
     Ok(())
 }
+fn same_media_folder(a: &str, b: &str) -> bool {
+    let normalized = |value: &str| -> Option<String> {
+        source(value, true).ok()?;
+        let url = tauri::Url::parse(value).ok()?;
+        let (_, query) = url.fragment()?.split_once('?')?;
+        let query_url = tauri::Url::parse(&format!("https://media.invalid/?{query}")).ok()?;
+        let mut params: Vec<_> = query_url.query_pairs()
+            .filter(|(key, _)| key != "page").map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        params.sort();
+        Some(format!("{}{}{:?}{params:?}", url.origin().ascii_serialization(), url.path(), url.query()))
+    };
+    normalized(a).is_some_and(|a| normalized(b).is_some_and(|b| a == b))
+}
 fn photo_time(name: &str) -> Result<i64, String> {
     if !name.starts_with("DJI_") || name.len() > 200 || name.contains(['/', '\\']) {
         return Err("照片名称无效".into());
@@ -173,6 +196,24 @@ fn photo_time(name: &str) -> Result<i64, String> {
     let stamp = name.get(4..18).ok_or("照片缺少拍摄时间")?;
     let t = NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M%S").map_err(|_| "照片拍摄时间无效")?;
     Ok(t.and_utc().timestamp_millis() - 8 * 3600000)
+}
+// A group's entire time span is <= 3 seconds, so a 0/3/6-second
+// chain cannot merge distinct observations. Preserve every original filename.
+fn issue_groups(files: &[String]) -> Result<Vec<Vec<String>>, String> {
+    let mut timed = files.iter().map(|name| Ok((photo_time(name)?, name.clone())))
+        .collect::<Result<Vec<_>, String>>()?;
+    timed.sort();
+    timed.dedup();
+    let mut groups: Vec<Vec<String>> = vec![];
+    let mut anchor = None;
+    for (time, name) in timed {
+        if anchor.is_none_or(|start| time - start > 3000) {
+            anchor = Some(time);
+            groups.push(vec![]);
+        }
+        groups.last_mut().unwrap().push(name);
+    }
+    Ok(groups)
 }
 fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     if data.without_air_data {
@@ -182,7 +223,11 @@ fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     } else {
         source(&data.air.url, false)?;
     }
-    source(&data.media.url, true)?;
+    if data.media.no_media {
+        if data.media.url != format!("https://fh.dji.com{PROJECT}#/plan") || !data.media.files.is_empty() || !data.photos.is_empty() {
+            return Err("无媒体回执与照片资料不一致".into());
+        }
+    } else { source(&data.media.url, true)?; }
     let m = &data.mission;
     if (!data.without_air_data && (m.mission_id == 0 || m.mission_id != data.air.mission_id))
         || data.local_event_id.as_ref().is_some_and(|id| Uuid::parse_str(id).is_err())
@@ -199,8 +244,8 @@ fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     if !data.without_air_data && (data.air.unit != "μg/m³" || data.air.points.len() < 2 || data.air.points.len() > 20000) {
         return Err("PM2.5 单位不符或采样数据不完整。".into());
     }
-    if !data.media.folder.trim_end().ends_with("Immediate-Media")
-        || data.media.files.len() > 20
+    if (!data.media.no_media && !data.media.folder.trim_end().ends_with("Immediate-Media"))
+        || data.media.files.len() > 200
         || data.photos.len() != data.media.files.len()
     {
         return Err("Immediate-Media 照片未完整导出。".into());
@@ -231,7 +276,7 @@ fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
                 .filter_map(|b| std::str::from_utf8(b).ok())
                 .find_map(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
         });
-    if folder_time.is_none_or(|t| {
+    if !data.media.no_media && folder_time.is_none_or(|t| {
         (t.and_utc().timestamp_millis() - 8 * 3600000 - m.start_time).abs() > 300000
     }) {
         return Err("司空任务文件夹时间与本次飞行不匹配或无法核对。".into());
@@ -359,7 +404,7 @@ pub async fn list_flight_missions(
     cursor_id: Option<u64>,
     cursor_time: Option<i64>,
 ) -> Result<Value, String> {
-    crate::readiness::require_started(&app)?;
+    crate::readiness::require_report(&app)?;
     let v = bridge
         .request(
             session,
@@ -370,6 +415,102 @@ pub async fn list_flight_missions(
     source(v["url"].as_str().ok_or("可飞未返回来源")?, false)?;
     Ok(v)
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DjiTask {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub media_folder_id: Option<u64>,
+    #[serde(default)]
+    pub planned_start_time: i64,
+    #[serde(default)]
+    pub actual_time_missing: bool,
+    pub mission: Mission,
+    pub status: String,
+    pub media_ready: bool,
+    #[serde(default)]
+    pub no_media: bool,
+}
+fn read_dji_tasks(db: &rusqlite::Connection) -> Result<Vec<DjiTask>, String> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS dji_report_tasks (task_key TEXT PRIMARY KEY, payload TEXT NOT NULL)").map_err(|e| e.to_string())?;
+    let mut stmt = db.prepare("SELECT payload FROM dji_report_tasks").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    rows.map(|row| serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| e.to_string())).collect()
+}
+#[tauri::command]
+pub fn list_dji_report_tasks(app: tauri::AppHandle) -> Result<Vec<DjiTask>, String> {
+    read_dji_tasks(&database(&app)?)
+}
+#[tauri::command]
+pub async fn sync_dji_report_tasks(app: tauri::AppHandle, bridge: tauri::State<'_, Bridge>, session: String) -> Result<Value, String> {
+    crate::readiness::require_report_media(&app)?;
+    let cursor: Value = crate::monitoring::setting(&database(&app)?, "dji_report_cursor")?
+        .map(|raw| serde_json::from_str(&raw).map_err(|e| format!("司空同步进度损坏：{e}"))).transpose()?.unwrap_or(Value::Null);
+    let completed = crate::monitoring::setting(&database(&app)?, "dji_report_history_completed_at")?
+        .and_then(|raw| raw.parse::<i64>().ok());
+    let api_migrated = crate::monitoring::setting(&database(&app)?, "dji_report_api_version")?.as_deref() == Some("1");
+    let include_history = !api_migrated || history_scan_due(&cursor, completed, Utc::now().timestamp());
+    let response = bridge.request(session, -1, json!({"type":"dji-tasks", "cursor":cursor, "includeHistory":include_history})).await;
+    // Retain the latest read-only sync outcome for support without browser
+    // credentials or raw platform data. A failed sync must remain diagnosable.
+    if let Ok(directory) = root(&app) {
+        let _ = fs::write(directory.join("dji-sync-status.json"), json!({
+            "checkedAt": Utc::now().timestamp_millis(),
+            "error": response.as_ref().err(),
+            "receivedTasks": response.as_ref().ok().and_then(|v| v["tasks"].as_array()).map(Vec::len)
+        }).to_string());
+    }
+    let result = response?;
+    persist_dji_tasks(&mut database(&app)?, &result)
+}
+// Latest executions still refresh each minute. A completed historical sweep
+// does not immediately start over; resume incomplete sweeps across restarts.
+fn history_scan_due(cursor: &Value, completed: Option<i64>, now: i64) -> bool {
+    !cursor.is_null() || completed.is_none_or(|at| !(0..21600).contains(&(now - at)))
+}
+fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Value, String> {
+    if result["url"].as_str() != Some(&format!("https://fh.dji.com{PROJECT}#/plan")) {
+        return Err("司空任务同步来源不匹配".into());
+    }
+    let incoming: Vec<DjiTask> = serde_json::from_value(result["tasks"].clone()).map_err(|e| format!("司空任务格式错误：{e}"))?;
+    let cursor = result.get("cursor").ok_or("司空同步缺少历史进度，请重新加载插件")?;
+    let api_cursor = cursor["apiVersion"] == 1 && cursor["page"].as_u64().is_some_and(|page| (2..=1000000).contains(&page));
+    if !cursor.is_null() && !api_cursor && cursor["after"].as_str().is_none_or(|s| s.is_empty() || s.len() > 200000) {
+        return Err("司空历史同步进度无效".into());
+    }
+    read_dji_tasks(db)?;
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    for task in incoming {
+        let m = &task.mission;
+        if m.mission_id != 0 || m.mission_name.trim().is_empty() || m.mission_name.len() > 500
+            || (task.actual_time_missing && (task.task_id.is_none() || task.planned_start_time <= 0 || task.media_ready))
+            || (!task.actual_time_missing && (m.start_time <= 0 || m.end_time <= m.start_time || m.end_time - m.start_time >= 86400000))
+            || m.start_time < 0 || m.end_time < 0 || m.end_time > Utc::now().timestamp_millis()
+            || task.task_id.as_ref().is_some_and(|id| Uuid::parse_str(id).is_err())
+            || !["执行成功", "部分执行", "执行终止", "执行失败"].contains(&task.status.as_str()) {
+            return Err("司空实际飞行记录无效，未保存".into());
+        }
+        let key = task.task_id.as_ref().map(|id| format!("dji-{id}")).unwrap_or_else(|| report_key(m, None));
+        // Replace the old minute-based receipt when upgrading to API identity.
+        // Existing generated reports remain untouched.
+        if task.task_id.is_some() {
+            tx.execute("DELETE FROM dji_report_tasks WHERE task_key=?1", [report_key(m, None)]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("INSERT INTO dji_report_tasks(task_key,payload) VALUES (?1,?2) ON CONFLICT(task_key) DO UPDATE SET payload=excluded.payload",
+            params![key, serde_json::to_string(&task).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+    }
+    // Commit the progress with the records; failed writes replay the same page.
+    crate::monitoring::put(&tx, "dji_report_cursor", &cursor.to_string())?;
+    if cursor.is_null() && result["historyComplete"] == true && result["historyError"].is_null() {
+        crate::monitoring::put(&tx, "dji_report_history_completed_at", &Utc::now().timestamp().to_string())?;
+        if result["apiVersion"] == 1 {
+            crate::monitoring::put(&tx, "dji_report_api_version", "1")?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(json!({"tasks":read_dji_tasks(db)?, "skipped":result["skipped"], "mediaTabId":result["mediaTabId"], "historyPending": !cursor.is_null(), "historyError":result["historyError"], "platformTotal":result["total"]}))
+}
 #[tauri::command]
 pub async fn collect_flight_report(
     app: tauri::AppHandle,
@@ -379,7 +520,7 @@ pub async fn collect_flight_report(
     if request.without_air_data {
         crate::readiness::require_report_media(&app)?;
     } else {
-        crate::readiness::require_started(&app)?;
+        crate::readiness::require_report(&app)?;
     }
     let req = request;
     if req.mission.end_time > Utc::now().timestamp_millis() - 60000 {
@@ -397,20 +538,41 @@ pub async fn collect_flight_report(
             .await?,
     )
     .map_err(|e| format!("可飞格式错误：{e}"))? };
-    let media_value = bridge
-        .request(
-            req.dji_session.clone(),
-            req.dji_tab_id,
-            json!({"type":"flight-dji-list","startTime":req.mission.start_time,"endTime":req.mission.end_time}),
-        )
-        .await?;
-    if media_value["matchedStartTime"].as_i64() != Some(req.mission.start_time) {
-        return Err("浏览器插件尚不支持按时间自动匹配，请更新并重新加载插件后重试。".into());
-    }
-    let media: Media = serde_json::from_value(media_value)
-        .map_err(|e| format!("司空格式错误：{e}"))?;
+    let media = if req.no_media {
+        // A missing media folder is not evidence of zero photos. Only an exact
+        // persisted FlightHub execution receipt can authorize an empty report.
+        let tasks = read_dji_tasks(&database(&app)?)?;
+        if !tasks.iter().any(|task| task.no_media && task.media_ready
+            && task.mission.mission_name == req.mission.mission_name
+            && task.mission.start_time == req.mission.start_time && task.mission.end_time == req.mission.end_time) {
+            return Err("司空尚未确认本航次无媒体文件".into());
+        }
+        Media { url: format!("https://fh.dji.com{PROJECT}#/plan"), folder: "司空计划：无媒体文件".into(), files: vec![], file_pages: HashMap::new(), no_media: true }
+    } else {
+        let known = read_dji_tasks(&database(&app)?)?;
+        let matches: Vec<_> = known.iter().filter(|task| !task.actual_time_missing && task.media_ready
+            && task.mission.mission_name == req.mission.mission_name
+            && task.mission.start_time == req.mission.start_time && task.mission.end_time == req.mission.end_time).collect();
+        let folder_id = if matches.len() == 1 { matches[0].media_folder_id } else { None };
+        let media_value = bridge
+            .request(
+                req.dji_session.clone(),
+                req.dji_tab_id,
+                json!({"type":"flight-dji-list","startTime":req.mission.start_time,"endTime":req.mission.end_time,"folderId":folder_id}),
+            )
+            .await?;
+        if media_value["matchedStartTime"].as_i64() != Some(req.mission.start_time) {
+            return Err("浏览器插件尚不支持按时间自动匹配，请更新并重新加载插件后重试。".into());
+        }
+        if folder_id.is_some() && media_value["matchedTaskFolderId"].as_u64() != folder_id {
+            return Err("司空媒体目录回执不匹配，未采集照片".into());
+        }
+        let media: Media = serde_json::from_value(media_value)
+            .map_err(|e| format!("司空格式错误：{e}"))?;
+        source(&media.url, true)?;
+        media
+    };
     if !req.without_air_data { source(&air.url, false)?; }
-    source(&media.url, true)?;
     let mut photos = vec![];
     for name in &media.files {
         let t = photo_time(name)?;
@@ -421,10 +583,10 @@ pub async fn collect_flight_report(
             .request(
                 req.dji_session.clone(),
                 req.dji_tab_id,
-                json!({"type":"flight-dji-image","name":name}),
+                json!({"type":"flight-dji-image","name":name,"page":media.file_pages.get(name)}),
             )
             .await?;
-        if v["url"] != media.url || v["folder"] != media.folder || v["name"] != *name {
+        if !same_media_folder(v["url"].as_str().unwrap_or_default(), &media.url) || v["folder"] != media.folder || v["name"] != *name {
             return Err("采集期间司空页面发生变化，请重试。".into());
         }
         photos.push(serde_json::from_value(v).map_err(|e| format!("图片格式错误：{e}"))?);
@@ -657,14 +819,24 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
     // Serialize the lookup and commit; normal saves reuse the latest report.
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SAVE_LOCK.lock().map_err(|_| "报告保存锁异常，请重试")?;
-    let existing = read_summaries(root)?.into_iter().find(|s| {
+    let summaries = read_summaries(root)?;
+    let existing = summaries.iter().find(|s| {
         s.mission.as_ref().is_some_and(|m| report_key(m, s.local_event_id.as_deref()) == report_key(&data.mission, data.local_event_id.as_deref()))
     });
     if !regenerate {
-        if let Some(existing) = existing { return Ok(existing); }
+        if let Some(existing) = existing { return Ok(existing.clone()); }
     }
+    // Upgrading a photo-only report changes its Airins identity. Persist the
+    // exact predecessor so offline/restarted clients never show both versions.
+    let upgrade_candidates: Vec<_> = summaries.iter().filter(|s| {
+        !data.without_air_data && s.without_air_data && s.local_event_id == data.local_event_id
+            && s.mission.as_ref().is_some_and(|m| m.mission_id == 0
+                && m.mission_name == data.mission.mission_name
+                && m.start_time == data.mission.start_time && m.end_time == data.mission.end_time)
+    }).collect();
+    let predecessor = existing.or_else(|| (upgrade_candidates.len() == 1).then(|| upgrade_candidates[0]));
     // Keep new revisions ordered even when generated within the same millisecond.
-    let now = data.evidence.as_ref().map_or_else(|| Utc::now().timestamp_millis(), |e| e.captured_at).max(existing.as_ref().map_or(0, |s| s.created_at + 1));
+    let now = data.evidence.as_ref().map_or_else(|| Utc::now().timestamp_millis(), |e| e.captured_at).max(predecessor.map_or(0, |s| s.created_at + 1));
     let stats = validate(data, now)?;
     let bytes = build_docx(data, charts, now, pm25_threshold)?;
     let id = Uuid::new_v4().to_string();
@@ -677,6 +849,7 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             date(data.mission.start_time, "%Y%m%d-%H%M%S")
         );
         let summary = Summary {
+            supersedes_report_id: predecessor.map(|s| s.id.clone()),
             without_air_data: data.without_air_data,
             local_event_id: data.local_event_id.clone(),
             id: id.clone(),
@@ -685,6 +858,7 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             title: data.mission.mission_name.clone(),
             path: dest.join(&name).to_string_lossy().into_owned(),
             photo_count: data.photos.len(),
+            issue_count: Some(issue_groups(&data.media.files)?.len()),
             point_count: data.air.points.len(),
             warning: if data.without_air_data {
                 "未收录可飞数据，报告对应位置留空".into()
@@ -696,6 +870,9 @@ fn persist(root: &Path, data: &Collected, charts: &[String; 2], pm25_threshold: 
             air_url: data.air.url.clone(),
             media_url: data.media.url.clone(),
         };
+        fs::write(temp.join("issues.json"), serde_json::to_vec_pretty(&json!({
+            "rule": "capture-time-span-at-most-3-seconds", "groups": issue_groups(&data.media.files)?
+        })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&serde_json::json!({"pm25Threshold": pm25_threshold, "templateSha256": "e30bc73f8f720df2c150e36a41a10080a3ff871be0be7cd3e9466f09c16c0a32", "generatorVersion": "template-fill-v3"})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join(&name), bytes).map_err(|e| e.to_string())?;
         fs::write(
@@ -764,6 +941,11 @@ fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
                 // association and platform URLs without rewriting or deleting files.
                 if let Ok(bytes) = fs::read(p.join("source.json")) {
                     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if summary.issue_count.is_none() {
+                            if let Ok(files) = serde_json::from_value::<Vec<String>>(value["media"]["files"].clone()) {
+                                summary.issue_count = issue_groups(&files).ok().map(|groups| groups.len());
+                            }
+                        }
                         if summary.mission.is_none() {
                             summary.mission = serde_json::from_value(value["mission"].clone()).ok();
                         }
@@ -779,6 +961,8 @@ fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
             }
         }
     }
+    let superseded: std::collections::HashSet<_> = items.iter().filter_map(|s| s.supersedes_report_id.clone()).collect();
+    items.retain(|s| !superseded.contains(&s.id));
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
     let mut seen = std::collections::HashSet::new();
     items.retain(|s| s.mission.as_ref().is_none_or(|m| seen.insert(report_key(m, s.local_event_id.as_deref()))));
@@ -818,6 +1002,98 @@ fn saved_report_path(root: &Path, id: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_sweep_is_throttled_only_after_a_committed_completion() {
+        assert!(history_scan_due(&Value::Null, None, 30000));
+        assert!(!history_scan_due(&Value::Null, Some(30000), 30001));
+        assert!(history_scan_due(&json!({"after":"page-2"}), Some(30000), 30001));
+        assert!(history_scan_due(&Value::Null, Some(30000), 51600));
+        assert!(history_scan_due(&Value::Null, Some(30000), 29999));
+        let mut db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let mut batch = json!({"url":format!("https://fh.dji.com{PROJECT}#/plan"),"tasks":[],"cursor":null,"historyComplete":true,"historyError":"timeout"});
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        assert!(crate::monitoring::setting(&db, "dji_report_history_completed_at").unwrap().is_none());
+        batch["historyError"] = Value::Null;
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        assert!(crate::monitoring::setting(&db, "dji_report_history_completed_at").unwrap().is_some());
+    }
+    #[test]
+    fn api_sync_preserves_incomplete_flights_and_replaces_legacy_receipts() {
+        let mut db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let mut task = json!({"mission":{"missionId":0,"missionName":"flight","startTime":1790031600000_i64,"endTime":1790032800000_i64,"geoLocation":""},"status":"执行成功","mediaReady":true});
+        let mut batch = json!({"url":format!("https://fh.dji.com{PROJECT}#/plan"),"tasks":[task.clone()],"cursor":null});
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        task["taskId"] = json!(Uuid::new_v4().to_string());
+        task["mediaFolderId"] = json!(350521756);
+        task["plannedStartTime"] = json!(1790031600000_i64);
+        batch["tasks"] = json!([task.clone()]);
+        batch["cursor"] = json!({"apiVersion":1,"page":7});
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 1);
+        assert_eq!(read_dji_tasks(&db).unwrap()[0].media_folder_id, Some(350521756));
+        task["taskId"] = json!(Uuid::new_v4().to_string());
+        task["mission"]["endTime"] = json!(0);
+        task["actualTimeMissing"] = json!(true);
+        task["mediaReady"] = json!(false);
+        task["status"] = json!("执行失败");
+        batch["tasks"] = json!([task.clone()]);
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 2);
+        task["mediaReady"] = json!(true);
+        batch["tasks"] = json!([task]);
+        assert!(persist_dji_tasks(&mut db, &batch).is_err());
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 2);
+    }
+    #[test]
+    fn dji_sync_commits_cursor_with_records_and_rolls_back_bad_batches() {
+        let mut db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let task = |name: &str| json!({"mission":{"missionId":0,"missionName":name,"startTime":1790031600000_i64,"endTime":1790032800000_i64,"geoLocation":""},"status":"执行成功","mediaReady":true});
+        let mut batch = json!({"url":format!("https://fh.dji.com{PROJECT}#/plan"),"tasks":[task("first")],"cursor":{"after":"page-5"},"skipped":0,"mediaTabId":7});
+        persist_dji_tasks(&mut db, &batch).unwrap();
+        batch["cursor"] = json!({"after":"page-10"});
+        batch["tasks"] = json!([task("second"), task("")]);
+        assert!(persist_dji_tasks(&mut db, &batch).is_err());
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 1);
+        assert_eq!(crate::monitoring::setting(&db, "dji_report_cursor").unwrap().unwrap(), r#"{"after":"page-5"}"#);
+        batch["tasks"] = json!([task("first"), task("second")]);
+        batch["cursor"] = Value::Null;
+        let result = persist_dji_tasks(&mut db, &batch).unwrap();
+        assert_eq!(result["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(result["historyPending"], false);
+    }
+    #[test]
+    fn groups_photo_formats_within_three_seconds_without_chaining() {
+        let names = ["DJI_20261013071746_0006_T.jpeg", "DJI_20261013070653_0002_T.jpeg",
+            "DJI_20261013070652_0002_V.jpeg", "DJI_20261013071746_0006_V.jpeg",
+            "DJI_20261013071749_0007_T.jpeg", "DJI_20261013071752_0008_V.jpeg"];
+        let groups = issue_groups(&names.map(String::from)).unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert!(issue_groups(&[]).unwrap().is_empty());
+        assert!(issue_groups(&["unknown.jpeg".into()]).is_err());
+    }
+    #[test]
+    fn media_page_changes_are_allowed_but_folder_changes_are_not() {
+        let base = format!("https://fh.dji.com{PROJECT}#/media?page=1&size=50&pid=123");
+        assert!(same_media_folder(&base, &base.replace("page=1", "page=2")));
+        assert!(!same_media_folder(&base, &base.replace("pid=123", "pid=456")));
+        assert!(!same_media_folder(&base, &base.replace("fh.dji.com", "evil.test")));
+    }
+    #[test]
+    fn explicit_no_media_receipt_is_distinct_from_a_missing_folder() {
+        let mut data = sample();
+        data.media.url = format!("https://fh.dji.com{PROJECT}#/plan");
+        data.media.folder = "司空计划：无媒体文件".into();
+        data.media.files.clear(); data.photos.clear();
+        let now = data.mission.end_time + 60001;
+        assert!(validate(&data, now).is_err());
+        data.media.no_media = true;
+        assert!(validate(&data, now).is_ok());
+        assert_eq!(issue_groups(&data.media.files).unwrap().len(), 0);
+        data.media.files.push("DJI_20260922070120_0001_V.jpeg".into());
+        assert!(validate(&data, now).is_err());
+    }
     #[test]
     fn mission_reasons_are_validated_and_persisted_by_airins_id() {
         let db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
@@ -865,6 +1141,8 @@ mod tests {
                 ],
             },
             media: Media {
+                file_pages: HashMap::new(),
+                no_media: false,
                 url: format!("https://fh.dji.com{PROJECT}#/media?page=1&pid=1"),
                 folder: "媒体文件 每日7时南侧火点巡飞 2026-09-22 07:00:05 (UTC+08) Immediate-Media"
                     .into(),
@@ -1006,6 +1284,31 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn sampling_upgrade_persists_one_visible_report_across_reload_and_revisions() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let full = sample();
+        let mut partial = full.clone();
+        partial.without_air_data = true;
+        partial.mission.mission_id = 0;
+        partial.air = AirData { url: String::new(), mission_id: 0, unit: String::new(), points: vec![] };
+        let old = persist(&root, &partial, &[String::new(), String::new()], 60.0, false).unwrap();
+        let upgrade = persist(&root, &full, &[PNG.into(), PNG.into()], 60.0, true).unwrap();
+        assert_eq!(upgrade.supersedes_report_id.as_deref(), Some(old.id.as_str()));
+        assert!(upgrade.created_at > old.created_at);
+        let reports = read_summaries(&root).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, upgrade.id);
+        assert!(!reports[0].without_air_data);
+        assert!(reports[0].point_count > 0);
+        let revision = persist(&root, &full, &[PNG.into(), PNG.into()], 60.0, true).unwrap();
+        assert_eq!(read_summaries(&root).unwrap().len(), 1);
+        assert_eq!(read_summaries(&root).unwrap()[0].id, revision.id);
+        assert!(Path::new(&old.path).is_file());
+        assert!(Path::new(&upgrade.path).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn native_docx_and_atomic_history() {
         let d = sample();
         let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
@@ -1043,6 +1346,7 @@ mod tests {
         let old = persist(&root, &data, &[PNG.into(), PNG.into()], 60.0, false).unwrap();
         let mut legacy = serde_json::to_value(&old).unwrap();
         legacy.as_object_mut().unwrap().remove("mission");
+        legacy.as_object_mut().unwrap().remove("issueCount");
         legacy.as_object_mut().unwrap().remove("airUrl");
         legacy.as_object_mut().unwrap().remove("mediaUrl");
         fs::write(root.join(&old.id).join("summary.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
@@ -1058,6 +1362,7 @@ mod tests {
         assert_eq!(reports[0].id, id);
         assert_eq!(reports[0].mission.as_ref().unwrap().mission_id, 1);
         assert_eq!(reports[0].media_url, data.media.url);
+        assert_eq!(reports[0].issue_count, Some(issue_groups(&data.media.files).unwrap().len()));
         assert!(root.join(&old.id).join("summary.json").is_file());
         assert_eq!(persist(&root, &data, &[PNG.into(), PNG.into()], 60.0, false).unwrap().id, id);
         // An old report whose source is unavailable must remain accessible.

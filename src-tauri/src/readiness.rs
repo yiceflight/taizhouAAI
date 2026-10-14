@@ -68,6 +68,9 @@ pub struct View {
     pub checking: bool,
     pub sites: Vec<SiteHealth>,
     pub ready: bool,
+    pub monitoring_ready: bool,
+    pub flight_ready: bool,
+    pub report_ready: bool,
     pub started: bool,
 }
 pub fn compatible(version: &str) -> bool {
@@ -181,6 +184,9 @@ fn evaluate(
         .collect();
     View {
         ready: plugin_ready && sites.iter().all(|s| s.state == "ready"),
+        monitoring_ready: plugin_ready && sites.iter().any(|s| s.id == "map" && s.state == "ready"),
+        flight_ready: plugin_ready && sites.iter().any(|s| s.id == "dji" && s.state == "ready"),
+        report_ready: plugin_ready && ["dji", "sniff"].iter().all(|id| sites.iter().any(|s| s.id == *id && s.state == "ready")),
         plugin_ready,
         plugin_update_required: bridge.connected && bridge.versions.iter().any(|v| !compatible(v)),
         minimum_extension_version: MIN_VERSION,
@@ -206,6 +212,24 @@ pub fn require_started(app: &tauri::AppHandle) -> Result<(), String> {
         return Err("请先完成首批数据读取并开始监测。".into());
     }
     Ok(())
+}
+fn check_capability(state: &View, available: bool, started: bool, message: &str) -> Result<(), String> {
+    if !state.plugin_ready { return Err(state.plugin_message.clone()); }
+    if !available { return Err(message.into()); }
+    if started && !state.started { return Err("请先完成首批数据读取并开始监测。".into()); }
+    Ok(())
+}
+pub fn require_monitoring(app: &tauri::AppHandle, started: bool) -> Result<(), String> {
+    let state = view(app);
+    check_capability(&state, state.monitoring_ready, started, "请先完成江苏大气站的登录和可用性验证。")
+}
+pub fn require_flight(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = view(app);
+    check_capability(&state, state.flight_ready, true, "请先完成司空的登录和可用性验证。")
+}
+pub fn require_report(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = view(app);
+    check_capability(&state, state.report_ready, false, "请先完成司空和可飞的登录和可用性验证。")
 }
 // Photo-only reports depend on FlightHub and the bridge, not monitoring or Airins.
 pub fn require_report_media(app: &tauri::AppHandle) -> Result<(), String> {
@@ -410,10 +434,10 @@ pub async fn check_readiness(app: tauri::AppHandle) -> Result<View, String> {
 }
 #[tauri::command]
 pub async fn start_workspace(app: tauri::AppHandle) -> Result<(), String> {
-    require_ready(&app)?;
+    require_monitoring(&app, false)?;
     // First read cannot trigger an automatic flight preparation.
     crate::monitoring::verify_first_sync(&app).await?;
-    require_ready(&app)?;
+    require_monitoring(&app, false)?;
     crate::monitoring::set_monitoring_enabled(app.clone(), true)?;
     app.state::<Readiness>()
         .started
@@ -569,6 +593,27 @@ mod tests {
         cache[0].health.state = "ready".into();
         bridge.versions = vec!["0.5.0".into()];
         assert!(check_report_media(evaluate(&bridge, &cache, false, false)).is_err());
+    }
+    #[test]
+    fn site_outages_only_block_dependent_capabilities_and_recover() {
+        let (bridge, mut cache) = fixture();
+        for missing in ["sniff", "dji", "map"] {
+            for cached in &mut cache { cached.health.state = if cached.health.id == missing { "login_required" } else { "ready" }.into(); }
+            let state = evaluate(&bridge, &cache, true, false);
+            assert!(!state.ready);
+            assert_eq!(state.monitoring_ready, missing != "map");
+            assert_eq!(state.flight_ready, missing != "dji");
+            assert_eq!(state.report_ready, missing == "map");
+            assert_eq!(check_capability(&state, state.monitoring_ready, true, "map").is_ok(), missing != "map");
+            assert_eq!(check_capability(&state, state.flight_ready, true, "dji").is_ok(), missing != "dji");
+            assert!(state.started);
+        }
+        for cached in &mut cache { cached.health.state = "ready".into(); }
+        let state = evaluate(&bridge, &cache, false, false);
+        assert!(check_capability(&state, state.monitoring_ready, false, "map").is_ok());
+        assert!(check_capability(&state, state.flight_ready, true, "dji").is_err());
+        let state = evaluate(&bridge, &cache, true, false);
+        assert!(state.ready && state.monitoring_ready && state.flight_ready && state.report_ready);
     }
     #[test]
     fn gates_all_sites_and_preserves_started_on_loss_for_recovery() {

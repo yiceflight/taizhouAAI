@@ -121,13 +121,13 @@ describe('drone task display',()=>{
     expect(doc.querySelector('.task-details-copy')).toBeNull();
     expect(doc.querySelector('.task-records')?.textContent).toContain('禁飞时间：05:00–08:00');
   });
-  it('only describes automatic cancellation as suppressing the current episode',()=>{
+  it('only describes automatic cancellation as suppressing only the current hour',()=>{
     const d=reading(data(),0.9);
     for (const source of ['manual', 'preview', 'auto', undefined]) {
       d.flight.event={...event('canceled'),source,preview:source==='preview'};
       const summary=flightSummary(d,true,now);
-      if(source==='auto') expect(summary.detail).toContain('本轮超标不再自动触发');
-      else expect(summary.detail).not.toContain('本轮超标不再自动触发');
+      if(source==='auto') expect(summary.detail).toContain('该小时不再自动触发');
+      else expect(summary.detail).not.toContain('该小时不再自动触发');
       if(source==='manual' || source==='preview') expect(summary.detail).toContain('不影响自动触发');
       expect(button(render(d),'立即执行任务')?.hasAttribute('disabled')).toBe(false);
     }

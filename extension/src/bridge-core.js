@@ -4,7 +4,7 @@ export function allowedUrl(value) {
   catch { return false; }
 }
 export function evaluationValue(result) {
-  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "页面脚本执行失败");
+  if (result.exceptionDetails) throw new Error((result.exceptionDetails.exception?.description || result.exceptionDetails.text || "页面脚本执行失败").split("\n")[0].replace(/^Error:\s*/, ""));
   if (!result.result || !("value" in result.result)) throw new Error("页面未返回可序列化数据");
   return result.result.value;
 }

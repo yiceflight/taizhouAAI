@@ -59,6 +59,11 @@ export async function djiReport(job) {
       search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
       await wait(() => !search.value, '搜索清空');
     }
+    if (job.folderId != null) {
+      if (!Number.isSafeInteger(job.folderId) || job.folderId <= 0) throw new Error('司空任务媒体目录编号无效');
+      await navigate(`#/media?page=1&size=50&pid=${job.folderId}`);
+      if (new URLSearchParams(location.hash.split('?')[1]).get('pid') !== String(job.folderId)) throw new Error('司空媒体目录不匹配');
+    } else {
     const rootHash = page => `#/media?page=${page}&size=50`;
     const candidates = [];
     let complete = false;
@@ -91,6 +96,7 @@ export async function djiReport(job) {
     const rootRows = signature();
     target.click();
     await wait(() => (crumb()?.innerText || '').includes(match.name) && signature() !== rootRows, '航次打开');
+    }
     const immediate = rows().map(row => leaf(row, 'Immediate-Media')).find(Boolean);
     if (!immediate) throw new Error('已按时间找到司空航次，但尚无 Immediate-Media 照片文件夹，请等待照片上传后重试');
     const taskRows = signature();
@@ -100,15 +106,54 @@ export async function djiReport(job) {
   const breadcrumb = document.querySelector('[aria-label="Breadcrumb"],.ant-breadcrumb');
   const folder = breadcrumb?.innerText?.trim() || '';
   if (!folder.endsWith('Immediate-Media')) throw new Error('请进入本次任务的 Immediate-Media 文件夹');
-  const names = [...document.querySelectorAll('table tbody tr')].filter(visible).map(row => row.innerText.match(/DJI_\d{14}_[A-Za-z0-9_]+\.(?:jpe?g|png)/i)?.[0]).filter(Boolean);
-  const unique = [...new Set(names)];
-  if (!unique.length && !/暂无数据|无文件|No data|No files/i.test([...document.querySelectorAll('table')].map(e=>e.innerText).join(' '))) throw new Error('未识别到图片列表，无法确认文件夹是否为空');
-  if (unique.length > 20) throw new Error('单次快报最多收录 20 张照片，请分批整理后重试');
-  // Refuse silent omission of another page or a search filter.
   if ([...document.querySelectorAll('input')].some(e => /文件名称/.test(e.placeholder) && e.value.trim())) throw new Error('请清空司空文件名搜索后重试');
-  const next = document.querySelector('.ant-pagination-next');
-  if (next && next.getAttribute('aria-disabled') !== 'true' && !next.classList.contains('ant-pagination-disabled')) throw new Error('图片超过一页，请整理为不超过 20 张的单页任务文件夹');
-  if (job.type === 'flight-dji-list') return {url:location.href,folder,files:unique,matchedStartTime:job.startTime};
+  const pageNames = () => [...document.querySelectorAll('table tbody tr')].filter(visible).flatMap(row => {
+    const value = row.innerText;
+    const name = value.match(/DJI_\d{14}_[A-Za-z0-9_]+\.(?:jpe?g|png)/i)?.[0];
+    if (!name && /\.(?:jpe?g|png|tiff?|dng|webp)\b/i.test(value)) throw new Error('存在无法核对拍摄时间或不支持格式的图片，未生成不完整报告');
+    return name ? [name] : [];
+  });
+  const goPage = async page => {
+    const params = new URLSearchParams(location.hash.split('?')[1]);
+    if (Number(params.get('page') || 1) === page) return;
+    const before = pageNames().join('|');
+    params.set('page', String(page)); location.hash = '#/media?' + params.toString();
+    let stable = 0;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      if (pageNames().join('|') !== before && ![...document.querySelectorAll('.ant-spin-spinning,[aria-busy="true"]')].some(visible)) {
+        if (++stable >= 3) return;
+      } else stable = 0;
+    }
+    throw new Error('司空图片翻页未完成，未生成不完整报告');
+  };
+  if (job.page != null) {
+    if (!Number.isInteger(job.page) || job.page < 1 || job.page > 20) throw new Error('照片页码无效');
+    await goPage(job.page);
+  }
+  const unique = [...new Set(pageNames())];
+  if (!unique.length && !/暂无数据|无文件|No data|No files/i.test([...document.querySelectorAll('table')].map(e=>e.innerText).join(' '))) throw new Error('未识别到图片列表，无法确认文件夹是否为空');
+  if (job.type === 'flight-dji-list') {
+    // Legacy manual probes cannot prove a complete multipage inventory.
+    const initialNext = document.querySelector('.ant-pagination-next');
+    if (job.startTime == null && initialNext && initialNext.getAttribute('aria-disabled') !== 'true' && !initialNext.classList.contains('ant-pagination-disabled')) throw new Error('图片超过一页，请按飞行时间自动匹配后重试');
+    await goPage(1);
+    const files = [], filePages = {};
+    for (let page = 1; page <= 20; page++) {
+      for (const name of pageNames()) {
+        if (filePages[name]) throw new Error('司空照片跨页重复，列表可能正在变化，请重试');
+        files.push(name); filePages[name] = page;
+      }
+      if (files.length > 200) throw new Error('单次报告超过 200 张照片，未截断或生成不完整报告');
+      const next = document.querySelector('.ant-pagination-next');
+      if (!next || next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled')) {
+        if ((document.querySelector('[aria-label="Breadcrumb"],.ant-breadcrumb')?.innerText?.trim() || '') !== folder) throw new Error('采集期间照片文件夹已变化');
+        return { url: location.href, folder, files, filePages, matchedStartTime: job.startTime, matchedTaskFolderId: job.folderId ?? null };
+      }
+      await goPage(page + 1);
+    }
+    throw new Error('照片列表超过 20 页，未生成不完整报告');
+  }
   if (!unique.includes(job.name)) throw new Error('照片已不在当前任务文件夹中');
   // Opening a preview is read-only and refreshes the selected photo record.
   const target = [...document.querySelectorAll('table tbody tr')].find(row=>row.innerText.includes(job.name));

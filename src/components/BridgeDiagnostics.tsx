@@ -17,7 +17,7 @@ export function diagnosticText(report: BridgeDiagnosticReport) {
 }
 export function DiagnosticResults({ report }: { report: BridgeDiagnosticReport }) {
   return <>
-    <p className="diagnostic-time">检测时间：{new Date(report.checkedAt).toLocaleString()} · 以下为本次检测快照</p>
+    <p className="diagnostic-time">最近检测：{new Date(report.checkedAt).toLocaleString()} · 本页每 5 秒自动刷新</p>
     <ul className="diagnostic-checks">{report.checks.map(check => <li key={check.id}>
       <div className="diagnostic-check-heading"><strong>{check.label}</strong><span className={`badge ${check.state === 'pass' ? 'success' : check.state === 'skipped' ? '' : 'warning'}`}>{labels[check.state]}</span></div>
       <p>{check.detail}</p>{check.suggestion && <small>{check.suggestion}</small>}
@@ -30,20 +30,26 @@ export function DiagnosticResults({ report }: { report: BridgeDiagnosticReport }
     </dl></details>
   </>;
 }
-export function BridgeDiagnostics() {
+export function BridgeDiagnostics({ active = true }: { active?: boolean }) {
   const [report, setReport] = useState<BridgeDiagnosticReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const lock = useRef(false);
-  const run = useCallback(async () => {
+  const run = useCallback(async (background = false) => {
     if (lock.current) return;
     if (!isTauri()) { setMessage('请在桌面客户端内运行本机连接诊断。'); return; }
-    lock.current = true; setBusy(true); setMessage(''); setReport(null);
-    try { setReport(await invoke<BridgeDiagnosticReport>('diagnose_bridge')); }
-    catch (error) { setMessage(`诊断未完成：${String(error)}。请重试，并将此提示提供给技术支持。`); }
+    lock.current = true; setBusy(true);
+    if (!background) { setMessage(''); setReport(null); }
+    try { setReport(await invoke<BridgeDiagnosticReport>('diagnose_bridge')); setMessage(''); }
+    catch (error) { setReport(null); setMessage(`诊断未完成：${String(error)}。请重试，并将此提示提供给技术支持。`); }
     finally { lock.current = false; setBusy(false); }
   }, []);
-  useEffect(() => { void run(); }, [run]);
+  useEffect(() => {
+    if (!active) return;
+    void run();
+    const timer = setInterval(() => void run(true), 5000);
+    return () => clearInterval(timer);
+  }, [active, run]);
   const copy = async () => {
     if (!report) return;
     try { await navigator.clipboard.writeText(diagnosticText(report)); setMessage('诊断结果已复制，可发给技术支持。'); }
@@ -54,7 +60,7 @@ export function BridgeDiagnostics() {
       <button className="secondary-button" disabled={busy} onClick={() => void run()}>{busy ? '正在诊断…' : '重新诊断'}</button>
       <button className="secondary-button" disabled={!report || busy} onClick={() => void copy()}>复制诊断结果</button>
     </div></div>
-    {busy && <p role="status">正在检查本机连接，请稍候…</p>}
+    {busy && !report && <p role="status">正在检查本机连接，请稍候…</p>}
     {report && <DiagnosticResults report={report} />}
     {message && <p className="notice" role="status">{message}</p>}
   </section>;

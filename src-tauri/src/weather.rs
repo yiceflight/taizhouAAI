@@ -1,20 +1,15 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
-};
+use serde_json::{json, Value};
+use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
-const LAT: &str = "32.434525";
-const LNG: &str = "119.92992";
 const REFRESH_SECS: u64 = 300;
-const MAX_OBSERVATION_AGE: i64 = 1800;
+const MAX_OBSERVATION_AGE: i64 = 600;
 const MAX_FETCH_AGE: i64 = 600;
-const WIND_CONFIRM_SPEED: f64 = 7.;
-const WIND_PROHIBIT_SPEED: f64 = 12.;
+const PROJECT: &str = "c7ea6bbc-110d-4dc9-ac75-4653ebbbca49";
+const DOCK: &str = "AHRXNBN00A029A";
 
 #[derive(Default)]
 pub struct Weather {
@@ -23,198 +18,94 @@ pub struct Weather {
     refreshing: AtomicBool,
 }
 #[derive(Default)]
-struct Cache {
-    sample: Option<Sample>,
-    error: Option<String>,
-    attempt: Option<Instant>,
+struct Cache { sample: Option<Sample>, error: Option<String>, attempt: Option<Instant> }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Item { key: String, label: String, value: String, level: u8 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Forecast {
+    observed_at: i64, condition: String, temperature: f64, humidity: f64, precipitation: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sample {
-    observed_at: i64,
-    fetched_at: i64,
-    temperature: Option<f64>,
-    weather_code: Option<u64>,
-    wind_speed: Option<f64>,
-    wind_gusts: Option<f64>,
-    wind_direction: Option<f64>,
-    precipitation: Option<f64>,
+    observed_at: i64, fetched_at: i64,
+    temperature: Option<f64>, weather_code: Option<u64>, wind_speed: Option<f64>,
+    wind_gusts: Option<f64>, wind_direction: Option<f64>, precipitation: Option<f64>,
+    // Optional for deserializing historical Open-Meteo creation snapshots.
+    #[serde(default)] airworthy: Option<u8>,
+    #[serde(default)] platform_label: Option<String>,
+    #[serde(default)] rainfall: Option<f64>,
+    #[serde(default)] latitude: Option<f64>,
+    #[serde(default)] longitude: Option<f64>,
+    #[serde(default)] forecast: Option<Forecast>,
+    #[serde(default)] items: Vec<Item>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
-    location: String,
-    latitude: f64,
-    longitude: f64,
-    source: String,
-    refreshing: bool,
-    pub allowed: bool,
-    level: String,
-    label: String,
-    pub reasons: Vec<String>,
-    current: Option<Sample>,
-}
-fn nonnegative(value: &Value) -> Option<f64> {
-    value.as_f64().filter(|v| v.is_finite() && *v >= 0.)
+    location: String, latitude: f64, longitude: f64, source: String, refreshing: bool,
+    pub allowed: bool, level: String, label: String, pub reasons: Vec<String>, current: Option<Sample>,
 }
 fn parse_response(raw: &Value, now: i64) -> Result<Sample, String> {
-    let c = &raw["current"];
-    let units = &raw["current_units"];
-    if units["wind_speed_10m"] != "m/s"
-        || units["wind_gusts_10m"] != "m/s"
-        || units["precipitation"] != "mm"
-        || units["time"] != "unixtime"
-    {
-        return Err("天气接口返回的单位不匹配，暂不能判断飞行条件。".into());
+    let expected_url = format!("https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/{PROJECT}#/team");
+    if raw["url"] != expected_url || raw["projectId"] != PROJECT || raw["dockSn"] != DOCK || raw["adapterVersion"] != 1 {
+        return Err("司空气象回执身份不匹配，请更新浏览器插件。".into());
     }
-    let observed_at = c["time"]
-        .as_i64()
-        .filter(|t| DateTime::from_timestamp(*t, 0).is_some())
-        .ok_or("天气数据缺少有效时间。")?;
-    Ok(Sample {
-        observed_at,
-        fetched_at: now,
-        temperature: c["temperature_2m"].as_f64().filter(|v| v.is_finite()),
-        weather_code: c["weather_code"].as_u64(),
-        wind_speed: nonnegative(&c["wind_speed_10m"]),
-        wind_gusts: nonnegative(&c["wind_gusts_10m"]),
-        wind_direction: nonnegative(&c["wind_direction_10m"]).filter(|v| *v <= 360.),
-        precipitation: nonnegative(&c["precipitation"]),
-    })
+    let mut value = raw.clone();
+    value["platformLabel"] = raw["label"].clone();
+    let sample: Sample = serde_json::from_value(value).map_err(|_| "司空气象回执不完整。")?;
+    if !(-60..=120).contains(&(now - sample.observed_at)) || !(0..=120).contains(&(now - sample.fetched_at))
+        || !matches!(sample.airworthy, Some(1..=3)) || sample.platform_label.as_ref().is_none_or(|s| s.trim().is_empty())
+        || sample.wind_speed.is_none_or(|v| !v.is_finite() || v < 0.)
+        || sample.rainfall.is_none_or(|v| !v.is_finite() || v < 0.)
+        || sample.temperature.is_none_or(|v| !v.is_finite())
+        || sample.latitude.is_none_or(|v| !v.is_finite() || v.abs() > 90.)
+        || sample.longitude.is_none_or(|v| !v.is_finite() || v.abs() > 180.)
+        || sample.forecast.as_ref().is_none_or(|f| !(0..=3600).contains(&(now - f.observed_at)) || f.condition.is_empty())
+        || sample.items.is_empty() || sample.items.iter().any(|i| !(1..=3).contains(&i.level) || i.value.trim().is_empty()) {
+        return Err("司空气象数据缺失、过期或结论无效，请刷新。".into());
+    }
+    Ok(sample)
 }
 fn assess(sample: Option<&Sample>, error: Option<&str>, now: i64) -> (&'static str, Vec<String>) {
-    if let Some(error) = error {
-        return ("unknown", vec![error.into()]);
+    if let Some(error) = error { return ("unknown", vec![error.into()]); }
+    let Some(s) = sample else { return ("unknown", vec!["等待司空气象数据和适飞结论。".into()]); };
+    if !(0..=MAX_FETCH_AGE).contains(&(now-s.fetched_at)) || !(-60..=MAX_OBSERVATION_AGE).contains(&(now-s.observed_at)) {
+        return ("unknown", vec!["司空气象数据已过期，请刷新。".into()]);
     }
-    let Some(s) = sample else {
-        return (
-            "unknown",
-            vec!["等待获取机场天气，暂不能判断飞行条件。".into()],
-        );
-    };
-    if !(0..=MAX_FETCH_AGE).contains(&(now - s.fetched_at))
-        || !(-60..=MAX_OBSERVATION_AGE).contains(&(now - s.observed_at))
-    {
-        return (
-            "unknown",
-            vec!["天气数据已过期或时间异常，请刷新后再判断。".into()],
-        );
-    }
-    conditions(s.weather_code, s.wind_speed, s.wind_gusts, s.precipitation)
-}
-pub(crate) fn conditions(weather_code: Option<u64>, wind_speed: Option<f64>, wind_gusts: Option<f64>, precipitation: Option<f64>) -> (&'static str, Vec<String>) {
-    let mut reasons = Vec::new();
-    let mut level = "ok";
-    match weather_code {
-        Some(0..=3) => {}
-        Some(45 | 48) => {
-            level = "caution";
-            reasons.push("有雾，能见度不足，暂停准备计划。".into());
-        }
-        Some(
-            51 | 53 | 55 | 56 | 57 | 61 | 63 | 65 | 66 | 67 | 71 | 73 | 75 | 77 | 80 | 81 | 82 | 85
-            | 86 | 95 | 96 | 99,
-        ) => {
-            level = "unsafe";
-            reasons.push("存在降水、降雪或雷暴，不满足无降水起飞条件。".into());
-        }
-        _ => {
-            level = "unknown";
-            reasons.push("天气现象数据缺失或无法识别。".into());
-        }
-    }
-    if precipitation.is_some_and(|v| v > 0.) {
-        level = "unsafe";
-        reasons.push(format!("当前时段降水量 {} mm。", precipitation.unwrap()));
-    }
-    for (name, value) in [("风速", wind_speed), ("阵风", wind_gusts)] {
-        if let Some(v) = value {
-            if v >= WIND_PROHIBIT_SPEED {
-                level = "unsafe";
-                reasons.push(format!("{name} {v:.1} m/s，达到 12 m/s，禁止起飞。"));
-            } else if v >= WIND_CONFIRM_SPEED {
-                if level == "ok" {
-                    level = "caution";
-                }
-                reasons.push(format!("{name} {v:.1} m/s，达到 7 m/s，需人工确认并现场复核。"));
-            }
-        }
-    }
-    if [wind_speed, wind_gusts, precipitation]
-        .iter()
-        .any(Option::is_none)
-    {
-        if level != "unsafe" {
-            level = "unknown";
-        }
-        reasons.push("风速、阵风或降水数据不完整，暂停准备计划。".into());
-    }
-    if reasons.is_empty() {
-        reasons.push("无降水，风速及阵风均低于 7 m/s。".into());
-    }
+    // Only map DJI's enum. Do not reproduce meteorological thresholds here.
+    let level = match s.airworthy { Some(1) => "ok", Some(2) => "caution", Some(3) => "unsafe", _ => "unknown" };
+    let mut reasons: Vec<String> = s.items.iter().filter(|i| i.level > 1).map(|i| format!("{}：{}", i.label, i.value)).collect();
+    if reasons.is_empty() { reasons.push(format!("司空判定：{}", s.platform_label.as_deref().unwrap_or("暂无法判断"))); }
     (level, reasons)
 }
-fn require_wind_below_limit(sample: Option<&Sample>) -> Result<(), String> {
-    if sample.is_some_and(|s| [s.wind_speed, s.wind_gusts].iter().any(|v| v.is_some_and(|v| v >= WIND_PROHIBIT_SPEED))) {
-        Err("风速或阵风达到 12 m/s，禁止起飞，人工确认不能覆盖。".into())
-    } else {
-        Ok(())
-    }
+fn require_platform_not_prohibited(weather: &View) -> Result<(), String> {
+    // Keep the existing explicit manual confirmation, but never override DJI's
+    // unable-to-fly verdict or an unavailable/stale decision.
+    if weather.level == "ok" || weather.level == "caution" { Ok(()) }
+    else { Err(format!("司空适飞结论未通过：{}", weather.reasons.join(" "))) }
 }
 pub fn view(app: &tauri::AppHandle) -> View {
     let state = app.state::<Weather>();
     let cache = state.cache.lock().unwrap();
-    let (level, reasons) = assess(
-        cache.sample.as_ref(),
-        cache.error.as_deref(),
-        Utc::now().timestamp(),
-    );
+    let (level, reasons) = assess(cache.sample.as_ref(), cache.error.as_deref(), Utc::now().timestamp());
+    let sample = cache.sample.as_ref();
     View {
         location: "泰州环境监测 Dock 3".into(),
-        latitude: LAT.parse().unwrap(),
-        longitude: LNG.parse().unwrap(),
-        source: "Open-Meteo".into(),
-        refreshing: state.refreshing.load(Ordering::SeqCst),
-        allowed: level == "ok",
-        level: level.into(),
-        label: match level {
-            "ok" => "天气条件通过",
-            "unsafe" if require_wind_below_limit(cache.sample.as_ref()).is_err() => "禁止起飞",
-            "unsafe" => "不宜起飞",
-            "caution" => "需现场复核",
-            _ => "暂无法判断",
-        }.into(),
-        reasons,
-        current: cache.sample.clone(),
+        latitude: sample.and_then(|s| s.latitude).unwrap_or(32.434676),
+        longitude: sample.and_then(|s| s.longitude).unwrap_or(119.929701),
+        source: "DJI FlightHub 2".into(), refreshing: state.refreshing.load(Ordering::SeqCst),
+        allowed: level == "ok", level: level.into(),
+        label: if level == "unknown" { "暂无法判断".into() } else { sample.and_then(|s| s.platform_label.clone()).unwrap_or_else(|| "暂无法判断".into()) },
+        reasons, current: cache.sample.clone(),
     }
 }
-async fn fetch() -> Result<Sample, String> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|_| "天气连接初始化失败。")?;
-    let mut url = tauri::Url::parse("https://api.open-meteo.com/v1/forecast").unwrap();
-    url.query_pairs_mut().extend_pairs([
-        ("latitude", LAT), ("longitude", LNG),
-        ("current", "temperature_2m,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation"),
-        ("wind_speed_unit", "ms"), ("timeformat", "unixtime"), ("timezone", "Asia/Shanghai"), ("forecast_days", "1"),
-    ]);
-    let response = client.get(url).send().await.map_err(|e| {
-        if e.is_timeout() {
-            "天气获取超时，请稍后重试。"
-        } else {
-            "无法连接天气服务，请检查网络。"
-        }
-    })?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "天气服务返回 HTTP {}，请稍后重试。",
-            response.status().as_u16()
-        ));
-    }
-    let body = response.text().await.map_err(|_| "天气响应读取失败。")?;
-    let raw: Value = serde_json::from_str(&body).map_err(|_| "天气响应格式无效。")?;
+async fn fetch(app: &tauri::AppHandle) -> Result<Sample, String> {
+    let bridge = app.state::<crate::bridge::Bridge>();
+    let session = bridge.single_session()?;
+    let raw = bridge.request(session, -1, json!({"type":"dji-weather"})).await?;
     parse_response(&raw, Utc::now().timestamp())
 }
 pub async fn refresh(app: &tauri::AppHandle, force: bool) {
@@ -225,7 +116,7 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
         let cache = state.cache.lock().unwrap();
         // Concurrent manual/automatic requests share the result of the first fetch.
         if cache.attempt.is_some_and(|t| {
-            t >= requested_at || (!force && t.elapsed() < Duration::from_secs(REFRESH_SECS))
+            t >= requested_at || (!force && t.elapsed() < Duration::from_secs(if cache.error.is_some() { 30 } else { REFRESH_SECS }))
         }) {
             return;
         }
@@ -238,7 +129,7 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
         }
     }
     let _guard = Guard(&state.refreshing);
-    let result = fetch().await;
+    let result = fetch(app).await;
     let mut cache = state.cache.lock().unwrap();
     cache.attempt = Some(Instant::now());
     match result {
@@ -250,16 +141,31 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
     }
 }
 pub async fn check_launch(app: &tauri::AppHandle, manual_override: bool) -> (View, Result<(), String>) {
-    refresh(app, true).await;
+    // Creation and preparation run back-to-back. Reuse only a just-validated
+    // successful receipt, never an error or the ordinary five-minute cache.
+    let recent = {
+        let state = app.state::<Weather>();
+        let cache = state.cache.lock().unwrap();
+        recent_launch_sample(&cache, Utc::now().timestamp())
+    };
+    if !recent { refresh(app, true).await; }
     let weather = view(app);
     let result = if manual_override {
-        require_wind_below_limit(weather.current.as_ref())
+        require_platform_not_prohibited(&weather)
     } else if weather.allowed {
         Ok(())
     } else {
         Err(format!("天气条件未通过：{}", weather.reasons.join(" ")))
     };
     (weather, result)
+}
+fn recent_launch_sample(cache: &Cache, now: i64) -> bool {
+    cache.error.is_none()
+        && cache.attempt.is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+        && cache.sample.as_ref().is_some_and(|s|
+            (0..=15).contains(&(now - s.fetched_at))
+            && (-60..=120).contains(&(now - s.observed_at))
+            && matches!(s.airworthy, Some(1..=3)))
 }
 #[tauri::command]
 pub async fn refresh_weather(app: tauri::AppHandle) {
@@ -269,146 +175,73 @@ pub fn start(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             refresh(&app, false).await;
-            tokio::time::sleep(Duration::from_secs(REFRESH_SECS)).await;
+            // Retry startup/login/bridge failures promptly once Chrome becomes available.
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sample() -> Sample {
-        Sample {
-            observed_at: 10000,
-            fetched_at: 10000,
-            temperature: Some(0.),
-            weather_code: Some(0),
-            wind_speed: Some(0.),
-            wind_gusts: Some(0.),
-            wind_direction: Some(0.),
-            precipitation: Some(0.),
+    fn receipt(now: i64) -> Value {
+        json!({"url":format!("https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/{PROJECT}#/team"),
+            "projectId":PROJECT,"dockSn":DOCK,"adapterVersion":1,"observedAt":now,"fetchedAt":now,
+            "latitude":32.434676,"longitude":119.929701,"temperature":22.,"windSpeed":20.,"rainfall":0.,
+            "airworthy":1,"label":"适合飞行","items":[{"key":"windSpeed","label":"风速","value":"20 m/s","level":1}],
+            "forecast":{"observedAt":now-60,"condition":"晴","temperature":19.,"humidity":80.,"precipitation":0.}})
+    }
+    #[test]
+    fn launch_reuses_only_a_just_validated_receipt_and_never_a_failed_refresh() {
+        let mut cache = Cache { sample: Some(parse_response(&receipt(10000), 10000).unwrap()), error: None, attempt: Some(Instant::now()) };
+        assert!(recent_launch_sample(&cache, 10001));
+        assert!(!recent_launch_sample(&cache, 10016));
+        assert!(!recent_launch_sample(&cache, 9999));
+        cache.error = Some("component unavailable".into());
+        assert!(!recent_launch_sample(&cache, 10001));
+        cache.error = None;
+        cache.sample.as_mut().unwrap().observed_at = 9879;
+        assert!(!recent_launch_sample(&cache, 10000));
+        cache.sample = Some(parse_response(&receipt(10000), 10000).unwrap());
+        cache.attempt = Some(Instant::now() - Duration::from_secs(16));
+        assert!(!recent_launch_sample(&cache, 10000));
+    }
+    #[test]
+    fn maps_only_platform_verdict_and_never_uses_local_wind_thresholds() {
+        let mut raw = receipt(10000);
+        let sample = parse_response(&raw, 10000).unwrap();
+        assert_eq!(assess(Some(&sample), None, 10000).0, "ok");
+        raw["windSpeed"] = json!(0.);
+        for (verdict, level) in [(1, "ok"), (2, "caution"), (3, "unsafe")] {
+            raw["airworthy"] = json!(verdict);
+            let sample = parse_response(&raw, 10000).unwrap();
+            assert_eq!(assess(Some(&sample), None, 10000).0, level);
+        }
+        assert_eq!(assess(Some(&sample), None, 10601).0, "unknown");
+        assert_eq!(assess(Some(&sample), Some("离线"), 10000).0, "unknown");
+    }
+    #[test]
+    fn rejects_wrong_device_schema_stale_and_missing_platform_data() {
+        for (key, value) in [("dockSn", json!("other")), ("projectId", json!("other")), ("adapterVersion", json!(0)),
+            ("airworthy", json!(0)), ("observedAt", json!(9879)), ("fetchedAt", json!(10001)),
+            ("windSpeed", Value::Null), ("rainfall", Value::Null), ("forecast", Value::Null), ("items", json!([]))] {
+            let mut raw = receipt(10000); raw[key] = value;
+            assert!(parse_response(&raw, 10000).is_err(), "{key}");
         }
     }
     #[test]
-    fn rain_wind_missing_and_stale_never_pass() {
-        let s = sample();
-        assert_eq!(assess(Some(&s), None, 10000).0, "ok");
-        for code in [51, 56, 57, 61, 66, 67, 71, 77, 80, 85, 95, 99] {
-            assert_eq!(
-                assess(
-                    Some(&Sample {
-                        weather_code: Some(code),
-                        ..s.clone()
-                    }),
-                    None,
-                    10000
-                )
-                .0,
-                "unsafe"
-            );
+    fn manual_confirmation_never_overrides_platform_prohibition_or_missing_data() {
+        for (level, allowed) in [("ok", true), ("caution", true), ("unsafe", false), ("unknown", false)] {
+            let view: View = serde_json::from_value(json!({"location":"机场","latitude":0.,"longitude":0.,"source":"DJI FlightHub 2",
+                "refreshing":false,"allowed":level=="ok","level":level,"label":"司空结论","reasons":[],"current":null})).unwrap();
+            assert_eq!(require_platform_not_prohibited(&view).is_ok(), allowed);
         }
-        for changed in [
-            Sample {
-                precipitation: Some(0.01),
-                ..s.clone()
-            },
-            Sample {
-                wind_speed: Some(12.),
-                ..s.clone()
-            },
-            Sample {
-                wind_gusts: Some(12.),
-                ..s.clone()
-            },
-            Sample {
-                wind_gusts: Some(7.),
-                ..s.clone()
-            },
-            Sample {
-                wind_speed: None,
-                ..s.clone()
-            },
-            Sample {
-                precipitation: None,
-                ..s.clone()
-            },
-            Sample {
-                wind_gusts: None,
-                ..s.clone()
-            },
-            Sample {
-                weather_code: Some(100),
-                ..s.clone()
-            },
-            Sample {
-                weather_code: Some(45),
-                ..s.clone()
-            },
-            Sample {
-                observed_at: 8000,
-                ..s.clone()
-            },
-            Sample {
-                observed_at: 10100,
-                ..s.clone()
-            },
-        ] {
-            assert_ne!(assess(Some(&changed), None, 10000).0, "ok");
-        }
-        assert_ne!(assess(Some(&s), None, 10601).0, "ok");
-        assert_ne!(assess(Some(&s), Some("离线"), 10000).0, "ok");
-        assert_ne!(assess(None, None, 10000).0, "ok");
-        assert_eq!(
-            assess(
-                Some(&Sample {
-                    wind_speed: Some(6.),
-                    wind_gusts: Some(6.),
-                    ..s
-                }),
-                None,
-                10000
-            )
-            .0,
-            "ok"
-        );
     }
     #[test]
-    fn wind_thresholds_apply_to_speed_and_gusts_and_cannot_be_overridden() {
-        for (speed, expected) in [(6.1, "ok"), (6.99, "ok"), (7., "caution"), (10.1, "caution"), (11.99, "caution"), (12., "unsafe"), (12.01, "unsafe")] {
-            for gusts in [false, true] {
-                let mut s = sample();
-                if gusts { s.wind_gusts = Some(speed); } else { s.wind_speed = Some(speed); }
-                assert_eq!(assess(Some(&s), None, 10000).0, expected, "speed={speed}, gusts={gusts}");
-                assert_eq!(require_wind_below_limit(Some(&s)).is_ok(), speed < 12.);
-            }
-        }
-        // A lower second reading must not downgrade the higher reading's prohibition.
-        assert_eq!(conditions(Some(0), Some(12.), Some(7.), Some(0.)).0, "unsafe");
-        assert_eq!(conditions(Some(0), Some(7.), Some(12.), Some(0.)).0, "unsafe");
-    }
-    #[test]
-    fn parser_rejects_units_and_preserves_missing_values() {
-        let mut raw = serde_json::json!({"current":{"time":10000,"wind_speed_10m":-1,"precipitation":null,"weather_code":0},"current_units":{"time":"unixtime","wind_speed_10m":"m/s","wind_gusts_10m":"m/s","precipitation":"mm"}});
-        let s = parse_response(&raw, 10000).unwrap();
-        assert!(s.precipitation.is_none());
-        assert!(s.wind_speed.is_none());
-        assert!(s.wind_gusts.is_none());
-        assert_eq!(assess(Some(&s), None, 10000).0, "unknown");
-        raw["current_units"]["wind_speed_10m"] = "km/h".into();
-        assert!(parse_response(&raw, 10000).is_err());
-    }
-    #[tokio::test]
-    #[ignore = "live Open-Meteo network check"]
-    async fn live_weather() {
-        let sample = fetch().await.expect("live weather request");
-        println!("{}", serde_json::to_string(&sample).unwrap());
-        assert!(
-            sample.wind_speed.is_some()
-                && sample.wind_gusts.is_some()
-                && sample.precipitation.is_some()
-        );
-        assert!(
-            (-60..=MAX_OBSERVATION_AGE).contains(&(Utc::now().timestamp() - sample.observed_at))
-        );
+    fn old_snapshots_still_deserialize_but_cannot_establish_a_live_verdict() {
+        let raw = json!({"observedAt":10000,"fetchedAt":10000,"windSpeed":0.,"weatherCode":0,"precipitation":0.});
+        let sample: Sample = serde_json::from_value(raw).unwrap();
+        assert_eq!(assess(Some(&sample), None, 10000).0, "unknown");
     }
 }

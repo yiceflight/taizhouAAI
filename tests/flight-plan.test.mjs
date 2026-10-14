@@ -113,7 +113,7 @@ test('route suffixes are ignored in the library, selected form and submission ch
   }
 });
 test('submission rejects other routes and ambiguous selected prefix matches',async()=>{
-  for (const route of ['南侧火点巡查航线', '备份-'+PLAN_RECIPE.route, '东南火点巡查航线（未验证）']) {
+  for (const route of ['南侧火点巡查航线', '备份-'+PLAN_RECIPE.route, '东南火点巡查航线', '东南火点巡查航线（已验证）-副本(6)', '东南火点巡查航线（未验证）']) {
     const f=fixture();await f.execute();f.document.querySelector('#selected-route').textContent=route;
     await assert.rejects(f.commit(), /指定航线已变化/);assert.equal(f.submissions(),0);
   }
@@ -186,7 +186,7 @@ test('status polling recovers a matching draft weather reason without submitting
     const {window,document}=parseHTML(`<input placeholder="请输入计划名称" value="${name}"><div role="dialog"><div class="plan-app-ant-modal-body">执行设备 泰州环境监测 因天气原因：在线天气风速： 12.75m/s</div><button>执行</button></div>`);
     window.HTMLElement.prototype.getClientRects=()=>[1];
     for(const element of document.querySelectorAll('*')) element.click=()=>{throw Error('read-only polling must not click')};
-    const stored={[`flight-${job.eventId}`]:42,[`flight-monitor-${job.eventId}`]:43};
+    const stored={[`flight-${job.eventId}`]:42,['flight-monitor-tab']:43};
     const calls=[];
     const chrome={storage:{local:{get:async key=>({[key]:stored[key]})}},tabs:{get:async id=>({id,status:'complete',url:id===42?PLAN_URL+'/create-plan':PLAN_URL})},debugger:{sendCommand:async(target,method,args)=>{
       calls.push(target.tabId);
@@ -306,4 +306,39 @@ test('a finished row briefly appearing in both tabs does not lose its receipt', 
   window.HTMLElement.prototype.getClientRects = () => [1];
   const result = await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() });
   assert.equal(result.status, '执行成功');
+});
+
+test('status lookup clears stale dates and finds a completed flight on the second page', async () => {
+  const { window, document } = parseHTML(`<button role="tab">已结束</button><span class="ant-calendar-picker"><input placeholder="开始日期" value="2026-09-01"><i class="ant-calendar-picker-clear"></i></span><table><tbody></tbody></table><li class="ant-pagination-next" title="下一页"></li><li class="ant-pagination-prev" title="上一页" aria-disabled="true"></li>`);
+  window.HTMLElement.prototype.getClientRects = () => [1];
+  let page = 1, cleared = false;
+  const next = document.querySelector('.ant-pagination-next'), previous = document.querySelector('.ant-pagination-prev');
+  const render = () => {
+    document.querySelector('tbody').innerHTML = `<tr><td><span>${page === 2 ? job.name : '其他计划'}</span></td><td><span>执行成功</span></td></tr>`;
+    next.setAttribute('aria-disabled', String(page === 2)); previous.setAttribute('aria-disabled', String(page === 1));
+  };
+  next.onclick = () => { page++; render(); }; previous.onclick = () => { page--; render(); };
+  document.querySelector('i').onclick = () => { document.querySelector('input').value = ''; cleared = true; };
+  render();
+  const run = () => runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() });
+  assert.equal((await run()).status, '执行成功'); assert.equal(cleared, true);
+  assert.equal((await run()).status, '执行成功'); // retained last page resets correctly
+});
+
+test('status lookup refuses duplicate names across pages instead of releasing the task', async () => {
+  const { window, document } = parseHTML(`<button role="tab">已结束</button><table><tbody></tbody></table><li class="ant-pagination-next" title="下一页"></li>`);
+  window.HTMLElement.prototype.getClientRects = () => [1];
+  const row = extra => `<tr><td><span>${job.name}</span></td><td><span>执行成功</span></td><td>${extra}</td></tr>`;
+  document.querySelector('tbody').innerHTML = row('first');
+  document.querySelector('li').onclick = () => { document.querySelector('tbody').innerHTML = row('second'); document.querySelector('li').setAttribute('aria-disabled', 'true'); };
+  await assert.rejects(runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() }), /不唯一/);
+});
+
+test('status search replaces a stale search term with the exact target plan', async () => {
+  const { window, document } = parseHTML('<button role="tab">已结束</button><input placeholder="按航线或计划名搜索" value="旧计划"><table><tbody></tbody></table>');
+  window.HTMLElement.prototype.getClientRects = () => [1];
+  const input = document.querySelector('input');
+  input.addEventListener('keydown', () => { document.querySelector('tbody').innerHTML = `<tr><td><span>${input.value}</span></td><td><span>执行成功</span></td></tr>`; });
+  const result = await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, HTMLInputElement: window.HTMLInputElement, Event: window.Event, KeyboardEvent: window.Event, setTimeout: fn => fn() });
+  assert.equal(input.value, job.name); assert.equal(result.status, '执行成功');
 });

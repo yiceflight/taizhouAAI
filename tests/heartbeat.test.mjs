@@ -1,0 +1,81 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { readFile } from 'node:fs/promises';
+const source = await readFile(new URL('../extension/src/service-worker.js', import.meta.url), 'utf8');
+const loop = source.slice(source.indexOf('async function bridgeTabs()'), source.indexOf('\nfunction start()'));
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+function fixture(post, capture, now = Date.now) {
+  const context = vm.createContext({
+    chrome: { runtime: { getManifest: () => ({ version: '0.7.17' }) }, tabs: { query: async () => [] }, action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {}, setTitle: async () => {} } },
+    SITE_PATTERNS: [], allowedUrl: () => true, debuggerSession: { maintain: async () => {} },
+    prioritizeHealthJobs: jobs => jobs, post, capture, Date: { now },
+  });
+  vm.runInContext('let polling = false, rerunRequested = false, keepingAlive = false, keepAliveSupported = false;\n' + loop, context);
+  return () => vm.runInContext('heartbeat()', context);
+}
+
+test('long-running work keeps renewing the lease without claiming or executing concurrent jobs', async () => {
+  const entered = deferred(), release = deferred();
+  let started = false, busyBeats = 0, captures = 0, elapsed = 0;
+  const run = fixture(async (path, body) => {
+    if (path !== 'heartbeat') return {};
+    if (body.busy) { busyBeats++; return { jobs: [] }; }
+    if (started) return { jobs: [] };
+    started = true; return { keepAliveSupported: true, jobs: [{ id: 'one', type: 'capture', tabId: 1 }] };
+  }, async () => { captures++; entered.resolve(); await release.promise; return {}; }, () => elapsed);
+  const pending = run(); await entered.promise;
+  for (let i = 0; i < 20; i++) { elapsed += 5000; await run(); }
+  assert.equal(elapsed, 100000); assert.equal(busyBeats, 20); assert.equal(captures, 1);
+  release.resolve(); await pending;
+});
+
+test('a rejected completion does not discard the remaining batch or replay the first task', async () => {
+  const executed = [], completed = [];
+  const run = fixture(async (path, body) => {
+    if (path === 'heartbeat') return { jobs: [1, 2].map(id => ({ id, type: 'capture', tabId: id })) };
+    completed.push(body.id);
+    if (body.id === 1) throw new Error('404: expired receipt');
+    return {};
+  }, async id => { executed.push(id); return {}; });
+  await run();
+  assert.deepEqual(executed, [1, 2]); assert.deepEqual(completed, [1, 2]);
+});
+
+test('expired queued work is never executed', async () => {
+  let calls = 0;
+  const run = fixture(async () => ({ jobs: [{ id: 1, type: 'capture', tabId: 1, expiresAt: 100 }] }), async () => { calls++; }, () => 101);
+  await run(); assert.equal(calls, 0);
+});
+
+test('an older server cannot accidentally deliver and lose jobs through a keepalive request', async () => {
+  const entered = deferred(), release = deferred();
+  let posts = 0;
+  const run = fixture(async path => {
+    if (path !== 'heartbeat') return {};
+    posts++;
+    return { jobs: posts === 1 ? [{ id: 1, type: 'capture', tabId: 1 }] : [] };
+  }, async () => { entered.resolve(); await release.promise; return {}; });
+  const pending = run(); await entered.promise;
+  await run(); assert.equal(posts, 1);
+  release.resolve(); await pending;
+});
+
+test('single-job protocol asks native scheduling again immediately after completion', async () => {
+  const done = deferred();
+  const executed = [], completed = [];
+  let claims = 0;
+  const run = fixture(async (path, body) => {
+    if (path === 'heartbeat') {
+      assert.equal(body.singleJob, true);
+      claims++;
+      if (claims > 2) { done.resolve(); return { singleJobSupported: true, jobs: [] }; }
+      assert.equal(completed.length, claims - 1);
+      return { singleJobSupported: true, jobs: [{ id: claims, type: 'capture', tabId: claims }] };
+    }
+    completed.push(body.id); return {};
+  }, async id => { executed.push(id); return {}; });
+  await run(); await done.promise;
+  assert.deepEqual(executed, [1, 2]);
+  assert.deepEqual(completed, [1, 2]);
+});

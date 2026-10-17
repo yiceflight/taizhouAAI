@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { version as configuredVersion } from "../../src-tauri/tauri.conf.json";
 import { checkForAppUpdate, type AppUpdateProgress, type AvailableAppUpdate } from "../lib/appUpdater";
 
@@ -8,6 +8,13 @@ const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 export function UpdateBanner() {
+  const [testEnvironment, setTestEnvironment] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (isTauri()) void invoke<boolean>("is_test_environment").then(value => { if (alive) setTestEnvironment(value); }).catch(() => { /* Keep updates disabled until the runtime environment is known. */ });
+    else setTestEnvironment(import.meta.env.DEV);
+    return () => { alive = false; };
+  }, []);
   const [version, setVersion] = useState(configuredVersion);
   const [update, setUpdate] = useState<AvailableAppUpdate | null>(null);
   const [progress, setProgress] = useState<AppUpdateProgress | null>(null);
@@ -19,10 +26,10 @@ export function UpdateBanner() {
   const mounted = useRef(false);
   const currentUpdate = useRef<AvailableAppUpdate | null>(null);
   const nextAutoCheck = useRef(0);
-  const automatic = import.meta.env.PROD && isTauri();
+  const automatic = testEnvironment === false && import.meta.env.PROD && isTauri();
 
   const checkUpdate = useCallback(async (background = false) => {
-    if (busy.current || currentUpdate.current) return;
+    if (testEnvironment !== false || busy.current || currentUpdate.current) return;
     if (!isTauri()) {
       setMessage("请在客户端检查更新");
       return;
@@ -53,7 +60,7 @@ export function UpdateBanner() {
       busy.current = false;
       if (mounted.current) setChecking(false);
     }
-  }, []);
+  }, [testEnvironment]);
 
   useEffect(() => {
     mounted.current = true;
@@ -106,6 +113,8 @@ export function UpdateBanner() {
   const installLabel = progress?.phase === "installing" ? "安装并重启中…"
     : installing ? `下载中${percent === null ? "…" : ` ${percent}%`}` : "下载并重启";
 
+  if (testEnvironment === true) return <div className="update-status"><span className="app-version">测试版客户端 v{version}</span><span>独立数据与桥接端口 · 复用当前 Chrome · 不接收正式版更新</span></div>;
+
   return <div className="update-status">
     <span className="app-version">当前客户端 v{version}</span>
     {(!update || message) && <span className={`update-message${error ? " error" : ""}`} role="status" title={message}>
@@ -115,6 +124,6 @@ export function UpdateBanner() {
       <span className="update-install-icon" aria-hidden="true">↻</span>
       <span>有新版本 v{update.latestVersion}，{installLabel}</span>
     </button>
-      : <button className="update-action" disabled={checking} onClick={() => void checkUpdate()}>{checking ? "正在检查…" : "检查更新"}</button>}
+      : <button className="update-action" disabled={checking || testEnvironment === null} onClick={() => void checkUpdate()}>{checking ? "正在检查…" : "检查更新"}</button>}
   </div>;
 }

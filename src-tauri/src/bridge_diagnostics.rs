@@ -1,6 +1,6 @@
 use crate::bridge::{Bridge, BridgeStatus, ADDRESS, ORIGIN};
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::Manager;
 
 #[derive(Debug, Serialize)]
@@ -120,9 +120,9 @@ async fn probe(address: &str, origin: &str, instance_id: &str) -> Vec<Check> {
     vec![tcp, service]
 }
 
-fn plugin_check(snapshot: &BridgeStatus) -> Check {
-    if !snapshot.connected {
-        return Check::new("plugin", "浏览器插件心跳", "warning", "未收到有效插件心跳，无法据此判断插件是否已安装", "若本机服务通过：打开 Chrome 扩展管理页，确认插件已启用、ID 与下方一致，并重新加载当前 App 提供的插件目录；查看插件的“错误”和 Service Worker。App 内的端口检测不能证明 Chrome 到 App 的请求未被拦截。");
+fn plugin_check(snapshot: &BridgeStatus, fresh_heartbeat: bool) -> Check {
+    if !fresh_heartbeat || !snapshot.connected {
+        return Check::new("plugin", "浏览器插件心跳", "warning", "本次诊断等待 35 秒，未收到新的插件心跳；历史心跳不作为通过依据，无法据此判断插件是否已安装", "若已删除插件，请重新安装；否则打开 Chrome 扩展管理页，确认插件已启用、ID 与下方一致，并检查插件错误和 Service Worker。App 内的端口检测不能证明 Chrome 到 App 的请求未被拦截。");
     }
     if snapshot
         .versions
@@ -137,7 +137,7 @@ fn plugin_check(snapshot: &BridgeStatus) -> Check {
             "浏览器插件心跳",
             "fail",
             format!("检测到 {} 个插件会话", snapshot.clients),
-            "只保留一个工作浏览器配置中的桥接插件会话；关闭多余会话后，等待约 75 秒再诊断。",
+            "只保留一个当前 Chrome 中的桥接插件会话；关闭多余会话后，等待约 75 秒再诊断。",
         );
     }
     Check::new(
@@ -145,7 +145,7 @@ fn plugin_check(snapshot: &BridgeStatus) -> Check {
         "浏览器插件心跳",
         "pass",
         format!(
-            "收到插件 v{} 的有效心跳；网站登录状态请查看网站验证",
+            "本次诊断开始后收到插件 v{} 的新心跳；网站登录状态请查看网站验证",
             snapshot.versions.join("、")
         ),
         "",
@@ -154,8 +154,14 @@ fn plugin_check(snapshot: &BridgeStatus) -> Check {
 
 #[tauri::command]
 pub async fn diagnose_bridge(app: tauri::AppHandle) -> Diagnostics {
+    let started = Instant::now();
     let bridge = app.state::<Bridge>().inner().clone();
     let mut checks = probe(ADDRESS, ORIGIN, &bridge.instance_id()).await;
+    // The extension polls every 5 seconds, with a 30-second alarm fallback.
+    // A cached 75-second lease cannot establish presence after an uninstall.
+    let fresh_heartbeat = bridge
+        .wait_for_heartbeat(started, Duration::from_secs(35))
+        .await;
     let snapshot = bridge.status();
     if let Some(error) = &snapshot.error {
         checks.push(Check::new(
@@ -177,12 +183,12 @@ pub async fn diagnose_bridge(app: tauri::AppHandle) -> Diagnostics {
         Ok(path) => Check::new("files", "随 App 附带的插件目录", "pass", format!("目录和入口文件可读取：{}", path.display()), "此项不能确认 Chrome 实际加载的是这个目录。"),
         Err(error) => Check::new("files", "随 App 附带的插件目录", "fail", error, "检查安装目录是否被移动、删除或被安全软件隔离；必要时重新安装客户端，再按指引加载插件。"),
     });
-    checks.push(plugin_check(&snapshot));
+    checks.push(plugin_check(&snapshot, fresh_heartbeat));
     Diagnostics {
         checked_at: chrono::Utc::now().to_rfc3339(),
         app_version: app.package_info().version.to_string(),
         platform: std::env::consts::OS,
-        channel: if tauri::is_dev() {
+        channel: if crate::environment::IS_TEST {
             "开发版"
         } else {
             "正式版"
@@ -260,16 +266,21 @@ mod tests {
             tabs: vec![],
             error: None,
         };
-        let check = plugin_check(&snapshot);
+        let check = plugin_check(&snapshot, false);
         assert_eq!(check.state, "warning");
         assert!(check.detail.contains("无法据此判断插件是否已安装"));
         snapshot.connected = true;
         snapshot.clients = 1;
         snapshot.versions = vec!["0.1.0".into()];
-        assert_eq!(plugin_check(&snapshot).state, "fail");
+        assert_eq!(plugin_check(&snapshot, true).state, "fail");
         snapshot.versions = vec![crate::readiness::MIN_VERSION.into()];
-        assert_eq!(plugin_check(&snapshot).state, "pass");
+        assert_eq!(plugin_check(&snapshot, true).state, "pass");
+        assert_eq!(
+            plugin_check(&snapshot, false).state,
+            "warning",
+            "a cached lease is not a fresh heartbeat"
+        );
         snapshot.clients = 2;
-        assert_eq!(plugin_check(&snapshot).state, "fail");
+        assert_eq!(plugin_check(&snapshot, true).state, "fail");
     }
 }

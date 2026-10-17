@@ -4,7 +4,9 @@ import { runInNewContext } from 'node:vm';
 import { parseHTML } from 'linkedom';
 import { evaluationValue } from '../extension/src/bridge-core.js';
 import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue } from '../extension/src/flight-plan.js';
-const job = { type: 'dji-prepare', submit: false, eventId: '00000000-0000-4000-8000-000000000001', name: '钾离子超标巡查-20260922-09' };
+const TEST_ROUTE = '东南火点巡查航线-改';
+const TEST_RECIPE = { ...PLAN_RECIPE, route: TEST_ROUTE };
+const job = { type: 'dji-prepare', submit: false, eventId: '00000000-0000-4000-8000-000000000001', name: '钾离子超标巡查-20260922-09', route: TEST_ROUTE };
 test('flight status reads the actual ended tab and progress-suffixed status', async () => {
   const { window, document } = parseHTML(`<html><body><button id="open">未完成</button><button id="done">已结束</button><table><tbody></tbody></table></body></html>`);
   window.HTMLElement.prototype.getClientRects = () => [1];
@@ -28,6 +30,7 @@ test('flight status reads the actual ended tab and progress-suffixed status', as
 });
 test('flight task cannot enable submission or choose arbitrary recipe inputs', () => {
   validatePlanJob(job);
+  assert.throws(() => validatePlanJob({ ...job, route: '' }));
   for (const change of [{ submit:true }, {submit:undefined}, {type:'submit'}, {name:'任意名称'}, {eventId:'invalid'}]) assert.throws(() => validatePlanJob({...job,...change}));
 });
 test('active FlightHub task labels normalize to the client status without accepting unrelated text', async () => {
@@ -45,11 +48,11 @@ test('active FlightHub task labels normalize to the client status without accept
 });
 test('wrong project and login redirects fail before reading or changing the page', async () => {
   for (const url of ['https://fh.dji.com/login', PLAN_URL.replace('c7ea6bbc','aaaaaaaa'), 'https://evil.test']) {
-    await assert.rejects(runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(PLAN_RECIPE)},${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, {location:{href:url}, Date, get document(){throw Error('must not read DOM');}}), /页面不匹配/);
+    await assert.rejects(runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, {location:{href:url}, Date, get document(){throw Error('must not read DOM');}}), /页面不匹配/);
   }
 });
 function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, baseRoute=false, submit=false, name=job.name,
-  libraryRoute=PLAN_RECIPE.route, selectedRoute=`${PLAN_RECIPE.route}-副本(2)`, previewRoute=null, submissionDialog=null, dialogDelay=0,
+  libraryRoute=TEST_ROUTE, selectedRoute=`${TEST_ROUTE}-副本(2)`, previewRoute=null, submissionDialog=null, dialogDelay=0,
   receiptRows=1, deviceCard=false, fastClock=false }={}) {
   const buttons = ['普通任务','高精度 RTK','立即','返航'].map(s=>`<button>${s}</button>`).join('');
   const switches = ['多模态识别','自动断点续飞','智能规划最佳返航路线'].map(s=>`<div><span>${s}</span><button role="switch" aria-checked="true"></button></div>`).join('');
@@ -78,9 +81,9 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   for(const label of ['普通任务','高精度 RTK','立即','返航']) btn(label).onclick=e=>e.currentTarget.className='button-primary';
   for(const el of document.querySelectorAll('[role="switch"]')) el.onclick=()=>el.setAttribute('aria-checked',el.getAttribute('aria-checked')==='true'?'false':'true');
   btn('选择航线').onclick=()=>{
-    const library=document.createElement('aside'); library.innerHTML=`<h2>航线库</h2><section><div class="route"><span>${libraryRoute}</span></div>${ambiguous?`<div class="route"><span>${PLAN_RECIPE.route}-副本(99)</span></div>`:''}</section>`;document.body.append(library);
+    const library=document.createElement('aside'); library.innerHTML=`<h2>航线库</h2><section><div class="route"><span>${libraryRoute}</span></div>${ambiguous?`<div class="route"><span>${TEST_ROUTE}-副本(99)</span></div>`:''}</section>`;document.body.append(library);
     if (previewRoute) { const preview=document.createElement('aside'); preview.textContent=previewRoute; preview.onclick=()=>{throw Error('must not click a preview title')}; document.body.append(preview); }
-    library.querySelector('.route span').onclick=()=>{document.querySelector('input[placeholder]').value='新建计划30';document.querySelector('#selected-route').textContent=baseRoute?PLAN_RECIPE.route:selectedRoute;library.remove()};
+    library.querySelector('.route span').onclick=()=>{document.querySelector('input[placeholder]').value='新建计划30';document.querySelector('#selected-route').textContent=baseRoute?TEST_ROUTE:selectedRoute;library.remove()};
   };
   btn('选择设备').onclick=()=>{
     const devices=document.createElement('aside');devices.innerHTML=`<div><span>Dock 3</span><span>泰州环境监测</span><span>Matrice 4TD</span></div>`;document.body.append(devices);
@@ -93,7 +96,7 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   if(confirmOnly) btn('普通任务').setAttribute('type','submit');
   if(changedHeight) document.querySelector('#height').addEventListener('change',e=>e.target.value='60');
   let clock=0;
-  const run=(commit)=>runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(PLAN_RECIPE)},${JSON.stringify(name)},${JSON.stringify(PLAN_URL)},${commit},(${readFlightSubmissionIssue.toString()}))`, { document, location, HTMLInputElement:window.HTMLInputElement, Event:window.Event, Date:fastClock?{now:()=>clock}:Date, setTimeout:fastClock?(fn,ms)=>{clock+=ms;fn()}:setTimeout, getComputedStyle:()=>({visibility:'visible'}) });
+  const run=(commit)=>runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(name)},${JSON.stringify(PLAN_URL)},${commit},(${readFlightSubmissionIssue.toString()}))`, { document, location, HTMLInputElement:window.HTMLInputElement, Event:window.Event, Date:fastClock?{now:()=>clock}:Date, setTimeout:fastClock?(fn,ms)=>{clock+=ms;fn()}:setTimeout, getComputedStyle:()=>({visibility:'visible'}) });
   const execute=async()=>{const draft=await run(false); return submit?run(true):draft;};
   return {execute,prepare:()=>run(false),commit:()=>run(true),document,submissions:()=>submissions,followupExecutions:()=>followupExecutions};
 }
@@ -103,22 +106,22 @@ test('video recipe fills and verifies the form without ever clicking final confi
 test('original route name is accepted when the platform omits its temporary copy suffix',async()=>{const f=fixture({baseRoute:true});assert.equal((await f.execute()).status,'ready');assert.equal(f.submissions(),0)});
 test('route suffixes are ignored in the library, selected form and submission checks', async()=>{
   for (const suffix of ['-副本(6)', '-副本(27)', '-新版', '']) {
-    const route=PLAN_RECIPE.route+suffix;
-    const f=fixture({submit:true,libraryRoute:route,selectedRoute:route,previewRoute:PLAN_RECIPE.route});
+    const route=TEST_ROUTE+suffix;
+    const f=fixture({submit:true,libraryRoute:route,selectedRoute:route,previewRoute:TEST_ROUTE});
     assert.equal((await f.prepare()).status,'ready');assert.equal(f.submissions(),0);
     // The platform may replace the copy number again before submission.
-    f.document.querySelector('#selected-route').textContent=PLAN_RECIPE.route+'-副本(100)';
+    f.document.querySelector('#selected-route').textContent=TEST_ROUTE+'-副本(100)';
     assert.equal((await f.commit()).status,'submitted');
     assert.equal(f.submissions(),1);
   }
 });
 test('submission rejects other routes and ambiguous selected prefix matches',async()=>{
-  for (const route of ['南侧火点巡查航线', '备份-'+PLAN_RECIPE.route, '东南火点巡查航线', '东南火点巡查航线（已验证）-副本(6)', '东南火点巡查航线（未验证）']) {
+  for (const route of ['南侧火点巡查航线', '备份-'+TEST_ROUTE, '东南火点巡查航线', '东南火点巡查航线（已验证）-副本(6)', '东南火点巡查航线（未验证）']) {
     const f=fixture();await f.execute();f.document.querySelector('#selected-route').textContent=route;
     await assert.rejects(f.commit(), /指定航线已变化/);assert.equal(f.submissions(),0);
   }
   const f=fixture();await f.execute();
-  f.document.querySelector('#selected-route').innerHTML=`<span>${PLAN_RECIPE.route}-副本(6)</span><span>${PLAN_RECIPE.route}-副本(7)</span>`;
+  f.document.querySelector('#selected-route').innerHTML=`<span>${TEST_ROUTE}-副本(6)</span><span>${TEST_ROUTE}-副本(7)</span>`;
   await assert.rejects(f.commit(), /已选航线不唯一/);assert.equal(f.submissions(),0);
 });
 test('ambiguous routes, submission controls and rejected height values fail closed',async()=>{
@@ -127,6 +130,7 @@ test('ambiguous routes, submission controls and rejected height values fail clos
 
 test('explicit submission accepts only a real mission and clicks exactly once after validation', async () => {
   validateSubmitJob({...job,type:'dji-submit',submit:true});
+  assert.throws(() => validateSubmitJob({...job,type:'dji-submit',submit:true,route:''}));
   for (const change of [{submit:false}, {name:'司空填写演练-20260922-09'}, {eventId:'wrong'}, {type:'dji-prepare'}]) assert.throws(()=>validateSubmitJob({...job,type:'dji-submit',submit:true,...change}));
   const f=fixture({submit:true}); const receipt=await f.execute();
   assert.equal(f.submissions(),1); assert.equal(receipt.status,'submitted'); assert.equal(receipt.submitted,true);

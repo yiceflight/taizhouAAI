@@ -1,18 +1,19 @@
 {
   "name": "taizhou-aai",
   "private": true,
-  "version": "0.2.6",
+  "version": "0.2.7",
   "type": "module",
   "scripts": {
     "dev": "node scripts/free-dev-ports.mjs && vite",
-    "dev:client": "tauri dev",
+    "dev:client": "tauri dev --config src-tauri/tauri.test.conf.json",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "oss:setup": "node scripts/setup-oss.mjs",
     "oss:publish": "node scripts/publish-updater.mjs",
     "test": "node --test tests/*.test.mjs",
-    "test:ui": "vitest run tests/*.test.tsx"
+    "test:ui": "vitest run tests/*.test.tsx",
+    "build:test-client": "tauri build --config src-tauri/tauri.test.conf.json --features test-environment"
   },
   "dependencies": {
     "@radix-ui/react-select": "^2.3.7",

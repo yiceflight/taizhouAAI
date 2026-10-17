@@ -4,8 +4,8 @@ import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { UpdateBanner } from '../src/components/UpdateBanner';
 
-const api = vi.hoisted(() => ({ check: vi.fn(), isTauri: vi.fn(() => true) }));
-vi.mock('@tauri-apps/api/core', () => ({ isTauri: api.isTauri }));
+const api = vi.hoisted(() => ({ check: vi.fn(), invoke: vi.fn(), isTauri: vi.fn(() => true) }));
+vi.mock('@tauri-apps/api/core', () => ({ isTauri: api.isTauri, invoke: api.invoke }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: async () => '0.2.0' }));
 vi.mock('../src/lib/appUpdater', () => ({ checkForAppUpdate: api.check }));
 let root: Root;
@@ -21,6 +21,7 @@ beforeEach(() => {
   vi.stubGlobal('document', window.document);
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   root = createRoot(document.getElementById('root')!);
+  api.invoke.mockReset().mockResolvedValue(false);
   api.check.mockReset().mockResolvedValue(null);
   api.isTauri.mockReturnValue(true);
 });
@@ -109,4 +110,26 @@ it('does not automatically check in development or browser previews', async () =
   await event('online');
   await advance(6 * 60 * 60_000);
   expect(api.check).not.toHaveBeenCalled();
+});
+
+
+it('test packages never check or offer production updates even with a production frontend build', async () => {
+  api.invoke.mockResolvedValue(true);
+  await mount();
+  await event('focus');
+  await event('online');
+  await advance(6 * 60 * 60_000);
+  expect(document.body.textContent).toContain('测试版客户端');
+  expect(document.body.textContent).toContain('不接收正式版更新');
+  expect(document.querySelector('.update-action')).toBeNull();
+  expect(api.check).not.toHaveBeenCalled();
+});
+
+it('does not contact update services before the native environment is known', async () => {
+  api.invoke.mockImplementation(() => new Promise(() => {}));
+  await mount();
+  await event('online');
+  await advance(6 * 60 * 60_000);
+  expect(api.check).not.toHaveBeenCalled();
+  expect(document.querySelector<HTMLButtonElement>('.update-action')?.disabled).toBe(true);
 });

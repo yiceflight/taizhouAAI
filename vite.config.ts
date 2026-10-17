@@ -7,6 +7,8 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(() => ({
   plugins: [react()],
+  // Scan actual dev entry points, not generated packages or saved QA pages.
+  optimizeDeps: { entries: ["index.html", "tests/fixtures/*.html"] },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

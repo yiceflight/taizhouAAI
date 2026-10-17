@@ -98,4 +98,16 @@ describe('automatic workspace startup', () => {
     await tick();
     expect(start).not.toHaveBeenCalled();
   });
+
+  it('starts a fresh initial sync after local data is cleared', async () => {
+    state = { ...state, ready:true };
+    await mount();
+    await tick();
+    expect(start).toHaveBeenCalledTimes(1);
+
+    state = { ...state, started:false };
+    await act(async () => current.resetStartup());
+    await tick();
+    expect(start).toHaveBeenCalledTimes(2);
+  });
 });

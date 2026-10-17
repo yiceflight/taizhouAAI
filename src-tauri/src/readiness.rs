@@ -38,6 +38,13 @@ pub struct Readiness {
     pub started: AtomicBool,
 }
 impl Readiness {
+    pub(crate) fn reset_workspace(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        self.site_open_attempted
+            .iter()
+            .for_each(|attempted| attempted.store(false, Ordering::SeqCst));
+    }
+
     fn reserve_site_open(&self, id: &str, missing: bool) -> bool {
         SITES
             .iter()
@@ -97,7 +104,8 @@ fn plugin(bridge: &crate::bridge::BridgeStatus) -> (bool, String) {
     if !bridge.connected {
         return (
             false,
-            "未收到插件连接，请保持 Chrome 运行，并查看本机连接诊断；此状态不代表插件未安装。".into(),
+            "未收到插件连接，请保持 Chrome 运行，并查看本机连接诊断；此状态不代表插件未安装。"
+                .into(),
         );
     }
     if bridge.versions.iter().any(|v| !compatible(v)) {
@@ -150,7 +158,7 @@ fn evaluate(
     started: bool,
     checking: bool,
 ) -> View {
-    let (plugin_ready, plugin_message) = plugin(&bridge);
+    let (plugin_ready, plugin_message) = plugin(bridge);
     let sites: Vec<_> = SITES
         .iter()
         .map(|(id, origin)| {
@@ -158,6 +166,13 @@ fn evaluate(
                 return empty(id, "blocked", "等待插件连接后检测");
             }
             if let Some(cached) = cache.iter().find(|c| c.health.id == *id) {
+                // Keep the last known result visible while a fresh pass is in
+                // flight. The individual site result replaces it as soon as
+                // that site's request completes, so a temporary tab reload
+                // cannot make a previously verified row flash to "验证中".
+                if checking {
+                    return cached.health.clone();
+                }
                 if cached.health.state == "error"
                     && cached.health.tab_id.is_none()
                     && cached.at.elapsed() < MAX_AGE
@@ -186,7 +201,10 @@ fn evaluate(
         ready: plugin_ready && sites.iter().all(|s| s.state == "ready"),
         monitoring_ready: plugin_ready && sites.iter().any(|s| s.id == "map" && s.state == "ready"),
         flight_ready: plugin_ready && sites.iter().any(|s| s.id == "dji" && s.state == "ready"),
-        report_ready: plugin_ready && ["dji", "sniff"].iter().all(|id| sites.iter().any(|s| s.id == *id && s.state == "ready")),
+        report_ready: plugin_ready
+            && ["dji", "sniff"]
+                .iter()
+                .all(|id| sites.iter().any(|s| s.id == *id && s.state == "ready")),
         plugin_ready,
         plugin_update_required: bridge.connected && bridge.versions.iter().any(|v| !compatible(v)),
         minimum_extension_version: MIN_VERSION,
@@ -213,31 +231,63 @@ pub fn require_started(app: &tauri::AppHandle) -> Result<(), String> {
     }
     Ok(())
 }
-fn check_capability(state: &View, available: bool, started: bool, message: &str) -> Result<(), String> {
-    if !state.plugin_ready { return Err(state.plugin_message.clone()); }
-    if !available { return Err(message.into()); }
-    if started && !state.started { return Err("请先完成首批数据读取并开始监测。".into()); }
+fn check_capability(
+    state: &View,
+    available: bool,
+    started: bool,
+    message: &str,
+) -> Result<(), String> {
+    if !state.plugin_ready {
+        return Err(state.plugin_message.clone());
+    }
+    if !available {
+        return Err(message.into());
+    }
+    if started && !state.started {
+        return Err("请先完成首批数据读取并开始监测。".into());
+    }
     Ok(())
 }
 pub fn require_monitoring(app: &tauri::AppHandle, started: bool) -> Result<(), String> {
     let state = view(app);
-    check_capability(&state, state.monitoring_ready, started, "请先完成江苏大气站的登录和可用性验证。")
+    check_capability(
+        &state,
+        state.monitoring_ready,
+        started,
+        "请先完成江苏大气站的登录和可用性验证。",
+    )
 }
 pub fn require_flight(app: &tauri::AppHandle) -> Result<(), String> {
     let state = view(app);
-    check_capability(&state, state.flight_ready, true, "请先完成司空的登录和可用性验证。")
+    check_capability(
+        &state,
+        state.flight_ready,
+        true,
+        "请先完成司空的登录和可用性验证。",
+    )
 }
 pub fn require_report(app: &tauri::AppHandle) -> Result<(), String> {
     let state = view(app);
-    check_capability(&state, state.report_ready, false, "请先完成司空和可飞的登录和可用性验证。")
+    check_capability(
+        &state,
+        state.report_ready,
+        false,
+        "请先完成司空和可飞的登录和可用性验证。",
+    )
 }
 // Photo-only reports depend on FlightHub and the bridge, not monitoring or Airins.
 pub fn require_report_media(app: &tauri::AppHandle) -> Result<(), String> {
     check_report_media(view(app))
 }
 fn check_report_media(state: View) -> Result<(), String> {
-    if !state.plugin_ready { return Err(state.plugin_message); }
-    if !state.sites.iter().any(|site| site.id == "dji" && site.state == "ready") {
+    if !state.plugin_ready {
+        return Err(state.plugin_message);
+    }
+    if !state
+        .sites
+        .iter()
+        .any(|site| site.id == "dji" && site.state == "ready")
+    {
         return Err("请先登录司空媒体库并完成可用性验证。".into());
     }
     Ok(())
@@ -260,13 +310,18 @@ pub async fn refresh(app: &tauri::AppHandle) -> Result<(), String> {
         state.sites.lock().unwrap().clear();
         return Ok(());
     }
-    // Queue all checks before waiting for the next extension heartbeat. The
-    // extension still executes them serially, preserving its single CDP lock.
-    tokio::join!(
-        check_site(app, &snapshot, SITES[2]),
-        check_site(app, &snapshot, SITES[0]),
-        check_site(app, &snapshot, SITES[1]),
-    );
+    // Site checks remain serial. Queueing all three at once starts their
+    // expiry clocks together; a later check can then spend most of its
+    // 120-second lease waiting behind the earlier checks and be discarded as
+    // expired. Report media jobs have a separate bounded parallel path.
+    for site in [SITES[2], SITES[0], SITES[1]] {
+        // A background page can finish loading while the previous site's
+        // request is running. Refresh the tab inventory before each site so
+        // that a stale `loading` snapshot cannot be written back as
+        // `unchecked` after the page is already usable.
+        let latest = bridge.status();
+        check_site(app, &latest, site).await;
+    }
     Ok(())
 }
 async fn check_site(
@@ -412,8 +467,12 @@ pub fn start(app: tauri::AppHandle) {
                     || current.sites.iter().any(|s| s.state == "unchecked"))
             {
                 let _ = refresh(&app).await;
-                next_check =
-                    Instant::now() + Duration::from_secs(if view(&app).ready { 45 } else { 10 });
+                // A site check can take up to ~35 seconds while a background
+                // page loads and its authenticated API is read. Retrying a
+                // not-yet-ready workspace every 10 seconds needlessly starts
+                // another long serial pass and makes the UI oscillate.
+                next_check = Instant::now()
+                    + Duration::from_secs(if view(&app).ready { 45 } else { 30 });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -434,15 +493,39 @@ pub async fn check_readiness(app: tauri::AppHandle) -> Result<View, String> {
 }
 #[tauri::command]
 pub async fn start_workspace(app: tauri::AppHandle) -> Result<(), String> {
-    require_monitoring(&app, false)?;
+    crate::runtime_log::record(
+        &app,
+        "info",
+        "app",
+        "workspace.start_requested",
+        "开始启动监测工作台",
+        serde_json::json!({}),
+    );
+    let result = start_workspace_inner(&app).await;
+    crate::runtime_log::record(
+        &app,
+        if result.is_ok() { "info" } else { "error" },
+        "app",
+        "workspace.start_finished",
+        if result.is_ok() {
+            "监测工作台已启动"
+        } else {
+            "监测工作台启动失败"
+        },
+        serde_json::json!({"error":result.as_ref().err()}),
+    );
+    result
+}
+async fn start_workspace_inner(app: &tauri::AppHandle) -> Result<(), String> {
+    require_monitoring(app, false)?;
     // First read cannot trigger an automatic flight preparation.
-    crate::monitoring::verify_first_sync(&app).await?;
-    require_monitoring(&app, false)?;
+    crate::monitoring::verify_first_sync(app).await?;
+    require_monitoring(app, false)?;
     crate::monitoring::set_monitoring_enabled(app.clone(), true)?;
     app.state::<Readiness>()
         .started
         .store(true, Ordering::SeqCst);
-    crate::flight::after_sync(&app).await?;
+    crate::flight::after_sync(app).await?;
     Ok(())
 }
 
@@ -584,7 +667,9 @@ mod tests {
     #[test]
     fn photo_only_report_requires_only_verified_flight_hub_and_compatible_plugin() {
         let (mut bridge, mut cache) = fixture();
-        bridge.tabs.retain(|tab| tab.tab.url.starts_with("https://fh.dji.com"));
+        bridge
+            .tabs
+            .retain(|tab| tab.tab.url.starts_with("https://fh.dji.com"));
         cache.retain(|entry| entry.health.id == "dji");
         assert!(!evaluate(&bridge, &cache, false, false).ready);
         assert!(check_report_media(evaluate(&bridge, &cache, false, false)).is_ok());
@@ -598,17 +683,32 @@ mod tests {
     fn site_outages_only_block_dependent_capabilities_and_recover() {
         let (bridge, mut cache) = fixture();
         for missing in ["sniff", "dji", "map"] {
-            for cached in &mut cache { cached.health.state = if cached.health.id == missing { "login_required" } else { "ready" }.into(); }
+            for cached in &mut cache {
+                cached.health.state = if cached.health.id == missing {
+                    "login_required"
+                } else {
+                    "ready"
+                }
+                .into();
+            }
             let state = evaluate(&bridge, &cache, true, false);
             assert!(!state.ready);
             assert_eq!(state.monitoring_ready, missing != "map");
             assert_eq!(state.flight_ready, missing != "dji");
             assert_eq!(state.report_ready, missing == "map");
-            assert_eq!(check_capability(&state, state.monitoring_ready, true, "map").is_ok(), missing != "map");
-            assert_eq!(check_capability(&state, state.flight_ready, true, "dji").is_ok(), missing != "dji");
+            assert_eq!(
+                check_capability(&state, state.monitoring_ready, true, "map").is_ok(),
+                missing != "map"
+            );
+            assert_eq!(
+                check_capability(&state, state.flight_ready, true, "dji").is_ok(),
+                missing != "dji"
+            );
             assert!(state.started);
         }
-        for cached in &mut cache { cached.health.state = "ready".into(); }
+        for cached in &mut cache {
+            cached.health.state = "ready".into();
+        }
         let state = evaluate(&bridge, &cache, false, false);
         assert!(check_capability(&state, state.monitoring_ready, false, "map").is_ok());
         assert!(check_capability(&state, state.flight_ready, true, "dji").is_err());
@@ -635,6 +735,10 @@ mod tests {
     #[test]
     fn rejects_stale_checks_reloads_and_browser_session_replacement() {
         let (mut bridge, mut cache) = fixture();
+        // A fresh pass must not make an already verified row flash to an
+        // indeterminate state while its request is still in flight.
+        let checking = evaluate(&bridge, &cache, false, true);
+        assert!(checking.sites.iter().all(|site| site.state == "ready"));
         cache[0].at = Instant::now() - MAX_AGE;
         assert!(!evaluate(&bridge, &cache, false, false).ready);
         cache[0].at = Instant::now();

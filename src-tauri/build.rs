@@ -32,6 +32,34 @@ fn version(value: &str) -> [u16; 4] {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(test_environment)");
+    let packaged_test = std::env::var_os("CARGO_FEATURE_TEST_ENVIRONMENT").is_some();
+    let test_environment = tauri_build::is_dev() || packaged_test;
+    if test_environment {
+        println!("cargo:rustc-cfg=test_environment");
+    }
+    // A test package must never carry the production installer identity.
+    if packaged_test && !tauri_build::is_dev() {
+        let overlay: serde_json::Value =
+            serde_json::from_str(&std::env::var("TAURI_CONFIG").unwrap_or_default())
+                .expect("Test packages require --config src-tauri/tauri.test.conf.json");
+        assert_eq!(
+            overlay["identifier"].as_str(),
+            Some("com.taizhou.aai.dev"),
+            "Test packages require the test config overlay"
+        );
+    }
+    if !test_environment {
+        if let Ok(overlay) = std::env::var("TAURI_CONFIG") {
+            let overlay: serde_json::Value =
+                serde_json::from_str(&overlay).expect("Invalid config overlay");
+            assert_ne!(
+                overlay["identifier"].as_str(),
+                Some("com.taizhou.aai.dev"),
+                "Test config requires --features test-environment when packaging"
+            );
+        }
+    }
     println!("cargo:rerun-if-changed=../bridge-config.json");
     println!("cargo:rerun-if-changed=../extension");
     let config: serde_json::Value =
@@ -66,9 +94,9 @@ fn main() {
         endpoint("production"),
         "Production extension endpoint must match bridge-config.json"
     );
-    // Only tauri dev uses the generated extension. Packaged builds (including
-    // --debug) retain the production identity, port and resource directory.
-    if tauri_build::is_dev() {
+    // Explicit test packages and tauri dev share the isolated test environment.
+    // Ordinary packaged builds (including --debug) remain production.
+    if test_environment {
         let output = Path::new("../extension-dev");
         copy_tree(Path::new("../extension"), output);
         manifest["name"] = format!("{} · 开发版", manifest["name"].as_str().unwrap()).into();

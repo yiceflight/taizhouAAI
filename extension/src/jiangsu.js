@@ -9,7 +9,7 @@ export function findJiangsuApi() {
     const vm = queue.shift();
     if (seen.has(vm)) continue;
     seen.add(vm);
-    if (typeof vm.$Ajax?.componentDeviceOption === 'function' && typeof vm.$Ajax?.photoTimeSeriesData === 'function') return vm.$Ajax;
+    if (typeof vm.$Ajax?.componentDeviceOption === 'function' && typeof vm.$Ajax?.photoTimeSeriesData === 'function' && typeof vm.$Ajax?.getNormalSixParamData === 'function') return vm.$Ajax;
     queue.push(...(vm.$children || []));
     if (vm.$parent) queue.push(vm.$parent);
   }
@@ -75,11 +75,16 @@ export async function queryJiangsuHourly(startTime, endTime, getApi = findJiangs
   const unit = factor.unit?.normalize("NFKC").replace(/μ/g, "u").replace(/\s/g, "");
   if (unit !== "ug/m3") throw new Error("K+ 单位不是 μg/m³，暂停同步以避免错误换算");
   const params = { startTime, endTime, siteCode: "321200", siteType: "CITY", timeType: "HOUR", dataSource: "A_6" };
-  const particle = await api.photoTimeSeriesData({ ...params, queryFactor: factor.factorCode });
+  const [particle, normal] = await Promise.all([
+    api.photoTimeSeriesData({ ...params, queryFactor: factor.factorCode }),
+    api.getNormalSixParamData({ ...params, commonSiteType: "30" }),
+  ]);
   const series = check(particle).filter((item) => item.factorCode === factor.factorCode);
   if (series.length !== 1) throw new Error("K+ 查询未返回唯一时间序列");
   if (location.href !== url) throw new Error("查询期间页面已跳转，请等待系统重新验证登录状态");
-  return { url: location.href, city: "泰州市", cityCode: "321200", unit: "μg/m³", dataSource: "A_6", commonSiteType: "30", startTime, endTime, potassium: { times: series[0].dataTimes, values: series[0].values } };
+  return { url: location.href, city: "泰州市", cityCode: "321200", unit: "μg/m³", dataSource: "A_6", commonSiteType: "30", startTime, endTime,
+    potassium: { times: series[0].dataTimes, values: series[0].values },
+    normal: check(normal).map((row) => ({ time: row.dataTime, pm25: row.pm25 })) };
 }
 
 export function normalizeHourly(raw) {
@@ -102,13 +107,15 @@ export function normalizeHourly(raw) {
   const rows = new Map();
   const add = (time, key, input) => {
     time = hour(time);
-    const row = rows.get(time) || { time, potassium: null };
+    const row = rows.get(time) || { time, potassium: null, pm25: null };
     if (row[`${key}Seen`]) throw new Error("平台返回重复的小时指标");
     row[key] = value(input); row[`${key}Seen`] = true; rows.set(time, row);
   };
   raw.potassium.times.forEach((time, i) => add(time, "potassium", raw.potassium.values[i]));
+  if (!Array.isArray(raw.normal)) throw new Error("平台 PM2.5 时间序列缺失");
+  raw.normal.forEach((row) => add(row.time, "pm25", row.pm25));
   const data = [...rows.values()].sort((a, b) => a.time.localeCompare(b.time));
   // Keep every source hour within the query window, including trailing missing
   // values. The latest reported hour must not fall back to an older reading.
-  return { url: raw.url, city: raw.city, cityCode: raw.cityCode, unit: raw.unit, dataSource: raw.dataSource, commonSiteType: raw.commonSiteType, startTime: raw.startTime, endTime: raw.endTime, rows: data.map(({time, potassium}) => ({time, potassium})) };
+  return { url: raw.url, city: raw.city, cityCode: raw.cityCode, unit: raw.unit, dataSource: raw.dataSource, commonSiteType: raw.commonSiteType, startTime: raw.startTime, endTime: raw.endTime, rows: data.map(({time, potassium, pm25}) => ({time, potassium, pm25})) };
 }

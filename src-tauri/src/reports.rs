@@ -132,22 +132,46 @@ pub async fn generate_report(
     session: String,
     tab_id: i64,
 ) -> Result<ReportSummary, String> {
-    crate::readiness::require_started(&app)?;
-    let data = bridge.capture(session, tab_id).await?;
-    let snapshot: Snapshot =
-        serde_json::from_value(data).map_err(|e| format!("插件数据格式错误：{e}"))?;
-    let source = validate(&snapshot)?;
-    let report = Report {
-        id: Uuid::new_v4().to_string(),
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_millis() as u64,
-        source,
-        snapshot,
-    };
-    persist(&directory(&app)?, &report)?;
-    Ok(summary(report))
+    crate::runtime_log::record(
+        &app,
+        "info",
+        "report",
+        "generate_report.started",
+        "网页报告生成开始",
+        serde_json::json!({}),
+    );
+    let result = async {
+        crate::readiness::require_started(&app)?;
+        let data = bridge.capture(session, tab_id).await?;
+        let snapshot: Snapshot =
+            serde_json::from_value(data).map_err(|e| format!("插件数据格式错误：{e}"))?;
+        let source = validate(&snapshot)?;
+        let report = Report {
+            id: Uuid::new_v4().to_string(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as u64,
+            source,
+            snapshot,
+        };
+        persist(&directory(&app)?, &report)?;
+        Ok(summary(report))
+    }
+    .await;
+    crate::runtime_log::record(
+        &app,
+        if result.is_ok() { "info" } else { "error" },
+        "report",
+        "generate_report.finished",
+        if result.is_ok() {
+            "网页报告生成完成"
+        } else {
+            "网页报告生成失败"
+        },
+        serde_json::json!({"error":result.as_ref().err()}),
+    );
+    result
 }
 
 fn summary(report: Report) -> ReportSummary {

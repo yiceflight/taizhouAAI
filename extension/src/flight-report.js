@@ -34,21 +34,52 @@ export async function djiReport(job) {
     const rows = () => [...document.querySelectorAll('table tbody tr')].filter(visible);
     const signature = () => rows().map(row => row.innerText).join('\n');
     const loading = () => [...document.querySelectorAll('.ant-spin-spinning,.el-loading-mask,[aria-busy="true"]')].some(visible);
-    const wait = async (condition, label) => {
+    const wait = async (condition, label, targetHash = '') => {
       let stable = 0;
       for (let attempt = 0; attempt < 50 && Date.now() < deadline; attempt++) {
         await new Promise(resolve => setTimeout(resolve, 200));
         if (condition() && !loading()) { if (++stable >= 3) return; } else stable = 0;
       }
-      throw new Error(`司空${label}未完成，请等待媒体库加载后重试`);
+      throw new Error(`司空${label}未完成（目标 ${targetHash || '当前页面'}，当前 ${location.hash}，面包屑 ${(crumb()?.innerText || '').trim() || '未知'}，列表 ${rows().length} 行），页面尚未稳定，请保持媒体库页面打开后重试`);
     };
     const leaf = (root, text) => [...root.querySelectorAll('*')].find(e => !e.children.length && e.textContent.trim() === text);
-    const navigate = async hash => {
-      if (location.hash === hash) { await wait(() => rows().length || /暂无数据|无文件|No data|No files/i.test(document.querySelector('table')?.innerText || ''), '列表加载'); return; }
-      const before = signature();
-      location.hash = hash;
-      await wait(() => location.hash === hash && signature() !== before, '列表切换');
+    // Vue's hash router may reorder query parameters when it normalizes a
+    // route. Compare the route and query values semantically so a successful
+    // navigation is not reported as a timeout merely because the URL string
+    // changed from `page=1&size=50` to `size=50&page=1`.
+    const normalizedHash = value => {
+      const [path, query = ''] = String(value || '').replace(/^#/, '').split('?');
+      return `${path}?${[...new URLSearchParams(query).entries()].sort(([a, b], [c, d]) => a.localeCompare(c) || b.localeCompare(d)).map(([key, item]) => `${key}=${item}`).join('&')}`;
     };
+    const routeMatches = hash => {
+      const [expectedPath, expectedQuery = ''] = String(hash || '').replace(/^#/, '').split('?');
+      const [actualPath, actualQuery = ''] = String(location.hash || '').replace(/^#/, '').split('?');
+      if (actualPath !== expectedPath) return false;
+      const expected = new URLSearchParams(expectedQuery);
+      const actual = new URLSearchParams(actualQuery);
+      for (const [key, value] of expected.entries()) if (actual.get(key) !== value) return false;
+      // A root route must not still carry a folder id from the previous task.
+      if (!expected.has('pid') && actual.has('pid')) return false;
+      return true;
+    };
+    const hashMatches = hash => routeMatches(hash) || normalizedHash(location.hash) === normalizedHash(hash);
+    const navigate = async (hash, changedReady = () => false) => {
+      if (hashMatches(hash)) { await wait(() => rows().length || /暂无数据|无文件|No data|No files/i.test(document.querySelector('table')?.innerText || ''), '列表加载'); return; }
+      const before = signature();
+      const beforeCrumb = crumb()?.innerText || '';
+      location.hash = hash;
+      const rootReady = () => /^#\/media\?/.test(hash) && new URLSearchParams(hash.split('?')[1]).has('page') && !new URLSearchParams(hash.split('?')[1]).has('pid') && (crumb()?.innerText || '').trim() === '媒体文件';
+      await wait(() => hashMatches(hash)
+        && (signature() !== before || ((changedReady() || rootReady()) && (crumb()?.innerText || '') !== beforeCrumb)), '列表切换', hash);
+    };
+    // `tabs.get(...).status === "complete"` only covers the document shell.
+    // FlightHub mounts the Vue media table asynchronously; changing the hash
+    // before that mount causes the router to restore the root route.
+    const initialParams = new URLSearchParams(location.hash.split('?')[1]);
+    if (!initialParams.has('pid')) {
+      await wait(() => (crumb()?.innerText || '').trim() === '媒体文件'
+        && (rows().length > 0 || /暂无数据|无文件|No data|No files/i.test(document.querySelector('table')?.innerText || '')), '媒体库加载');
+    }
     // Reset to the unfiltered first page even when a different flight is open.
     const search = [...document.querySelectorAll('input')].find(e => /文件名称/.test(e.placeholder));
     if (search?.value.trim()) {
@@ -61,7 +92,48 @@ export async function djiReport(job) {
     }
     if (job.folderId != null) {
       if (!Number.isSafeInteger(job.folderId) || job.folderId <= 0) throw new Error('司空任务媒体目录编号无效');
-      await navigate(`#/media?page=1&size=50&pid=${job.folderId}`);
+      const folderHash = `#/media?page=1&size=50&pid=${job.folderId}`;
+      // The rendered table exposes the same folder id as `rowid`. Clicking
+      // that row follows FlightHub's own router path; assigning location.hash
+      // directly can be reverted by the Vue router while its table is busy.
+      const folderRow = document.querySelector(`table tbody tr[rowid="${job.folderId}"]`);
+      if (folderRow) {
+        // FlightHub binds the folder-opening handler to the rendered name
+        // element. Clicking the thumbnail or wrapping row can be ignored by
+        // some Vue renders, so use the same visible text target as a user.
+        const targets = [
+          folderRow.querySelector('.file-name-text'),
+          folderRow.querySelector('.file-name'),
+          folderRow.querySelector('.file-item-name'),
+          ...[...folderRow.querySelectorAll('*')].filter(element => element.getClientRects().length > 0 && !element.children.length && element.textContent.trim()),
+        ].filter((element, index, all) => element && all.indexOf(element) === index);
+        if (!targets.length) throw new Error('司空任务媒体目录入口未渲染，请刷新媒体库后重试');
+        const before = signature();
+        let opened = false;
+        for (const target of targets) {
+          target.scrollIntoView?.({ block: 'center' });
+          target.click();
+          try {
+            await wait(() => routeMatches(folderHash)
+              && (signature() !== before || (crumb()?.innerText || '').trim() !== '媒体文件'), '任务目录打开', folderHash);
+            opened = true;
+            break;
+          } catch (_) {
+            // Different FlightHub builds attach the click listener to a
+            // different descendant of the same rendered row. Try the next
+            // user-visible target before falling back to route navigation.
+          }
+        }
+        if (!opened) await navigate(folderHash, () => {
+          const text = (crumb()?.innerText || '').trim();
+          return !!text && text !== '媒体文件';
+        });
+      } else {
+        await navigate(folderHash, () => {
+          const text = (crumb()?.innerText || '').trim();
+          return !!text && text !== '媒体文件';
+        });
+      }
       if (new URLSearchParams(location.hash.split('?')[1]).get('pid') !== String(job.folderId)) throw new Error('司空媒体目录不匹配');
     } else {
     const rootHash = page => `#/media?page=${page}&size=50`;

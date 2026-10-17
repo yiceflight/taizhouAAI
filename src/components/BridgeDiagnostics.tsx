@@ -17,7 +17,7 @@ export function diagnosticText(report: BridgeDiagnosticReport) {
 }
 export function DiagnosticResults({ report }: { report: BridgeDiagnosticReport }) {
   return <>
-    <p className="diagnostic-time">最近检测：{new Date(report.checkedAt).toLocaleString()} · 本页每 5 秒自动刷新</p>
+    <p className="diagnostic-time">最近完成：{new Date(report.checkedAt).toLocaleString()} · 每 5 秒尝试刷新，正在诊断时等待完成</p>
     <ul className="diagnostic-checks">{report.checks.map(check => <li key={check.id}>
       <div className="diagnostic-check-heading"><strong>{check.label}</strong><span className={`badge ${check.state === 'pass' ? 'success' : check.state === 'skipped' ? '' : 'warning'}`}>{labels[check.state]}</span></div>
       <p>{check.detail}</p>{check.suggestion && <small>{check.suggestion}</small>}
@@ -41,7 +41,13 @@ export function BridgeDiagnostics({ active = true }: { active?: boolean }) {
     lock.current = true; setBusy(true);
     if (!background) { setMessage(''); setReport(null); }
     try { setReport(await invoke<BridgeDiagnosticReport>('diagnose_bridge')); setMessage(''); }
-    catch (error) { setReport(null); setMessage(`诊断未完成：${String(error)}。请重试，并将此提示提供给技术支持。`); }
+    catch (error) {
+      // Keep the last completed report during an automatic refresh. A
+      // transient diagnostic failure should not remove the whole result card
+      // and make the page jump; manual retries still clear stale results above.
+      if (!background) setReport(null);
+      setMessage(`诊断未完成：${String(error)}。请重试，并将此提示提供给技术支持。`);
+    }
     finally { lock.current = false; setBusy(false); }
   }, []);
   useEffect(() => {
@@ -60,7 +66,9 @@ export function BridgeDiagnostics({ active = true }: { active?: boolean }) {
       <button className="secondary-button" disabled={busy} onClick={() => void run()}>{busy ? '正在诊断…' : '重新诊断'}</button>
       <button className="secondary-button" disabled={!report || busy} onClick={() => void copy()}>复制诊断结果</button>
     </div></div>
-    {busy && !report && <p role="status">正在检查本机连接，请稍候…</p>}
+    <p className="diagnostic-progress" role="status" aria-hidden={!busy}>{busy ? report
+      ? '正在后台复查，以下为上次完成的诊断结果；等待插件新心跳（最多 35 秒）…'
+      : '正在检查本机连接，等待插件新心跳（最多 35 秒）…' : '\u00a0'}</p>
     {report && <DiagnosticResults report={report} />}
     {message && <p className="notice" role="status">{message}</p>}
   </section>;

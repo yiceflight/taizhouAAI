@@ -53,7 +53,8 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
   }, [taskDialog]);
 
   const status = flightSummary(data, started && ready, event?.status === 'countdown' ? now : Date.now());
-  const showStatus = event ? isCurrentFlightEvent(event) : status.tone === 'danger' || !!status.needsManualLaunch;
+  const djiWeatherBlocked = !!event && ['ready', 'uncertain', 'not_flown'].includes(event.status) && [event.statusCheckError, event.error].some(value => !!value?.includes('司空平台天气阻飞：') && value.includes('；未继续执行'));
+  const showStatus = event ? isCurrentFlightEvent(event) || djiWeatherBlocked : status.tone === 'danger' || !!status.needsManualLaunch;
   const preview = !!event && (event.preview || event.source === 'preview');
   const checkable = event && !preview && ['ready', 'submitted', 'uncertain', 'flying', 'paused', 'flight_error'].includes(event.status);
   const resolvable = event && ['ready', 'flight_error'].includes(event.status);
@@ -91,7 +92,7 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
 
   if (compact) return <div className={`drone-status drone-status-${status.tone} drone-status-compact`} aria-label="无人机状态">
     <div className="drone-status-copy"><strong>{status.title}</strong></div>
-    <div className="drone-actions">{cancelable && <button className="drone-action drone-cancel" onClick={() => void action('cancel_flight', { eventId: event.id })}>取消任务</button>}<button className="drone-action drone-details" onClick={viewTask}>查看详情 ↓</button></div>
+    <div className="drone-actions">{cancelable && <button className="drone-action drone-cancel" onClick={() => void action('cancel_flight', { eventId: event.id })}>取消任务</button>}{djiWeatherBlocked ? <button className="drone-action drone-launch" disabled={busy} onClick={openDji}>切换 Chrome 页面</button> : <button className="drone-action drone-details" onClick={viewTask}>查看详情 ↓</button>}</div>
   </div>;
 
   return <div className={showStatus ? `drone-status drone-status-${status.tone}` : 'drone-actions'} aria-label={showStatus ? '无人机状态' : '任务核查操作'}>
@@ -103,6 +104,7 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
     <div className="drone-actions">
       {checkable && <button className="drone-action drone-finish" disabled={busy || refreshing} aria-busy={refreshing} onClick={() => void refreshStatus()}>{refreshing ? '正在刷新…' : '刷新状态'}</button>}
       {cancelable ? <button className="drone-action drone-cancel" onClick={() => void action('cancel_flight', { eventId: event.id })}>取消任务</button>
+        : djiWeatherBlocked ? <button className="drone-action drone-launch" disabled={busy} onClick={openDji}>去司空确认阻飞 ↗</button>
         : active ? event.status !== 'submitting' && <button className="drone-action drone-launch" disabled={busy} onClick={openDji}>{djiLabel}</button>
         : <ManualLaunchButton data={data} ready={ready} started={started} busy={busy} action={action} className="drone-action drone-launch" />}
       {resolvable && <div ref={more} className="drone-more" onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setMoreOpen(false); }}>

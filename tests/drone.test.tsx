@@ -9,7 +9,7 @@ import { defaultSettings, flightDisplay, flightSummary, noFlyPeriod, type Monito
 const now = Date.now();
 const data = (): MonitorView => ({ enabled:true, syncing:false, lastAttempt:null, lastSuccess:null, error:null, total:0, rows:[], queryThrough:null,
   settings:{...defaultSettings,noFlyPeriods:[],requireManualConfirmation:false,takeoffDelayMinutes:5},
-  flight:{enabled:true,threshold:1,delayMinutes:5,event:null},
+  flight:{threshold:1,delayMinutes:5,event:null,selectedRoute:'测试航线'},
   weather:{ location:'test',latitude:0,longitude:0,source:'test',refreshing:false,allowed:true,level:'ok',label:'通过',reasons:[],current:{observedAt:now/1000,fetchedAt:now/1000,temperature:20,weatherCode:0,windSpeed:1,windGusts:2,windDirection:0,precipitation:0} },
 });
 const event = (status: FlightEvent['status']): FlightEvent => ({id:'test-event',name:'测试任务',observedAt:'2026-09-22 21:00:00',potassium:2,status,error:null,preview:false,source:'auto',launchAt:now+65000});
@@ -133,7 +133,7 @@ describe('drone task display',()=>{
     }
   });
   it('prompts for manual action in chart red when fresh K+ exceeds the configured threshold',()=>{
-    const d=reading(data(),0.9);d.flight.enabled=false;d.settings.requireManualConfirmation=true;
+    const d=reading(data(),0.9);d.settings.requireManualConfirmation=true;
     const doc=render(d);
     expect(doc.querySelector('.drone-status-danger')).not.toBeNull();
     expect(doc.documentElement.textContent).toContain('K⁺ 超标 · 需要执行任务');
@@ -146,7 +146,7 @@ describe('drone task display',()=>{
   });
   it('does not trigger an exceedance reminder for equal, missing, expired, or future readings',()=>{
     for(const [k,age] of [[0.4,1],[0,1],[null,1],[0.9,4],[0.9,-1]] as const){
-      const d=reading(data(),k,age);d.flight.enabled=false;
+      const d=reading(data(),k,age);
       expect(flightSummary(d,true,now).tone).not.toBe('danger');
       expect(flightSummary(d,true,now).needsManualLaunch).not.toBe(true);
     }
@@ -247,11 +247,11 @@ describe('drone task display',()=>{
     for (const label of ['查看任务详情', '查看实时监测', '核查后重新发起', '更多 ⋯']) expect(task.textContent).not.toContain(label);
     expect(button(doc, '刷新状态')).toBeDefined();
   });
-  it('restores the ordinary launch entrance after FlightHub confirms weather blocked execution', () => {
+  it('keeps the FlightHub weather block visible and offers to focus its page', () => {
     const d = data(); d.flight.event = { ...event('not_flown'), statusCheckedAt: now, error: '司空平台天气阻飞：在线天气风速 12.75m/s；未继续执行' };
     const doc = render(d);
-    expect(doc.querySelector('.drone-status-copy')).toBeNull();
-    expect(button(doc, '立即执行任务')?.hasAttribute('disabled')).toBe(false);
-    expect(button(doc, '核查后重新发起')).toBeUndefined();
+    expect(doc.querySelector('.drone-status-copy')?.textContent).toContain('司空天气阻飞');
+    expect(button(doc, '去司空确认阻飞 ↗')).toBeDefined();
+    expect(button(doc, '重新发起任务')).toBeUndefined();
   });
 });

@@ -18,42 +18,31 @@ beforeEach(() => {
   ipc.invoke.mockReset().mockResolvedValue(null); onClose.mockClear(); onSaved.mockClear();
 });
 afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
-const render = async (enabled = false, ready = true) => { await act(async () => root.render(<SettingsDialog settings={{ ...defaultSettings, requireManualConfirmation: false }} flightEnabled={enabled} canEnableFlight={ready} onClose={onClose} onSaved={onSaved} />)); };
-const toggle = () => document.querySelector<HTMLButtonElement>('[aria-labelledby="automatic-patrol-label"]')!;
+const render = async (_legacyEnabled = false, ready = true) => { await act(async () => root.render(<SettingsDialog settings={{ ...defaultSettings, requireManualConfirmation: false }} flightReady={ready} routes={[{ routeId: 'test-route', name: '现场巡查航线' }]} selectedRoute="现场巡查航线" onClose={onClose} onSaved={onSaved} />)); };
 const submit = async () => { await act(async () => document.querySelector('form')!.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }))); };
 
-it('persists the strategy before explicitly enabling automatic patrol', async () => {
-  await render();
-  await act(async () => toggle().click());
-  await submit();
-  expect(ipc.invoke.mock.calls.map(call => call[0])).toEqual(['save_workspace_settings', 'set_flight_enabled']);
-  expect(ipc.invoke).toHaveBeenLastCalledWith('set_flight_enabled', { enabled: true });
-  expect(onSaved).toHaveBeenCalledOnce(); expect(onClose).toHaveBeenCalledOnce();
-});
-it('leaves automatic patrol off when only the confirmation strategy changes', async () => {
+it('persists the execution strategy without a separate automatic patrol switch', async () => {
   await render();
   await submit();
   expect(ipc.invoke.mock.calls.map(call => call[0])).toEqual(['save_workspace_settings']);
-  expect(document.body.textContent).toContain('自动巡查尚未开启');
+  expect(document.querySelector('[aria-labelledby="automatic-patrol-label"]')).toBeNull();
+  expect(onSaved).toHaveBeenCalledOnce(); expect(onClose).toHaveBeenCalledOnce();
 });
-it('disables automatic patrol before saving settings to cancel pending automatic tasks', async () => {
-  await render(true);
-  await act(async () => toggle().click());
-  await submit();
-  expect(ipc.invoke.mock.calls.map(call => call[0])).toEqual(['set_flight_enabled', 'save_workspace_settings']);
-  expect(ipc.invoke).toHaveBeenNthCalledWith(1, 'set_flight_enabled', { enabled: false });
-});
-it('requires readiness to enable but permits disabling an existing automatic patrol', async () => {
-  await render(false, false);
-  expect(toggle().disabled).toBe(true);
-  await act(async () => root.unmount());
-  root = createRoot(document.getElementById('root')!);
-  await render(true, false);
-  expect(toggle().disabled).toBe(false);
-});
-it('does not enable automatic patrol when saving the strategy fails', async () => {
+it('shows manual or automatic execution as the only execution choice', async () => {
   await render();
-  await act(async () => toggle().click());
+  expect(document.body.textContent).toContain('自动执行');
+  expect(document.body.textContent).toContain('钾离子超过阈值后自动创建巡查计划');
+  const choices = [...document.querySelectorAll<HTMLInputElement>('input[name="takeoff-execution-mode"]')];
+  expect(choices).toHaveLength(2);
+  expect(choices.map(choice => choice.value)).toEqual(['manual', 'automatic']);
+  expect(choices[1].checked).toBe(true);
+  await act(async () => { choices[0].click(); });
+  expect(choices[0].checked).toBe(true);
+  expect(document.body.textContent).toContain('由工作人员确认后起飞');
+  expect(document.body.textContent).not.toContain('超标仅提示');
+});
+it('does not invoke a legacy patrol switch when saving fails', async () => {
+  await render();
   ipc.invoke.mockRejectedValueOnce('设置写入失败');
   await submit();
   expect(ipc.invoke.mock.calls.map(call => call[0])).toEqual(['save_workspace_settings']);
@@ -101,41 +90,61 @@ it('cancels no-fly drafts without saving and restores the morning default only i
 });
 
 const clickText = async (text: string) => { await act(async () => [...document.querySelectorAll('button')].find(b => b.textContent === text)!.click()); };
-it('clears only after confirmation, refreshes tasks and keeps unsaved settings open', async () => {
+it('clears all local data only after confirmation and keeps unsaved settings open', async () => {
   const cleared = vi.fn(async () => {});
-  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} onTasksCleared={cleared} />));
-  await clickText('清空任务列表');
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} onDataCleared={cleared} />));
+  await clickText('清空数据');
   expect(ipc.invoke).not.toHaveBeenCalled();
   await clickText('暂不清空');
   expect(ipc.invoke).not.toHaveBeenCalled();
-  await clickText('清空任务列表');
-  ipc.invoke.mockResolvedValueOnce({ preservedCurrentTask: false });
-  await clickText('确认清空');
-  expect(ipc.invoke).toHaveBeenCalledExactlyOnceWith('clear_task_list', { confirmed: true });
+  await clickText('清空数据');
+  ipc.invoke.mockResolvedValueOnce({ cleared: true });
+  await clickText('确认清空数据');
+  expect(ipc.invoke).toHaveBeenCalledExactlyOnceWith('clear_all_data', { confirmed: true });
   expect(cleared).toHaveBeenCalledOnce();
   expect(onSaved).not.toHaveBeenCalled();
   expect(onClose).not.toHaveBeenCalled();
-  expect(document.querySelector('[role="status"]')?.textContent).toContain('任务列表已清空');
+  expect(document.querySelector('[role="status"]')?.textContent).toContain('本地数据已清空');
 });
 it('keeps the confirmation available and shows storage errors on clear failure', async () => {
   await render();
-  await clickText('清空任务列表');
-  ipc.invoke.mockRejectedValueOnce('任务记录写入失败');
-  await clickText('确认清空');
-  expect(document.querySelector('[role="alert"]')?.textContent).toContain('任务记录写入失败');
+  await clickText('清空数据');
+  ipc.invoke.mockRejectedValueOnce('本地数据库清理失败');
+  await clickText('确认清空数据');
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain('本地数据库清理失败');
   expect(document.querySelector('[role="status"]')).toBeNull();
   expect(onClose).not.toHaveBeenCalled();
 });
-
-it('reports successful history clearing while retaining a current task', async () => {
-  const cleared = vi.fn(async () => {});
-  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} onTasksCleared={cleared} />));
-  await clickText('清空任务列表');
-  expect(document.body.textContent).toContain('当前正在执行或待核查的任务会保留');
-  ipc.invoke.mockResolvedValueOnce({ preservedCurrentTask: true });
-  await clickText('确认清空');
-  expect(cleared).toHaveBeenCalledOnce();
-  expect(document.querySelector('[role="status"]')?.textContent).toContain('历史任务已清空。当前正在执行或待核查的任务已保留');
-  expect(document.querySelector('[role="alert"]')).toBeNull();
-  expect(onSaved).not.toHaveBeenCalled();
+it('shows the synced route choice and persists a changed route prefix', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[{ routeId: 'r1', name: '东南火点巡查航线-改' }, { routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }]} selectedRoute="东南火点巡查航线-改" onClose={onClose} onSaved={onSaved} />));
+  const select = document.querySelector<HTMLSelectElement>('#flight-route')!;
+  expect(select.value).toBe('东南火点巡查航线-改');
+  expect([...select.options].map(option => option.textContent)).toEqual(['东南火点巡查航线-改', '东南火点巡查航线-改-副本(6)']);
+  ipc.invoke.mockResolvedValueOnce({ routes: [{ routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }], selected: '东南火点巡查航线-改-副本(6)' });
+  await act(async () => { select.options[1].selected = true; select.dispatchEvent(new window.Event('change', { bubbles: true })); });
+  expect(ipc.invoke).toHaveBeenCalledWith('set_flight_route', { route: '东南火点巡查航线-改-副本(6)' });
+});
+it('keeps the sync prompt only before the first route sync', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} />));
+  const unsynced = document.querySelector<HTMLSelectElement>('#flight-route')!;
+  expect([...unsynced.options].map(option => option.textContent)).toEqual(['请先同步航线列表']);
+  await act(async () => root.unmount());
+  root = createRoot(document.getElementById('root')!);
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南火点巡查航线' }]} routesSyncedAt={Date.now()} onClose={onClose} onSaved={onSaved} />));
+  const synced = document.querySelector<HTMLSelectElement>('#flight-route')!;
+  expect([...synced.options].map(option => option.textContent)).toEqual(['请选择航线', '东南火点巡查航线']);
+  expect(document.body.textContent).not.toContain('请先同步航线列表');
+});
+it('uses a matching-height refresh icon and shows its spinning state while syncing', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[{ routeId: 'r1', name: '东南火点巡查航线-改' }]} selectedRoute="东南火点巡查航线-改" onClose={onClose} onSaved={onSaved} />));
+  const select = document.querySelector<HTMLSelectElement>('#flight-route')!;
+  const refresh = document.querySelector<HTMLButtonElement>('[aria-label="同步司空航线"]')!;
+  expect(select.className).toBe('');
+  expect(refresh.classList.contains('settings-route-sync')).toBe(true);
+  expect(refresh.querySelector('svg.refresh-icon')?.classList.contains('is-spinning')).toBe(false);
+  let resolveSync!: (value: unknown) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise(resolve => { resolveSync = resolve; }));
+  await act(async () => { refresh.click(); await Promise.resolve(); });
+  expect(document.querySelector('[aria-label="正在同步航线"] svg.refresh-icon')?.classList.contains('is-spinning')).toBe(true);
+  await act(async () => resolveSync({ routes: [], selected: '东南火点巡查航线-改' }));
 });

@@ -1,6 +1,6 @@
 [package]
 name = "taizhou-aai"
-version = "0.2.6"
+version = "0.2.7"
 description = "江苏省泰州环境监测中心智能监测系统 browser automation desktop client"
 authors = ["you"]
 edition = "2021"
@@ -13,6 +13,9 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "taizhou_aai_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+test-environment = []
 
 [build-dependencies]
 serde_json = "1"

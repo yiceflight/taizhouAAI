@@ -84,18 +84,19 @@ test('background business-page login redirect prompts login, while unauthorized 
   }
 });
 test('aligns by source time and preserves zero, interior missing values and trailing missing hours', () => {
-  assert.deepEqual(normalizeHourly(raw()).rows, [{time:'2026-09-22 00:00:00',potassium:0},{time:'2026-09-22 01:00:00',potassium:null},{time:'2026-09-22 02:00:00',potassium:1.2},{time:'2026-09-22 03:00:00',potassium:null}]);
+  assert.deepEqual(normalizeHourly(raw()).rows, [{time:'2026-09-22 00:00:00',potassium:0,pm25:null},{time:'2026-09-22 01:00:00',potassium:null,pm25:35},{time:'2026-09-22 02:00:00',potassium:1.2,pm25:20},{time:'2026-09-22 03:00:00',potassium:null,pm25:null}]);
 });
 test('latest missing hours advance past the last numeric reading, including an entirely missing batch', () => {
   const r = raw();
   r.startTime = '2026-10-10 11:00:00';
   r.endTime = '2026-10-10 14:00:00';
   r.potassium = { times: ['2026-10-10 14:00:00', '2026-10-10 11:00:00', '2026-10-10 12:00:00', '2026-10-10 13:00:00'], values: ['--', 0.03, '', null] };
+  r.normal = [];
   assert.deepEqual(normalizeHourly(r).rows, [
-    {time:'2026-10-10 11:00:00',potassium:0.03},
-    {time:'2026-10-10 12:00:00',potassium:null},
-    {time:'2026-10-10 13:00:00',potassium:null},
-    {time:'2026-10-10 14:00:00',potassium:null},
+    {time:'2026-10-10 11:00:00',potassium:0.03,pm25:null},
+    {time:'2026-10-10 12:00:00',potassium:null,pm25:null},
+    {time:'2026-10-10 13:00:00',potassium:null,pm25:null},
+    {time:'2026-10-10 14:00:00',potassium:null,pm25:null},
   ]);
   r.potassium.values = ['--', '—', undefined, 'null'];
   const missing = normalizeHourly(r).rows;
@@ -106,7 +107,8 @@ test('latest missing hours advance past the last numeric reading, including an e
 test('does not invent hours absent from the source response', () => {
   const r = raw();
   r.potassium = { times: [r.startTime, r.endTime], values: [0.03, null] };
-  assert.deepEqual(normalizeHourly(r).rows, [{time:r.startTime,potassium:0.03},{time:r.endTime,potassium:null}]);
+  r.normal = [];
+  assert.deepEqual(normalizeHourly(r).rows, [{time:r.startTime,potassium:0.03,pm25:null},{time:r.endTime,potassium:null,pm25:null}]);
   r.potassium = { times: [], values: [] };
   assert.deepEqual(normalizeHourly(r).rows, []);
 });
@@ -122,12 +124,12 @@ test('page adapter uses verified API shape and fixed Taizhou hourly city mixed s
   const vm={$options:{name:'MapView'},$Ajax:{
     componentDeviceOption: async p => {calls.push(p);return ok([{deviceTypeCode:'IC',factorGroupList:[{factorList:[{factorCode:'potassium-test',factorName:'K⁺',unit:'μg/m³'}]}]}]);},
     photoTimeSeriesData: async p => {calls.push(p);return ok([{factorCode:'potassium-test',dataTimes:raw().potassium.times,values:raw().potassium.values}]);},
-    getNormalSixParamData: async () => {throw new Error('must not request PM2.5');},
+    getNormalSixParamData: async p => {calls.push(p);return ok(raw().normal.map(row => ({dataTime:row.time,pm25:row.pm25})));},
   }};
   const result=await runInNewContext(`(${queryJiangsuHourly.toString()})('2026-09-22 00:00:00','2026-09-22 03:00:00',(${findJiangsuApi.toString()}))`,{location:new URL(JIANGSU_URL),document:{querySelector:()=>({__vue__:{$options:{name:"wrapper"},$children:[vm]}})}});
   assert.equal(normalizeHourly(result).rows.length,4);
-  assert.deepEqual(normalizeHourly(result).rows.at(-1), {time:'2026-09-22 03:00:00',potassium:null});
-  assert.equal(calls[1].siteCode,'321200');assert.equal(calls[1].timeType,'HOUR');assert.equal(calls[1].dataSource,'A_6');assert.equal(calls.length,2);assert.equal('normal' in result,false);
+  assert.deepEqual(normalizeHourly(result).rows.at(-1), {time:'2026-09-22 03:00:00',potassium:null,pm25:null});
+  assert.equal(calls[1].siteCode,'321200');assert.equal(calls[1].timeType,'HOUR');assert.equal(calls[1].dataSource,'A_6');assert.equal(calls[2].commonSiteType,'30');assert.equal(calls.length,3);assert.ok('normal' in result);
   vm.$Ajax.photoTimeSeriesData=async()=>({code:44001,data:null});
   await assert.rejects(runInNewContext(`(${queryJiangsuHourly.toString()})(undefined,undefined,(${findJiangsuApi.toString()}))`,{location:new URL(JIANGSU_URL),document:{querySelector:()=>({__vue__:{$options:{name:"wrapper"},$children:[vm]}})}}),/登录状态/);
 });

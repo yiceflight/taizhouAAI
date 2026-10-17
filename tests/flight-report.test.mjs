@@ -39,7 +39,7 @@ test('DJI opens the selected photo with click and downloads its full-size record
  await assert.rejects(vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name})})`,sandbox),/缩略图/);
 });
 
-function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jpeg'], immediate = true, initialFolder = false, photoPages, folderId }) {
+function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jpeg'], immediate = true, initialFolder = false, photoPages, folderId, normalizeRoute = false }) {
  const {document} = parseHTML('<html><body><div class="ant-breadcrumb"></div><table><thead><tr><th></th></tr></thead><tbody></tbody></table></body></html>');
  const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
  let hash = '', opened = [], taskName = '';
@@ -65,7 +65,7 @@ function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jp
    if (photoPages) showPhotos(1); else show(`媒体文件 / ${name} / Immediate-Media`, folderPhotos, () => {});
   });
  };
- const location = {origin:'https://fh.dji.com',pathname:project, get href(){return this.origin+this.pathname+hash;},get hash(){return hash;},set hash(value){hash=value;const params = new URLSearchParams(value.split('?')[1]); const page = Number(params.get('page')); if (folderId && params.get('pid') === String(folderId)) { openTask('接口确认的航次'); hash=value; } else if (params.get('pid') === 'photos' && photoPages) showPhotos(page); else show('媒体文件',pages[page-1] || [],openTask);}};
+ const location = {origin:'https://fh.dji.com',pathname:project, get href(){return this.origin+this.pathname+hash;},get hash(){return hash;},set hash(value){const params = new URLSearchParams(value.split('?')[1]); const normalized = normalizeRoute ? `#/media?${[...params.entries()].reverse().map(([key, item]) => `${key}=${item}`).join('&')}` : value; hash = normalized; const page = Number(params.get('page')); if (folderId && params.get('pid') === String(folderId)) { openTask('接口确认的航次'); hash = normalized; } else if (params.get('pid') === 'photos' && photoPages) showPhotos(page); else show('媒体文件',pages[page-1] || [],openTask);}};
  location.hash = '#/media?page=1&size=50';
  if(initialFolder){ hash='#/media?page=1&size=50&pid=wrong'; show('媒体文件 / 旧航次 / Immediate-Media',['DJI_20260921071701_0002_V.jpeg'],()=>{}); }
  const run = () => vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-list',startTime:start,endTime:end,folderId})})`,{document,location,URLSearchParams,setTimeout:fn=>fn()});
@@ -78,6 +78,12 @@ test('DJI matches the unique Beijing start time across pages and navigates from 
  assert.equal(result.matchedStartTime,start);
  assert.equal(result.files.length,1);
  assert.match(result.folder,/2026-09-22 07:00:05.*Immediate-Media/);
+});
+test('DJI accepts hash-router query normalization while switching media pages', async()=>{
+ const fixture=autoMediaFixture({initialFolder:true,normalizeRoute:true,pages:[['每日7时 2026-09-22 07:00:05 (UTC+08)']]});
+ const result=await fixture.run();
+ assert.equal(result.files.length,1);
+ assert.match(result.folder,/Immediate-Media$/);
 });
 test('DJI refuses ambiguous candidates even when they occur on different pages', async()=>{
  const fixture=autoMediaFixture({pages:[['任务A 2026-09-22 07:00:05 (UTC+08)'],['任务B 2026-09-22 07:02:05 (UTC+08)']]});

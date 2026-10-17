@@ -6,6 +6,8 @@ use tauri_plugin_opener::OpenerExt;
 pub struct ExtensionDirectory {
     path: String,
     platform: &'static str,
+    #[serde(rename = "testEnvironment")]
+    test_environment: bool,
 }
 
 pub(crate) fn extension_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -39,6 +41,7 @@ pub fn get_extension_directory(app: tauri::AppHandle) -> Result<ExtensionDirecto
             .ok_or("插件目录包含无法显示的字符。")?
             .to_owned(),
         platform: std::env::consts::OS,
+        test_environment: crate::environment::IS_TEST,
     })
 }
 

@@ -11,6 +11,7 @@ export function useWorkspace() {
   const lock = useRef(false);
   const pendingActions = useRef(0);
   const autoStartAttempted = useRef(false);
+  const [startupReset, setStartupReset] = useState(0);
   const refresh = useCallback(async () => {
     if (!isTauri()) { setPollError('请使用桌面客户端完成插件配置和监测。'); return; }
     try {
@@ -34,6 +35,12 @@ export function useWorkspace() {
     // can be retried explicitly, rather than looping on every status poll.
     autoStartAttempted.current = true;
     void action('start_workspace');
-  }, [readiness, acting, action]);
-  return { bridge, readiness, monitor, error: pollError || error, acting, action, refresh };
+  }, [readiness, acting, action, startupReset]);
+  const resetStartup = useCallback(() => {
+    // Clearing local data resets the native workspace. Allow the same client
+    // session to perform its initial monitoring sync again after that reset.
+    autoStartAttempted.current = false;
+    setStartupReset(value => value + 1);
+  }, []);
+  return { bridge, readiness, monitor, error: pollError || error, acting, action, refresh, resetStartup };
 }

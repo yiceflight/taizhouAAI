@@ -9,7 +9,7 @@ import { weatherPasses, type WeatherView } from '../src/lib/weather';
 const good = (): WeatherView => ({ location:'泰州环境监测 Dock 3', latitude:32.434525, longitude:119.92992, source:'DJI FlightHub 2', refreshing:false, allowed:true, level:'ok', label:'天气条件通过', reasons:['无降水'], current:{observedAt:Date.now()/1000,fetchedAt:Date.now()/1000,temperature:0,weatherCode:0,windSpeed:0,windGusts:0,windDirection:0,precipitation:0} });
 const doc = (element: React.ReactElement) => parseHTML(renderToStaticMarkup(element)).document;
 const noop = () => {}; const action = async () => true;
-const monitor = (weather?: WeatherView):MonitorView => ({weather,enabled:true,syncing:false,lastAttempt:null,lastSuccess:null,error:null,total:0,rows:[],queryThrough:null,settings:{...defaultSettings,noFlyPeriods:[]},flight:{enabled:false,threshold:1,event:null}});
+const monitor = (weather?: WeatherView):MonitorView => ({weather,enabled:true,syncing:false,lastAttempt:null,lastSuccess:null,error:null,total:0,rows:[],queryThrough:null,settings:{...defaultSettings,noFlyPeriods:[]},flight:{threshold:1,event:null,selectedRoute:'测试航线'}});
 describe('weather gates',()=>{
   it('preserves zero weather values and explains unknown weather',()=>{
     const d=doc(<WeatherPanel weather={good()} busy={false} onRefresh={noop}/>);
@@ -21,7 +21,7 @@ describe('weather gates',()=>{
     expect(missing.documentElement.textContent).toContain('暂无法判断');
     expect(missing.documentElement.textContent).not.toContain('天气条件通过');
   });
-  it('blocks launches for missing, unsafe, and stale platform weather',()=>{
+  it('keeps manual force available for an unsafe verdict but blocks missing or stale weather',()=>{
     const safe=good();
     const stale={...safe,current:{...safe.current!,fetchedAt:Date.now()/1000-601}};
     expect(weatherPasses(safe)).toBe(true);
@@ -31,8 +31,10 @@ describe('weather gates',()=>{
       for(const ui of [<DroneStatus {...props}/>]) {
         const d=doc(ui);
         expect([...d.querySelectorAll('button')].find(b=>b.textContent==='立即执行任务')).toBeUndefined();
-        const b=[...d.querySelectorAll('button')].find(b=>b.textContent==='司空气象未通过');
-        expect(b?.hasAttribute('disabled')).toBe(true);
+        const force=[...d.querySelectorAll('button')].find(b=>b.textContent==='手动强制起飞');
+        const unavailable=[...d.querySelectorAll('button')].find(b=>b.textContent==='天气数据不可用');
+        if (weather?.level === 'unsafe') expect(force?.hasAttribute('disabled')).toBe(false);
+        else expect(unavailable?.hasAttribute('disabled')).toBe(true);
       }
     }
     const d=doc(<DroneStatus data={monitor(safe)} ready started busy={false} action={action} onFlight={noop}/>);
@@ -70,12 +72,18 @@ describe('weather status explanation', () => {
     expect(trigger(weather).textContent).toContain('不宜飞行');
     expect(trigger(weather).textContent).toContain('预测飞行风速');
   });
-  it('prioritizes unavailable, refreshing and expired data over cached metrics', () => {
+  it('keeps cached metrics visible while refreshing and explains unavailable or expired data', () => {
     const weather = blocked();
     const failed = { ...weather, level: 'unknown' as const, reasons: ['司空登录已失效，请重新登录。'] };
     expect(trigger(failed).textContent).toContain('司空登录已失效');
     expect(trigger(failed).textContent).not.toContain('12.1');
-    expect(trigger({ ...weather, refreshing: true }).textContent).toContain('正在更新天气');
+    const refreshing = trigger({ ...weather, refreshing: true });
+    expect(refreshing.textContent).toContain('无法飞行');
+    expect(refreshing.textContent).toContain('正在更新天气');
+    expect(refreshing.textContent).toContain('预测飞行风速：12.1 m/s');
+    const refreshingSafe = trigger({ ...good(), refreshing: true });
+    expect(refreshingSafe.textContent).toContain('天气条件通过');
+    expect(refreshingSafe.textContent).toContain('晴 · 0 °C · 实测风速 0 m/s');
     for (const sample of [good(), blocked()]) {
       sample.current!.fetchedAt -= 601;
       expect(trigger(sample).textContent).toContain('天气已过期');

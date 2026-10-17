@@ -24,7 +24,7 @@ test('Airins requires successful business API, classifies auth, permission and n
   assert.equal((await run(air, { fetch: async () => {throw Error('network');} })).state,'error');
 });
 test('Jiangsu uses fixed read-only catalog and rejects expired or unavailable sessions', async () => {
-  const vm = { $options: {name:'PM-time-series'}, $Ajax: { photoTimeSeriesData() {}, componentDeviceOption: async p => {assert.equal(p.siteCodes,'321200');return {code:0,data:[]};} } };
+  const vm = { $options: {name:'PM-time-series'}, $Ajax: { photoTimeSeriesData() {}, getNormalSixParamData() {}, componentDeviceOption: async p => {assert.equal(p.siteCodes,'321200');return {code:0,data:[]};} } };
   const document = {querySelectorAll:()=>[],querySelector:()=>({__vue__:vm})};
   assert.equal((await run(map,{document})).state,'ready');
   vm.$Ajax.componentDeviceOption = async () => ({code:44001});

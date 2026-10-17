@@ -6,12 +6,12 @@ use tauri::{
 };
 
 fn application_icon(_app: &App) -> Result<Image<'static>, Box<dyn std::error::Error>> {
-    #[cfg(dev)]
+    #[cfg(test_environment)]
     {
         return Ok(Image::from_bytes(include_bytes!("../icons/dev/icon.png"))?);
     }
 
-    #[cfg(not(dev))]
+    #[cfg(not(test_environment))]
     {
         _app.default_window_icon()
             .cloned()
@@ -21,6 +21,14 @@ fn application_icon(_app: &App) -> Result<Image<'static>, Box<dyn std::error::Er
 }
 
 pub fn show_main_window(app: &AppHandle) {
+    crate::runtime_log::record(
+        app,
+        "info",
+        "window",
+        "window.show_requested",
+        "请求恢复主窗口",
+        serde_json::json!({}),
+    );
     if let Some(window) = app.get_webview_window("main") {
         let result = window
             .unminimize()
@@ -36,7 +44,11 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(
         app,
         "tray-show",
-        "打开 江苏省泰州环境监测中心智能监测系统",
+        if crate::environment::IS_TEST {
+            "打开 测试版智能监测系统"
+        } else {
+            "打开 江苏省泰州环境监测中心智能监测系统"
+        },
         true,
         None::<&str>,
     )?;
@@ -44,7 +56,11 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItem::with_id(
         app,
         "tray-quit",
-        "退出 江苏省泰州环境监测中心智能监测系统",
+        if crate::environment::IS_TEST {
+            "退出 测试版智能监测系统"
+        } else {
+            "退出 江苏省泰州环境监测中心智能监测系统"
+        },
         true,
         None::<&str>,
     )?;
@@ -57,7 +73,11 @@ pub fn setup_tray(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::with_id("main-tray")
         .icon(icon.clone())
-        .tooltip("江苏省泰州环境监测中心智能监测系统 · 后台运行")
+        .tooltip(if crate::environment::IS_TEST {
+            "测试版智能监测系统 · 后台运行"
+        } else {
+            "江苏省泰州环境监测中心智能监测系统 · 后台运行"
+        })
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

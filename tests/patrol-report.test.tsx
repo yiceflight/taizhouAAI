@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FlightReportPanel } from '../src/components/FlightReportPanel';
-import { DJI_PLAN_URL, localFlightTimeDisplay, missionOriginLabel, patrolTasks, type Mission, type FlightSummary, type FlightWeather, type LocalFlightEvent } from '../src/lib/flightReport';
+import { DJI_MEDIA_URL, DJI_PLAN_URL, isTodayPatrolTask, localFlightTimeDisplay, missionOriginLabel, patrolTasks, visibleReportTasks, type Mission, type FlightSummary, type LocalFlightEvent } from '../src/lib/flightReport';
 import type { BrowserTab } from '../src/lib/workspace';
 import type { WeatherCheck } from '../src/lib/weather';
 const ipc = vi.hoisted(() => ({ invoke: vi.fn(), isTauri: () => true }));
@@ -21,7 +21,6 @@ let root: ReturnType<typeof createRoot>;
 let reports: FlightSummary[];
 let missions: Mission[];
 let reasons: Record<string, string>;
-let weather: Record<string, FlightWeather>;
 let prepare: ReturnType<typeof vi.fn>;
 const button = (text: string) => [...document.querySelectorAll('button')].find(b => b.textContent === text)!;
 const click = async (text: string) => { await act(async () => button(text).click()); };
@@ -30,13 +29,11 @@ beforeEach(() => {
   const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
   window.HTMLElement.prototype.showModal = function () { this.setAttribute('open', ''); };
   vi.stubGlobal('window', window); vi.stubGlobal('document', window.document); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
-  root = createRoot(document.getElementById('root')!); reports = [saved()]; missions = [first, second]; reasons = {}; weather = {}; prepare = vi.fn();
+  root = createRoot(document.getElementById('root')!); reports = [saved()]; missions = [first, second]; reasons = {}; prepare = vi.fn();
   ipc.invoke.mockReset().mockImplementation(async (command, args) => {
     if (command === 'list_flight_reports') return reports;
     if (command === 'list_flight_reasons') return reasons;
     if (command === 'set_flight_reason') { if (args.reason) reasons[args.missionId] = args.reason; else delete reasons[args.missionId]; return; }
-    if (command === 'list_flight_weather') return weather;
-    if (command === 'enrich_flight_weather') return { weather, error: null };
     if (command === 'list_flight_missions') return { missions, total: missions.length };
     if (command === 'collect_flight_report') return { withoutAirData: args.request.withoutAirData, localEventId: args.request.localEventId, mission: args.request.mission, air: { points: args.request.withoutAirData ? [] : [{ pm25: 10 }, { pm25: 20 }] }, media: { folder: 'Immediate-Media' }, photos: [] };
     if (command === 'save_flight_report') return { ...saved(args.data.mission), withoutAirData: args.data.withoutAirData, localEventId: args.data.localEventId };
@@ -62,6 +59,82 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
     await click('补充时间');
     expect([...document.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]')].every(input => !input.value)).toBe(true);
+  });
+  it('filters failed DJI executions from the report list', async () => {
+    missions = []; reports = [];
+    const startTime = Date.parse('2026-09-22T09:00:00+08:00');
+    const djiTask = { mission: { missionId: 0, missionName: '南侧上午9点航线巡查', startTime, endTime: 0, geoLocation: '' }, plannedStartTime: startTime, actualTimeMissing: true, status: '执行失败', mediaReady: false, noMedia: true, taskType: '自动任务', routeName: '南侧火点巡查航线-副本' };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'list_dji_report_tasks' ? [djiTask] : original(command, args));
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(0);
+    expect(document.querySelector('.history-card')?.textContent).toContain('0 个任务');
+  });
+  it('shows media counts and does not offer reports for explicit no-media flights', async () => {
+    missions = []; reports = [];
+    const start = Date.parse('2026-09-22T09:00:00+08:00');
+    const task = (name: string, media: Partial<{ noMedia: boolean; mediaReady: boolean; mediaUploadedCount: number; mediaExpectedCount: number }>) => ({
+      taskId: name,
+      mission: { missionId: 0, missionName: name, startTime: start, endTime: start + 20 * 60000, geoLocation: '' },
+      status: '执行成功', mediaReady: true, mediaUploadedCount: 0, mediaExpectedCount: 0, ...media,
+    });
+    const noMedia = task('无媒体巡飞', { noMedia: true });
+    const withMedia = task('有媒体巡飞', { mediaUploadedCount: 12, mediaExpectedCount: 15 });
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'list_dji_report_tasks' ? [noMedia, { ...withMedia, taskId: 'with-media' }] : original(command, args));
+    await render(false, tabs.slice(1));
+    const rows = [...document.querySelectorAll('tbody tr')];
+    const noMediaRow = rows.find(row => row.textContent?.includes('无媒体巡飞'))!;
+    const withMediaRow = rows.find(row => row.textContent?.includes('有媒体巡飞'))!;
+    expect(noMediaRow.querySelector('.task-media')?.textContent).toContain('无媒体文件');
+    expect(noMediaRow.querySelector('.task-actions')?.textContent).toContain('无需生成报告');
+    expect(noMediaRow.querySelector('.task-actions button')).toBeNull();
+    expect(withMediaRow.querySelector('.task-media')?.textContent).toContain('媒体文件（12/15）');
+  });
+  it('does not render missing media counts as 0/0', async () => {
+    missions = []; reports = [];
+    const start = Date.parse('2026-09-22T09:00:00+08:00');
+    const task = {
+      taskId: 'unknown-media',
+      mission: { missionId: 0, missionName: '数量待核对巡飞', startTime: start, endTime: start + 20 * 60000, geoLocation: '' },
+      status: '执行成功', mediaReady: true, noMedia: false,
+    };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'list_dji_report_tasks' ? [task] : original(command, args));
+    await render(false, tabs.slice(1));
+    const media = document.querySelector('.task-media')?.textContent ?? '';
+    expect(media).toContain('媒体已上传（数量待核对）');
+    expect(media).not.toContain('0/0');
+  });
+  it('links each DJI task to its corresponding media folder', async () => {
+    missions = []; reports = [];
+    const start = Date.parse('2026-09-22T09:00:00+08:00');
+    const task = {
+      taskId: 'media-folder-task',
+      mediaFolderId: 101,
+      mission: { missionId: 0, missionName: '媒体目录巡飞', startTime: start, endTime: start + 20 * 60000, geoLocation: '' },
+      status: '执行成功', mediaReady: true, noMedia: false,
+    };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'list_dji_report_tasks' ? [task] : original(command, args));
+    await render(false, tabs.slice(1));
+    const link = document.querySelector<HTMLAnchorElement>('.task-link');
+    expect(link?.textContent).toBe('司空媒体库 ↗');
+    expect(link?.href).toBe(`${DJI_MEDIA_URL}?page=1&size=50&pid=101`);
+  });
+  it('uses DJI as the date authority and removes Airins-only rows while retaining partial executions', () => {
+    const start = Date.parse('2026-10-16T09:00:00+08:00');
+    const dji = (id: string, offsetMinutes: number, status: string) => ({
+      taskId: id,
+      mission: { missionId: 0, missionName: `司空-${id}`, startTime: start + offsetMinutes * 60000, endTime: start + offsetMinutes * 60000 + 20 * 60000, geoLocation: '' },
+      status, mediaReady: true,
+    });
+    const platform = [dji('ok-1', 0, '执行成功'), dji('partial-1', 60, '部分执行'), dji('ok-2', 120, '执行成功'), dji('failed-1', 180, '执行失败'), dji('failed-2', 240, '执行失败')];
+    const rows = platform.map((task, index) => ({ key: `dji-${index}`, mission: task.mission, report: null, djiTask: task }));
+    rows.push({ key: 'airins-extra-1', mission: { missionId: 101, missionName: '50634a31_2026-10-16 17:01:13', startTime: start + 8 * 60 * 60000, endTime: start + 8 * 60 * 60000 + 30 * 60000, geoLocation: '' }, report: null });
+    rows.push({ key: 'airins-extra-2', mission: { missionId: 102, missionName: '50634a31_2026-10-16 15:01:16', startTime: start + 6 * 60 * 60000, endTime: start + 6 * 60 * 60000 + 34 * 60000, geoLocation: '' }, report: null });
+    expect(visibleReportTasks(rows, platform)).toHaveLength(3);
+    expect(visibleReportTasks(rows, platform).map(task => task.djiTask?.status)).toEqual(['执行成功', '部分执行', '执行成功']);
   });
   it('uses synchronized DJI times in the row and photo matching without manual input or Airins', async () => {
     missions = []; reports = [];
@@ -132,6 +205,8 @@ describe('task-owned reports', () => {
   it('loads tasks and generates a report only for the selected row, then replaces its action with open', async () => {
     await render();
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
+    expect(document.querySelector('tbody tr .task-actual-time')?.textContent).toContain('至');
+    expect(document.querySelector('tbody tr .task-actual-time')?.textContent).not.toContain('结束');
     expect(document.querySelectorAll('tbody td:last-child button')).toHaveLength(4);
     expect(button('打开 Word')).toBeDefined();
     await click('生成报告');
@@ -144,6 +219,13 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
     expect([...document.querySelectorAll('tbody td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告', '打开 Word', '打开文件夹', '重新生成报告']);
     expect(button('生成报告')).toBeUndefined();
+  });
+  it('clears cached task rows after the local data reset completes', async () => {
+    await render();
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
+    await act(async () => root.render(<FlightReportPanel dataResetKey={1} tabs={tabs} ready onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(0);
+    expect(document.querySelector('.history-card')?.textContent).toContain('0 个任务');
   });
   it('uses the same primary action and dialog for tasks with and without Airins data', async () => {
     reports = [];
@@ -170,6 +252,8 @@ describe('task-owned reports', () => {
     await render();
     const row = button('打开 Word').closest('tr')!;
     expect([...row.querySelectorAll('td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告']);
+    expect(row.querySelector('.task-action-list')).toBeDefined();
+    expect(row.querySelectorAll('.task-action-link')).toHaveLength(2);
     await click('重新生成报告');
     expect(document.querySelector('dialog')?.textContent).toContain('重新生成巡飞报告');
     expect(document.querySelector('dialog')?.textContent).toContain(first.missionName);
@@ -212,7 +296,7 @@ describe('task-owned reports', () => {
     await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
     expect(document.querySelector('dialog')?.textContent).toContain('暂无可飞数据');
     await click('自动匹配并读取资料');
-    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, withoutAirData: true, localEventId: null, mission: second } });
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, mediaKey: `mission-${second.startTime}-${second.endTime}`, withoutAirData: true, localEventId: null, mission: second } });
     expect(document.querySelector('dialog')?.textContent).toContain('报告对应内容留空');
     expect(document.querySelector('dialog')?.textContent).not.toContain('全部为 0');
     await click('生成并保存 Word 快报');
@@ -239,7 +323,7 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
     expect(document.querySelector('.report-material-value')?.textContent).toContain('07:00:05');
     await click('自动匹配并读取资料');
-    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, withoutAirData: true, localEventId: completedWithoutAir.id, mission: { missionId: 0, missionName: '无采样巡飞', startTime: Date.parse('2026-09-22T07:00:05+08:00'), endTime: Date.parse('2026-09-22T07:20:05+08:00'), geoLocation: '' } } });
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', { request: { djiSession: 'fixture', djiTabId: 2, mediaKey: `mission-${Date.parse('2026-09-22T07:00:05+08:00')}-${Date.parse('2026-09-22T07:20:05+08:00')}`, withoutAirData: true, localEventId: completedWithoutAir.id, mission: { missionId: 0, missionName: '无采样巡飞', startTime: Date.parse('2026-09-22T07:00:05+08:00'), endTime: Date.parse('2026-09-22T07:20:05+08:00'), geoLocation: '' } } });
     await click('生成并保存 Word 快报');
     expect(button('打开 Word')).toBeDefined();
     expect(document.querySelector('tbody')?.textContent).not.toContain('任务编号 0');
@@ -282,17 +366,14 @@ describe('task-owned reports', () => {
     await click('关闭');
     expect(document.querySelector('dialog')).toBeNull();
   });
-  it('shows platform origin and persisted historical weather for each task', async () => {
-    weather = { 11: { missionId: 11, startTime: first.startTime, observedAt: Math.floor(first.startTime / 3600000) * 3600,
-      fetchedAt: Date.now() / 1000, source: 'Open-Meteo 历史预报', status: 'ok', temperature: 21.5,
-      weatherCode: 3, windSpeed: 1.4, windGusts: 2.6, windDirection: 90, precipitation: 0 } };
+  it('shows platform origin without backfilling historical weather', async () => {
     await render();
     expect(document.querySelector('tbody')?.textContent).toContain('司空平台任务');
     expect(document.querySelector('tbody')?.textContent).not.toContain('模型条件正常');
-    expect(document.querySelector('tbody')?.textContent).not.toContain('Open-Meteo 历史预报');
-    expect(document.querySelector('tbody')?.textContent).toContain('阴 · 21.5 °C');
+    expect(document.querySelector('tbody')?.textContent).toContain('司空平台任务无需记录天气');
     expect(document.querySelectorAll('[role="listbox"]')).toHaveLength(0);
-    expect(ipc.invoke).toHaveBeenCalledWith('enrich_flight_weather', { missions });
+    expect(ipc.invoke).not.toHaveBeenCalledWith('list_flight_weather', expect.anything());
+    expect(ipc.invoke).not.toHaveBeenCalledWith('enrich_flight_weather', expect.anything());
   });
   it('links each task to its Airins mission and persisted DJI media folder', async () => {
     await render();
@@ -445,6 +526,48 @@ it('keeps cleared missions and reports hidden after reload while showing new tas
 describe('DJI scheduled flight automation', () => {
   afterEach(() => vi.useRealTimers());
   const external = (offset = 0) => ({ mission: { ...first, missionId: 0, missionName: '每日7时南侧火点巡飞', startTime: first.startTime - offset, endTime: first.endTime - offset }, status: '执行成功', mediaReady: true });
+  it('limits automatic report generation to today while keeping older tasks manual', async () => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const today = external();
+    const yesterday = external(86400000);
+    expect(isTodayPatrolTask({ key: 'today', mission: today.mission, report: null, djiTask: today }, Date.now())).toBe(true);
+    expect(isTodayPatrolTask({ key: 'yesterday', mission: yesterday.mission, report: null, djiTask: yesterday }, Date.now())).toBe(false);
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [today, yesterday], skipped: 0, mediaTabId: 2 };
+      const result = await original(command, args);
+      if (command === 'save_flight_report') reports = [result];
+      return result;
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady active={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    const collected = ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report');
+    expect(collected).toHaveLength(1);
+    expect(collected[0][1]).toEqual(expect.objectContaining({ request: expect.objectContaining({ mission: today.mission }) }));
+    expect(document.body.textContent).toContain('生成报告');
+  });
+  it('serializes automatic DJI collection because all jobs share one media tab', async () => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const firstTask = external();
+    const secondTask = { ...external(15 * 60000), mission: { ...external(15 * 60000).mission, missionName: '每日8时南侧火点巡飞' } };
+    let active = 0;
+    let maxActive = 0;
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [firstTask, secondTask], skipped: 0, mediaTabId: 2 };
+      if (command === 'collect_flight_report') {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await Promise.resolve();
+        active -= 1;
+      }
+      return original(command, args);
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady active={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(maxActive).toBe(1);
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
+  });
   it('generates an external flight without Airins while the task page is hidden, then reuses the report', async () => {
     vi.useFakeTimers(); reports = []; missions = [];
     const original = ipc.invoke.getMockImplementation()!;
@@ -482,6 +605,22 @@ describe('DJI scheduled flight automation', () => {
     await act(async () => vi.advanceTimersByTimeAsync(60000));
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(1);
+  });
+  it('explains a media-ready partial execution retry as a media-page switch issue', async () => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const original = ipc.invoke.getMockImplementation()!;
+    const partial = { ...external(), status: '部分执行', partialReason: '2026-10-17 15:25:04 飞行器执行飞行任务过程中低电量返航，无法完成航线飞行（错误码：321773）' };
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [partial], skipped: 0, mediaTabId: 2 };
+      if (command === 'collect_flight_report') throw new Error('司空列表切换未完成，请等待媒体库加载后重试');
+      return original(command, args);
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady active={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(document.querySelector('tbody')?.textContent).toContain(partial.partialReason);
+    expect(document.querySelector('tbody')?.textContent).toContain('媒体已上传');
+    expect(document.querySelector('tbody')?.textContent).toContain('媒体库页面切换未完成');
+    expect(document.querySelector('tbody')?.textContent).not.toContain('等待媒体上传结束');
   });
   it('upgrades a partial report when sampling recovers, retries failures, and stops once complete', async () => {
     vi.useFakeTimers(); reports = []; missions = [];
@@ -616,6 +755,38 @@ describe('distinct nearby DJI executions', () => {
   const mission = { missionId: 0, missionName: '同名巡查', startTime: Date.now() - 3600000, endTime: Date.now() - 3480000, geoLocation: '' };
   const a = { mission, status: '执行终止', mediaReady: true };
   const b = { mission: { ...mission, startTime: mission.startTime + 240000, endTime: mission.endTime + 240000 }, status: '执行成功', mediaReady: true };
+  it('uses the DJI plan name when Airins returns a generated timestamp name', () => {
+    const airins = { ...mission, missionId: 88, missionName: '50634a31_2026-10-16 10:03:27' };
+    const dji = { ...a, taskId: '00000000-0000-4000-8000-000000000088', mission: { ...mission, missionName: '南侧上午9点航线巡查' } };
+    const tasks = patrolTasks([airins], [], null, [], 0, [dji]);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].djiTask).toBe(dji);
+    expect(tasks[0].mission?.missionName).toBe('南侧上午9点航线巡查');
+    const report = { ...saved({ ...airins, missionId: 0 }), withoutAirData: true };
+    const withReport = patrolTasks([airins], [report], null, [], 0, [dji]);
+    expect(withReport).toHaveLength(1);
+    expect(withReport[0].report).toBe(report);
+    expect(withReport[0].mission?.missionName).toBe('南侧上午9点航线巡查');
+  });
+  it('associates a unique start-time match when Airins and DJI end times differ', () => {
+    const airins = {
+      ...mission,
+      missionId: 88,
+      missionName: '50634a31_2026-10-17 09:01:13',
+      startTime: mission.startTime + 60_000,
+      endTime: mission.endTime + 9 * 60_000,
+    };
+    const dji = {
+      ...a,
+      taskId: '00000000-0000-4000-8000-000000000089',
+      mission: { ...mission, missionName: '南侧上午9点航线巡查' },
+    };
+    const tasks = patrolTasks([airins], [], null, [], 0, [dji]);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].djiTask).toBe(dji);
+    expect(tasks[0].mission?.missionId).toBe(88);
+    expect(tasks[0].mission?.missionName).toBe('南侧上午9点航线巡查');
+  });
   it('keeps both executions and associates each saved photo report with its exact flight', () => {
     const report = { ...saved(mission), withoutAirData: true };
     for (const incoming of [[a, b], [b, a]]) {

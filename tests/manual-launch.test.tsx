@@ -9,7 +9,7 @@ const now = Date.now();
 const data = (potassium: number | null = 0.2, age = 1): MonitorView => ({
   enabled: true, syncing: false, lastAttempt: null, lastSuccess: null, error: null, total: 1, queryThrough: null,
   rows: [{ potassium, time: new Date(now + (8 - age) * 3600000).toISOString().slice(0, 19).replace('T', ' ') }],
-  settings: { ...defaultSettings, noFlyPeriods: [] }, flight: { enabled: false, threshold: 1, event: null },
+  settings: { ...defaultSettings, noFlyPeriods: [] }, flight: { threshold: 1, event: null, selectedRoute: '测试航线' },
   weather: { location: '机场', latitude: 0, longitude: 0, source: 'test', refreshing: false, allowed: true, level: 'ok', label: '通过', reasons: [],
     current: { observedAt: now / 1000, fetchedAt: now / 1000, temperature: 25.7, weatherCode: 3, windSpeed: 1.97, windGusts: 3, windDirection: 0, precipitation: 0 } },
 });
@@ -109,16 +109,18 @@ describe('manual launch confirmation', () => {
     await act(async () => finish(false));
     expect(button('刷新状态').disabled).toBe(false);
   });
-  it.each(['windSpeed', 'windGusts'] as const)('prohibits manual launch when DJI says unsafe regardless of wind (%s)', async field => {
+  it.each(['windSpeed', 'windGusts'] as const)('allows manual force launch when DJI says unsafe (%s)', async field => {
     const d = data(2);
     d.weather!.allowed = false; d.weather!.level = 'unsafe'; d.weather!.current![field] = 0;
     const action = await render(d);
-    expect(button('司空气象未通过').disabled).toBe(true);
-    await click('司空气象未通过');
-    expect(document.querySelector('dialog')).toBeNull();
-    expect(action).not.toHaveBeenCalled();
+    expect(button('手动强制起飞').disabled).toBe(false);
+    await click('手动强制起飞');
+    const checkbox = document.querySelector<HTMLInputElement>('.manual-launch-override input')!;
+    await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
+    await click('确认强制起飞');
+    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { weatherOverrideConfirmed: true });
   });
-  it.each(['windSpeed', 'windGusts'] as const)('blocks a confirmed override when DJI changes its verdict (%s)', async field => {
+  it.each(['windSpeed', 'windGusts'] as const)('keeps a manual override available when DJI changes its verdict (%s)', async field => {
     const d = data(2);
     d.weather!.allowed = false; d.weather!.level = 'caution'; d.weather!.current![field] = 11.99;
     const action = await render(d); await click('手动强制起飞');
@@ -126,10 +128,10 @@ describe('manual launch confirmation', () => {
     await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
     expect(button('确认强制起飞').disabled).toBe(false);
     d.weather!.current![field] = 12; d.weather!.level = 'unsafe'; await render(d, action);
-    expect(button('确认强制起飞').disabled).toBe(true);
-    expect(document.querySelector('.manual-launch-override')).toBeNull();
-    expect(document.querySelector('dialog')?.textContent).toContain('人工确认不能覆盖');
-    await click('确认强制起飞'); expect(action).not.toHaveBeenCalled();
+    expect(button('确认强制起飞').disabled).toBe(false);
+    expect(document.querySelector('.manual-launch-override')).not.toBeNull();
+    await click('确认强制起飞');
+    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { weatherOverrideConfirmed: true });
   });
   it('blocks a manual launch when its open confirmation crosses into a no-fly period', async () => {
     const at=Date.parse('2026-10-09T04:59:00+08:00'); vi.setSystemTime(at);

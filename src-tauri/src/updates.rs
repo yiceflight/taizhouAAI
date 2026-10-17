@@ -1,5 +1,8 @@
 #[tauri::command]
 pub async fn check_update_channel() -> Result<(), String> {
+    if crate::environment::IS_TEST {
+        return Err("测试版不连接正式更新服务，请通过开发构建更新。".into());
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config: serde_json::Value =
         serde_json::from_str(include_str!("../tauri.conf.json")).map_err(|_| "更新配置无效")?;

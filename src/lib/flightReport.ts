@@ -6,17 +6,41 @@ export type FlightSummary = { withoutAirData?:boolean; localEventId?:string|null
 export type FlightTime = { startTime: number; endTime: number; durationMs: number; source: 'dji-plan'; precision: 'minute' };
 export type LocalFlightEvent = { id:string; observedAt:string; name:string; status:string; source?:string; error?:string|null; launchAt?:number|null; statusCheckError?:string|null; statusCheckedAt?:number|null; weatherOverrideConfirmedAt?:number|null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
 
-export type DjiTask = { mission: Mission; status: string; mediaReady: boolean; noMedia?: boolean; taskId?: string; mediaFolderId?: number | null; plannedStartTime?: number; actualTimeMissing?: boolean };
+export type DjiTask = { mission: Mission; status: string; mediaReady: boolean; noMedia?: boolean; taskId?: string; mediaFolderId?: number | null; mediaUploadedCount?: number; mediaExpectedCount?: number; plannedStartTime?: number; actualTimeMissing?: boolean; taskType?: string; routeName?: string; partialReason?: string };
 export const flightKey = (mission: Mission) => `flight-${mission.startTime}-${mission.endTime}-${mission.missionName}`;
 export type PatrolTask = { key: string; mission: Mission | null; report: FlightSummary | null; localEvent?: LocalFlightEvent; djiTask?: DjiTask };
-export type FlightWeather = {
-  missionId: number; startTime: number; observedAt: number; fetchedAt: number; source: string;
-  status: 'ok' | 'caution' | 'unsafe' | 'unknown'; temperature: number; weatherCode: number;
-  windSpeed: number; windGusts: number; windDirection: number | null; precipitation: number;
-};
+const shanghaiDay = (value: number) => value > 0 && Number.isFinite(value)
+  ? new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value))
+  : '';
+function patrolTaskDay(task: PatrolTask): string {
+  const start = task.djiTask?.mission.startTime || task.djiTask?.plannedStartTime || task.mission?.startTime || task.report?.mission?.startTime || 0;
+  if (start > 0) return shanghaiDay(start);
+  const observed = task.localEvent ? Date.parse(`${task.localEvent.observedAt.replace(' ', 'T')}+08:00`) : NaN;
+  return Number.isFinite(observed) ? shanghaiDay(observed) : '';
+}
+/** Automatic report generation is limited to executions on today's Beijing date. */
+export function isTodayPatrolTask(task: PatrolTask, now = Date.now()): boolean {
+  const today = shanghaiDay(now);
+  return !!today && patrolTaskDay(task) === today;
+}
+export function visibleReportTasks(tasks: PatrolTask[], djiTasks: DjiTask[] = []): PatrolTask[] {
+  const withoutFailed = tasks.filter(task => task.djiTask?.status !== '执行失败');
+  // Once司空 has returned records for a Beijing calendar day, that day's
+  // task set is authoritative. Airins history and local receipts can contain
+  // nearby/generated rows for the same flight; keeping them would inflate the
+  // count and show records absent from the platform list.
+  const authoritativeDays = new Set(djiTasks.map(task => shanghaiDay(task.mission.startTime || task.plannedStartTime || 0)).filter(Boolean));
+  if (!authoritativeDays.size) return withoutFailed;
+  return withoutFailed.filter(task => task.djiTask || !authoritativeDays.has(patrolTaskDay(task)));
+}
 export const AIRINS_HISTORY_URL = 'https://aai.airins.cn/sniff/HistoryCloud';
 export const DJI_MEDIA_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/media';
 export const DJI_PLAN_URL = DJI_MEDIA_URL.replace('#/media', '#/plan');
+export function djiMediaFolderUrl(folderId?: number | null): string {
+  return typeof folderId === 'number' && Number.isSafeInteger(folderId) && folderId > 0
+    ? `${DJI_MEDIA_URL}?page=1&size=50&pid=${folderId}`
+    : DJI_MEDIA_URL;
+}
 export function airinsMissionUrl(mission: Mission): string {
   return `${AIRINS_HISTORY_URL}?missionId=${encodeURIComponent(mission.missionId)}`;
 }
@@ -46,7 +70,7 @@ export function localFlightDisplay(event: LocalFlightEvent): { label: string; ac
     flight_error: ['执飞异常', '请到司空核查飞行记录'],
     paused: ['任务暂停', '请到司空核查任务'],
     uncertain: ['结果待核查', '请到司空核查 · 不自动重试'],
-    not_flown: ['未起飞 · 司空天气阻飞', '可手动执行任务'],
+    not_flown: ['未起飞 · 司空天气阻飞', '请到司空确认，可切换 Chrome 页面'],
     failed: ['起飞未完成 · 待人工核验', event.source === 'auto' ? '未起飞 · 新小时数据到达后重新判断' : '未起飞 · 可手动重新发起'],
     restricted: ['禁飞时间 · 仅记录', '未执行起飞'],
     canceled: ['已取消', '本次任务已取消'],
@@ -81,8 +105,23 @@ export function localFlightTimeDisplay(event: LocalFlightEvent): { label: string
 }
 export function patrolTasks(missions: Mission[], reports: FlightSummary[], localEvent?: LocalFlightEvent | null, records: LocalFlightEvent[] = [], clearedAt = 0, djiTasks: DjiTask[] = []): PatrolTask[] {
   const tasks = new Map<string, PatrolTask>();
-  const near = (a: Mission, b: Mission) => a.startTime > 0 && b.startTime > 0 && a.endTime > a.startTime && b.endTime > b.startTime && a.missionName === b.missionName
-    && Math.abs(a.startTime - b.startTime) <= 300000 && Math.abs(a.endTime - b.endTime) <= 300000;
+  const nearStart = (a: Mission, b: Mission) => a.startTime > 0 && b.startTime > 0
+    && Math.abs(a.startTime - b.startTime) <= 300000;
+  const nearTime = (a: Mission, b: Mission) => nearStart(a, b) && a.endTime > a.startTime && b.endTime > b.startTime
+    && Math.abs(a.endTime - b.endTime) <= 300000;
+  // Airins and FlightHub do not always stop their clocks at the same point:
+  // the records in the live pages can share a takeoff minute while their end
+  // times differ by several minutes. Prefer a complete window match, then use
+  // a unique start-time match. Never use this fallback when another execution
+  // has the same start window, because that would attach the sampling link to
+  // the wrong flight.
+  const executionMatches = (targets: PatrolTask[], mission: Mission) => {
+    const candidates = targets.filter(task => task.mission && nearStart(task.mission, mission));
+    const complete = candidates.filter(task => nearTime(task.mission!, mission));
+    return (complete.length === 1 ? complete : candidates).filter(task =>
+      djiTasks.filter(t => nearStart(t.mission, task.mission!)).length === 1,
+    );
+  };
   // A DJI execution is an identity, not a fuzzy match to another DJI execution.
   djiTasks = [...new Map(djiTasks.filter(t => (t.mission.startTime || t.plannedStartTime || 0) > clearedAt).map(t => [t.taskId ? `dji-${t.taskId}` : flightKey(t.mission), t])).values()];
   if (clearedAt > 0) {
@@ -95,9 +134,9 @@ export function patrolTasks(missions: Mission[], reports: FlightSummary[], local
   }
   for (const mission of missions) {
     const key = `mission-${mission.missionId}`;
-    const aliases = [...tasks.values()].filter(task => task.mission && !task.mission.missionId && near(task.mission, mission)
-      && missions.filter(m => near(m, task.mission!)).length === 1
-      && djiTasks.filter(t => near(t.mission, mission)).length <= 1);
+    const aliases = [...tasks.values()].filter(task => task.mission && !task.mission.missionId && nearStart(task.mission, mission)
+      && missions.filter(m => nearStart(m, task.mission!)).length === 1
+      && djiTasks.filter(t => nearStart(t.mission, mission)).length <= 1);
     const linked = aliases.length === 1 ? aliases[0] : null;
     if (linked) tasks.delete(linked.key);
     tasks.set(key, { key, mission, report: tasks.get(key)?.report ?? linked?.report ?? null });
@@ -106,10 +145,16 @@ export function patrolTasks(missions: Mission[], reports: FlightSummary[], local
   for (const djiTask of djiTasks) {
     const mission = djiTask.mission;
     if ((mission.startTime || djiTask.plannedStartTime || 0) <= clearedAt) continue;
-    const matches = associationTargets.filter(task => task.mission && (task.mission.missionId
-      ? near(task.mission, mission) && djiTasks.filter(t => near(t.mission, task.mission!)).length === 1
-      : flightKey(task.mission) === flightKey(mission)));
-    if (matches.length === 1) matches[0].djiTask = djiTask;
+    // Airins may return a generated timestamp as the mission name. Keep the
+    // Airins ID/location for the link, but use a unique execution-time match
+    // so nearby executions remain separate.
+    const matches = executionMatches(associationTargets, mission);
+    if (matches.length === 1) {
+      matches[0].djiTask = djiTask;
+      // Keep Airins id/location for sampling links, but display and save the
+      // authoritative DJI plan name.
+      matches[0].mission = { ...matches[0].mission!, missionName: mission.missionName };
+    }
     else {
       const key = djiTask.taskId ? `dji-${djiTask.taskId}` : flightKey(mission);
       tasks.set(key, { key, mission, report: tasks.get(key)?.report ?? null, djiTask });

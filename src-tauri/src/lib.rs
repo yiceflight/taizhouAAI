@@ -1,10 +1,16 @@
 use std::process::Command;
 use tauri::Manager;
 
+mod data_reset;
+
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
 fn open_in_chrome(url: &str) -> Result<(), String> {
+    open_default_chrome(url)
+}
+
+fn open_default_chrome(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         for app in ["Google Chrome", "Google Chrome Canary", "Chromium"] {
@@ -56,6 +62,58 @@ fn open_in_chrome(url: &str) -> Result<(), String> {
     Err("当前系统暂不支持自动打开 Chrome 扩展管理页。".to_string())
 }
 
+async fn refresh_after_resume(app: tauri::AppHandle) {
+    runtime_log::record(
+        &app,
+        "info",
+        "app",
+        "app.resume_checks_started",
+        "系统恢复后立即检查天气和运行状态",
+        serde_json::json!({}),
+    );
+
+    // Refresh weather first so any monitoring sync that follows cannot make a
+    // launch decision from the stale pre-lock receipt.
+    weather::refresh(&app, true).await;
+    let readiness_result = readiness::refresh(&app).await;
+    if let Err(error) = &readiness_result {
+        runtime_log::record(
+            &app,
+            "warning",
+            "readiness",
+            "resume.check_failed",
+            "系统恢复后的运行状态检查失败",
+            serde_json::json!({"error":error}),
+        );
+    }
+
+    if readiness_result.is_ok() {
+        if let Err(error) = monitoring::resume_sync(&app).await {
+            runtime_log::record(
+                &app,
+                "warning",
+                "monitoring",
+                "resume.sync_failed",
+                "系统恢复后的监测同步失败",
+                serde_json::json!({"error":error}),
+            );
+        }
+    }
+
+    let weather_view = weather::view(&app);
+    runtime_log::record(
+        &app,
+        "info",
+        "app",
+        "app.resume_checks_finished",
+        "系统恢复后的检查完成",
+        serde_json::json!({
+            "weather": serde_json::to_value(weather_view).unwrap_or(serde_json::Value::Null),
+            "ready": readiness::view(&app).ready,
+        }),
+    );
+}
+
 #[tauri::command]
 fn open_chrome_extensions() -> Result<(), String> {
     open_in_chrome("chrome://extensions")
@@ -65,7 +123,9 @@ fn open_business_site(url: String) -> Result<(), String> {
     if !bridge::allowed_url(&url) {
         return Err("不支持的业务网站。".into());
     }
-    open_in_chrome(&url)
+    // Every browser entry point uses the user's existing Chrome profile so
+    // platform sessions and the bridge extension see the same pages.
+    open_default_chrome(&url)
 }
 
 #[tauri::command]
@@ -81,10 +141,16 @@ async fn open_airins_realtime(app: tauri::AppHandle) -> Result<serde_json::Value
         Some(target) => target,
         None => (bridge.single_session()?, -1),
     };
-    bridge.request(session, tab_id, serde_json::json!({"type":"airins-realtime"})).await
+    bridge
+        .request(
+            session,
+            tab_id,
+            serde_json::json!({"type":"airins-realtime"}),
+        )
+        .await
 }
 
-#[cfg(all(dev, target_os = "macos"))]
+#[cfg(all(test_environment, target_os = "macos"))]
 fn set_dev_app_icon() {
     use objc2::{AllocAnyThread, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSImage};
@@ -94,16 +160,24 @@ fn set_dev_app_icon() {
     let application = NSApplication::sharedApplication(marker);
     let data = NSData::with_bytes(include_bytes!("../icons/dev/icon.icns"));
     if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) {
-        unsafe { application.setApplicationIconImage(Some(&icon)); }
+        unsafe {
+            application.setApplicationIconImage(Some(&icon));
+        }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut context = tauri::generate_context!();
+    environment::configure(&mut context);
+    let mut builder = tauri::Builder::default();
+    if !environment::IS_TEST {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(runtime_log::RuntimeLog::default())
         .manage(bridge::Bridge::default())
         .manage(monitoring::Monitor::default())
         .manage(flight::Flight::default())
@@ -111,6 +185,7 @@ pub fn run() {
         .manage(weather::Weather::default())
         .setup(|app| {
             use tauri::Manager;
+            runtime_log::start(app.handle());
             app.state::<bridge::Bridge>().start(app.handle().clone());
             readiness::start(app.handle().clone());
             flight::initialize(app.handle()).map_err(std::io::Error::other)?;
@@ -125,6 +200,14 @@ pub fn run() {
                     // Keep the webview and background work alive. Explicit quit and
                     // updater restarts still use the normal application exit path.
                     api.prevent_close();
+                    runtime_log::record(
+                        window.app_handle(),
+                        "info",
+                        "window",
+                        "window.hide_requested",
+                        "关闭窗口，转入托盘后台运行",
+                        serde_json::json!({}),
+                    );
                     if let Err(error) = window.hide() {
                         eprintln!("Could not hide main window: {error}");
                     }
@@ -132,6 +215,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            environment::is_test_environment,
+            runtime_log::get_runtime_logs,
+            runtime_log::export_runtime_logs,
+            runtime_log::open_runtime_log_exports,
             open_chrome_extensions,
             open_business_site,
             open_airins_realtime,
@@ -145,7 +232,9 @@ pub fn run() {
             monitoring::get_monitoring,
             weather::refresh_weather,
             settings::save_workspace_settings,
-            flight::set_flight_enabled,
+            flight::list_flight_routes,
+            flight::sync_flight_routes,
+            flight::set_flight_route,
             flight::set_flight_delay,
             flight::cancel_flight,
             flight::launch_flight,
@@ -154,6 +243,7 @@ pub fn run() {
             flight::dismiss_flight,
             flight::resolve_flight,
             flight::clear_task_list,
+            data_reset::clear_all_data,
             flight::open_prepared_flight,
             monitoring::sync_monitoring,
             monitoring::set_monitoring_enabled,
@@ -175,10 +265,20 @@ pub fn run() {
             reports::open_reports_directory,
             updates::check_update_channel
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|_app, _event| {
-            #[cfg(all(dev, target_os = "macos"))]
+            if matches!(&_event, tauri::RunEvent::Exit) {
+                runtime_log::record(
+                    _app,
+                    "info",
+                    "app",
+                    "app.exit",
+                    "客户端正常退出",
+                    serde_json::json!({}),
+                );
+            }
+            #[cfg(all(test_environment, target_os = "macos"))]
             if let tauri::RunEvent::Ready = &_event {
                 set_dev_app_icon();
             }
@@ -186,6 +286,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = _event {
                 window_lifecycle::show_main_window(_app);
+            }
+
+            if let tauri::RunEvent::Resumed = &_event {
+                let app = _app.clone();
+                tauri::async_runtime::spawn(refresh_after_resume(app));
             }
         });
 }
@@ -197,9 +302,9 @@ mod bridge_diagnostics;
 mod reports;
 mod updates;
 
+mod flight_weather;
 mod monitoring;
 mod settings;
-mod flight_weather;
 
 mod flight;
 
@@ -208,3 +313,7 @@ mod flight_report;
 mod readiness;
 
 mod weather;
+
+mod runtime_log;
+
+mod environment;

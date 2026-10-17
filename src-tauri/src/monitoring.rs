@@ -32,11 +32,22 @@ pub struct Monitor {
     last_attempt: Mutex<Option<String>>,
     error: Mutex<Option<String>>,
 }
+impl Monitor {
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn reset(&self) {
+        *self.last_attempt.lock().unwrap() = None;
+        *self.error.lock().unwrap() = None;
+    }
+}
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HourRow {
     time: String,
     potassium: Option<f64>,
+    pm25: Option<f64>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -121,19 +132,36 @@ pub(crate) fn parse(value: &str) -> Result<NaiveDateTime, String> {
     }
     Ok(time)
 }
-fn window(db: &Connection) -> Result<(String, String), String> {
-    let end_now = now()
+fn current_hour() -> NaiveDateTime {
+    now()
         .with_minute(0)
         .unwrap()
         .with_second(0)
         .unwrap()
         .with_nanosecond(0)
-        .unwrap();
+        .unwrap()
+}
+fn window(db: &Connection) -> Result<(String, String), String> {
+    let end_now = current_hour();
     let start = match setting(db, "query_through")? {
         Some(value) => (parse(&value)? - Duration::hours(48)).min(end_now - Duration::hours(48)),
         None => end_now - Duration::days(7),
     };
     let end = (start + Duration::days(7)).min(end_now);
+    Ok((
+        start.format(FORMAT).to_string(),
+        end.format(FORMAT).to_string(),
+    ))
+}
+fn requested_window(range: &str) -> Result<(String, String), String> {
+    let end = current_hour();
+    let start = match range {
+        "today" => end.date().and_hms_opt(0, 0, 0).unwrap(),
+        "24" => end - Duration::hours(23),
+        "72" => end - Duration::hours(71),
+        "168" => end - Duration::hours(167),
+        _ => return Err("时间范围无效，请重新选择 24 小时、3 天或 7 天。".into()),
+    };
     Ok((
         start.format(FORMAT).to_string(),
         end.format(FORMAT).to_string(),
@@ -163,7 +191,7 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
         if time < lower
             || time > upper
             || !seen.insert(&row.time)
-            || [row.potassium]
+            || [row.potassium, row.pm25]
                 .iter()
                 .flatten()
                 .any(|v| !v.is_finite() || *v < 0.0)
@@ -176,14 +204,48 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
     for row in batch.rows {
         tx.execute("INSERT INTO hourly_observations(city_code,observed_at,potassium,pm25,unit,source_url,data_source,common_site_type,synced_at)
             VALUES ('321200',?,?,?,?,?,'A_6','30',?) ON CONFLICT(city_code,observed_at) DO UPDATE SET
-            potassium=excluded.potassium,pm25=excluded.pm25,source_url=excluded.source_url,synced_at=excluded.synced_at",
-            params![row.time, row.potassium, Option::<f64>::None, batch.unit, batch.url, synced]).map_err(|e| e.to_string())?;
+            potassium=COALESCE(excluded.potassium,hourly_observations.potassium),pm25=COALESCE(excluded.pm25,hourly_observations.pm25),source_url=excluded.source_url,synced_at=excluded.synced_at",
+            params![row.time, row.potassium, row.pm25, batch.unit, batch.url, synced]).map_err(|e| e.to_string())?;
     }
     put(&tx, "query_through", end)?;
     put(&tx, "last_success", &synced)?;
     tx.commit().map_err(|e| e.to_string())
 }
-async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String> {
+async fn sync(
+    app: &tauri::AppHandle,
+    trigger_flight: bool,
+    requested_range: Option<&str>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let attempt = uuid::Uuid::new_v4().to_string();
+    crate::runtime_log::record(
+        app,
+        "info",
+        "monitoring",
+        "sync.started",
+        "开始同步小时监测数据",
+        json!({"attemptId":attempt,"evaluateFlightAfterSync":trigger_flight}),
+    );
+    let result = sync_inner(app, trigger_flight, requested_range).await;
+    crate::runtime_log::record(
+        app,
+        if result.is_ok() { "info" } else { "error" },
+        "monitoring",
+        "sync.finished",
+        if result.is_ok() {
+            "小时监测数据同步完成"
+        } else {
+            "小时监测数据同步失败"
+        },
+        json!({"attemptId":attempt,"elapsedMs":started.elapsed().as_millis() as u64,"error":result.as_ref().err()}),
+    );
+    result
+}
+async fn sync_inner(
+    app: &tauri::AppHandle,
+    trigger_flight: bool,
+    requested_range: Option<&str>,
+) -> Result<(), String> {
     crate::readiness::require_monitoring(app, false)?;
     let monitor = app.state::<Monitor>();
     if monitor.busy.swap(true, Ordering::SeqCst) {
@@ -199,10 +261,17 @@ async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String
     let _guard = Busy(&monitor.busy);
     *monitor.last_attempt.lock().unwrap() = Some(now().format(FORMAT).to_string());
     let result = async {
-        let (start, end) = window(&database(app)?)?;
+        let db = database(app)?;
+        let (start, end) = match requested_range {
+            Some(range) => requested_window(range)?,
+            None => window(&db)?,
+        };
         let bridge = app.state::<Bridge>();
         let readiness = crate::readiness::view(app);
-        let verified = readiness.sites.iter().find(|site| site.id == "map" && site.state == "ready")
+        let verified = readiness
+            .sites
+            .iter()
+            .find(|site| site.id == "map" && site.state == "ready")
             .ok_or("江苏大气站尚未通过 API 验证，请重新验证登录状态。")?;
         let (session, tab) = bridge.hourly_target(verified)?;
         let raw = bridge
@@ -214,7 +283,17 @@ async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String
             .await?;
         let batch: Batch =
             serde_json::from_value(raw).map_err(|_| "小时采集数据格式不正确".to_string())?;
-        persist(&mut database(app)?, batch, &start, &end)
+        let count = batch.rows.len();
+        persist(&mut database(app)?, batch, &start, &end)?;
+        crate::runtime_log::record(
+            app,
+            "info",
+            "monitoring",
+            "sync.persisted",
+            "监测数据已写入本机",
+            json!({"from":start,"through":end,"rows":count}),
+        );
+        Ok(())
     }
     .await;
     *monitor.error.lock().unwrap() = result.as_ref().err().cloned();
@@ -222,6 +301,14 @@ async fn sync(app: &tauri::AppHandle, trigger_flight: bool) -> Result<(), String
         // Flight preparation has its own persistent status; a failure must not
         // turn a successful measurement import into a reported sync failure.
         if let Err(error) = crate::flight::after_sync(app).await {
+            crate::runtime_log::record(
+                app,
+                "error",
+                "flight",
+                "flight.prepare_error",
+                "同步后巡查准备失败",
+                json!({"error":error}),
+            );
             eprintln!("Flight preparation: {error}");
         }
     }
@@ -238,13 +325,49 @@ pub fn start(app: tauri::AppHandle) {
                         .load(Ordering::SeqCst)
                     {
                         let _ = crate::readiness::refresh(&app).await;
-                        if crate::readiness::require_monitoring(&app, true).is_ok() {
-                            let _ = sync(&app, true).await;
+                        match crate::readiness::require_monitoring(&app, true) {
+                            Ok(()) => {
+                                let _ = sync(&app, true, None).await;
+                            }
+                            Err(error) => crate::runtime_log::record(
+                                &app,
+                                "warning",
+                                "monitoring",
+                                "sync.skipped",
+                                "定时同步未执行：运行条件未就绪",
+                                json!({"reason":error}),
+                            ),
                         }
+                    } else {
+                        crate::runtime_log::record(
+                            &app,
+                            "warning",
+                            "monitoring",
+                            "sync.skipped",
+                            "定时同步未执行：监测尚未启动",
+                            json!({}),
+                        );
                     }
                 }
-                Err(error) => *app.state::<Monitor>().error.lock().unwrap() = Some(error),
-                _ => {}
+                Err(error) => {
+                    crate::runtime_log::record(
+                        &app,
+                        "error",
+                        "monitoring",
+                        "sync.settings_error",
+                        "无法读取监测设置",
+                        json!({"error":error}),
+                    );
+                    *app.state::<Monitor>().error.lock().unwrap() = Some(error);
+                }
+                _ => crate::runtime_log::record(
+                    &app,
+                    "info",
+                    "monitoring",
+                    "sync.skipped",
+                    "定时同步未执行：监测已关闭",
+                    json!({}),
+                ),
             }
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
@@ -256,12 +379,13 @@ pub fn get_monitoring(
     monitor: tauri::State<'_, Monitor>,
 ) -> Result<MonitorView, String> {
     let db = database(&app)?;
-    let mut stmt = db.prepare("SELECT observed_at,potassium FROM hourly_observations WHERE city_code='321200' ORDER BY observed_at DESC LIMIT 168").map_err(|e| e.to_string())?;
+    let mut stmt = db.prepare("SELECT observed_at,potassium,pm25 FROM hourly_observations WHERE city_code='321200' ORDER BY observed_at DESC LIMIT 168").map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
             Ok(HourRow {
                 time: row.get(0)?,
                 potassium: row.get(1)?,
+                pm25: row.get(2)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -288,12 +412,35 @@ pub fn get_monitoring(
     })
 }
 pub async fn verify_first_sync(app: &tauri::AppHandle) -> Result<(), String> {
-    sync(app, false).await
+    sync(app, false, None).await
+}
+
+/// Recheck the current monitoring window after the operating system wakes up.
+/// Tokio's timer is not a reliable wake-up signal across sleep/lock, so use
+/// the same sync path as the regular background loop when the workspace is on.
+pub async fn resume_sync(app: &tauri::AppHandle) -> Result<(), String> {
+    let enabled = database(app).and_then(|db| setting(&db, "enabled"))?;
+    if enabled.as_deref() == Some("false")
+        || !app
+            .state::<crate::readiness::Readiness>()
+            .started
+            .load(Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+    sync(app, true, None).await
 }
 #[tauri::command]
-pub async fn sync_monitoring(app: tauri::AppHandle) -> Result<(), String> {
-    crate::readiness::require_monitoring(&app, true)?;
-    sync(&app, true).await
+pub async fn sync_monitoring(
+    app: tauri::AppHandle,
+    range: Option<String>,
+) -> Result<(), String> {
+    crate::readiness::require_monitoring(&app, false)?;
+    let trigger_flight = app
+        .state::<crate::readiness::Readiness>()
+        .started
+        .load(Ordering::SeqCst);
+    sync(&app, trigger_flight, range.as_deref()).await
 }
 #[tauri::command]
 pub fn set_monitoring_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
@@ -322,8 +469,20 @@ mod tests {
         let mut data = batch(json!([{ "time": "2026-09-16 01:00:00", "potassium": 0.38 }]));
         data.url = "http://61.155.4.60:18080/#/home/map".into();
         save(&mut db, data).unwrap();
-        assert_eq!(db.query_row("SELECT source_url FROM hourly_observations", [], |r| r.get::<_, String>(0)).unwrap(), "http://61.155.4.60:18080/#/home/map");
-        for url in ["http://61.155.4.60:18080/#/login", "http://61.155.4.60:18080/login", "http://61.155.4.60.evil.test:18080/#/home/map", "https://61.155.4.60:18080/#/home/map"] {
+        assert_eq!(
+            db.query_row("SELECT source_url FROM hourly_observations", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "http://61.155.4.60:18080/#/home/map"
+        );
+        for url in [
+            "http://61.155.4.60:18080/#/login",
+            "http://61.155.4.60:18080/login",
+            "http://61.155.4.60.evil.test:18080/#/home/map",
+            "https://61.155.4.60:18080/#/home/map",
+        ] {
             let mut data = batch(json!([]));
             data.url = url.into();
             assert!(save(&mut db, data).is_err());
@@ -349,7 +508,12 @@ mod tests {
             batch(json!([{"time":"2026-09-18 00:00:00","potassium":1,"pm25":2}]))
         )
         .is_err());
-        assert_eq!(db.query_row("SELECT pm25 FROM hourly_observations", [], |r| r.get::<_, Option<f64>>(0)).unwrap(), None);
+        assert_eq!(
+            db.query_row("SELECT pm25 FROM hourly_observations", [], |r| r
+                .get::<_, Option<f64>>(0))
+                .unwrap(),
+            Some(25.0)
+        );
         let mut wrong = batch(json!([]));
         wrong.city_code = "320100".into();
         assert!(save(&mut db, wrong).is_err());
@@ -377,28 +541,56 @@ mod tests {
     #[test]
     fn latest_missing_hours_are_persisted_and_later_backfilled_without_duplicates() {
         let mut db = connect(Path::new(":memory:")).unwrap();
-        save(&mut db, batch(json!([
-            {"time":"2026-09-16 11:00:00","potassium":0.03},
-            {"time":"2026-09-16 12:00:00","potassium":null},
-            {"time":"2026-09-16 13:00:00","potassium":null},
-            {"time":"2026-09-16 14:00:00","potassium":null}
-        ]))).unwrap();
-        let latest = |db: &Connection| db.query_row(
+        save(
+            &mut db,
+            batch(json!([
+                {"time":"2026-09-16 11:00:00","potassium":0.03},
+                {"time":"2026-09-16 12:00:00","potassium":null},
+                {"time":"2026-09-16 13:00:00","potassium":null},
+                {"time":"2026-09-16 14:00:00","potassium":null}
+            ])),
+        )
+        .unwrap();
+        let latest = |db: &Connection| {
+            db.query_row(
             "SELECT observed_at,potassium FROM hourly_observations ORDER BY observed_at DESC LIMIT 1",
             [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
-        ).unwrap();
+        ).unwrap()
+        };
         assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), None));
         assert!(setting(&db, "last_success").unwrap().is_some());
-        assert_eq!(setting(&db, "query_through").unwrap().as_deref(), Some("2026-09-17 00:00:00"));
-        save(&mut db, batch(json!([
-            {"time":"2026-09-16 12:00:00","potassium":null},
-            {"time":"2026-09-16 13:00:00","potassium":null},
-            {"time":"2026-09-16 14:00:00","potassium":null}
-        ]))).unwrap();
+        assert_eq!(
+            setting(&db, "query_through").unwrap().as_deref(),
+            Some("2026-09-17 00:00:00")
+        );
+        save(
+            &mut db,
+            batch(json!([
+                {"time":"2026-09-16 12:00:00","potassium":null},
+                {"time":"2026-09-16 13:00:00","potassium":null},
+                {"time":"2026-09-16 14:00:00","potassium":null}
+            ])),
+        )
+        .unwrap();
         assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), None));
-        save(&mut db, batch(json!([{"time":"2026-09-16 14:00:00","potassium":0.0}]))).unwrap();
+        save(
+            &mut db,
+            batch(json!([{"time":"2026-09-16 14:00:00","potassium":0.0}])),
+        )
+        .unwrap();
         assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), Some(0.0)));
-        assert_eq!(db.query_row("SELECT COUNT(*) FROM hourly_observations", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        save(
+            &mut db,
+            batch(json!([{"time":"2026-09-16 14:00:00","potassium":null}])),
+        )
+        .unwrap();
+        assert_eq!(latest(&db), ("2026-09-16 14:00:00".into(), Some(0.0)));
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM hourly_observations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
     }
     #[test]
     fn catchup_advances_in_bounded_overlapping_windows() {
@@ -414,5 +606,35 @@ mod tests {
         ] {
             assert!(parse(value).is_err());
         }
+    }
+
+    #[test]
+    fn initial_window_is_dynamic_seven_days_ending_at_current_hour() {
+        let db = connect(Path::new(":memory:")).unwrap();
+        let (start, end) = window(&db).unwrap();
+        let start = parse(&start).unwrap();
+        let end = parse(&end).unwrap();
+        let current = now();
+        assert_eq!(end - start, Duration::days(7));
+        assert!(end <= current);
+        assert!(current - end <= Duration::hours(1));
+    }
+
+    #[test]
+    fn requested_window_uses_the_selected_range_and_current_hour() {
+        for (range, expected_hours) in [("24", 23), ("72", 71), ("168", 167)] {
+            let (start, end) = requested_window(range).unwrap();
+            let start = parse(&start).unwrap();
+            let end = parse(&end).unwrap();
+            assert_eq!(end - start, Duration::hours(expected_hours));
+            assert!(end <= now());
+        }
+        let (start, end) = requested_window("today").unwrap();
+        let start = parse(&start).unwrap();
+        let end = parse(&end).unwrap();
+        assert_eq!(start.date(), end.date());
+        assert_eq!(start.time().hour(), 0);
+        assert!(end >= start);
+        assert!(requested_window("12").is_err());
     }
 }

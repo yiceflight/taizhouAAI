@@ -1,21 +1,22 @@
 // Fixed, video-derived recipe. Submission uses a separate, explicitly authorized job.
 export const PLAN_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 export const PLAN_RECIPE = Object.freeze({
-  route: '东南火点巡查航线-改',
   device: '泰州环境监测', dock: 'Dock 3', aircraft: 'Matrice 4TD',
   precision: '高精度 RTK', strategy: '立即', returnHeight: 110,
   lostLink: '返航', completion: '自动返航', media: '全部文件', subscriber: '运维',
 });
 export function validatePlanJob(job) {
   if (job.type !== 'dji-prepare' || job.submit !== false || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
-      typeof job.name !== 'string' || !/^((钾离子超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name)) {
+      typeof job.name !== 'string' || !/^((钾离子超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
+      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
     throw new Error('司空任务参数无效；只允许填写，禁止提交');
   }
 }
 
 export function validateSubmitJob(job) {
   if (job.type !== 'dji-submit' || job.submit !== true || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
-      typeof job.name !== 'string' || !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name)) {
+      typeof job.name !== 'string' || !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
+      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
     throw new Error('起飞任务参数无效；演练任务禁止提交');
   }
 }
@@ -211,8 +212,10 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   if (!submit) choose('普通任务', form);
   // FlightHub creates a route copy when selecting it; its suffix is variable.
   // Match the configured prefix, keeping the library and selected form separate.
-  const routeNames = root => all('*', root).filter(e => text(e).startsWith(norm(recipe.route))
-    && ![...e.children].some(c => visible(c) && text(c).startsWith(norm(recipe.route))));
+  const routePrefix = norm(recipe.route);
+  if (!routePrefix) throw new Error('指定航线为空，已停止填写');
+  const routeNames = root => all('*', root).filter(e => text(e).startsWith(routePrefix)
+    && ![...e.children].some(c => visible(c) && text(c).startsWith(routePrefix)));
   const routeSelected = () => {
     const matches = routeNames(form);
     if (matches.length > 1) throw new Error('已选航线不唯一，已停止填写');

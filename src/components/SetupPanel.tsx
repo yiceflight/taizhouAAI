@@ -4,18 +4,18 @@ import { targetSites, type TargetSite } from '../config/sites';
 import { siteLabels, type Readiness } from '../lib/workspace';
 import { BridgeDiagnostics } from './BridgeDiagnostics';
 
-type Props = { state: Readiness | null; busy: boolean; active?: boolean; onCheck: () => void; openSite: (site: TargetSite) => void; onHistory: () => void };
-export function SetupPanel({ state, busy, active = true, onCheck, openSite, onHistory }: Props) {
-  const [directory, setDirectory] = useState<{path:string;platform:string} | null>(null);
+type Props = { state: Readiness | null; busy: boolean; active?: boolean; onCheck: () => void; openSite: (site: TargetSite) => void };
+export function SetupPanel({ state, busy, active = true, onCheck, openSite }: Props) {
+  const [directory, setDirectory] = useState<{path:string;platform:string;testEnvironment?:boolean} | null>(null);
   const [message, setMessage] = useState('');
   const [opening, setOpening] = useState(false);
-  useEffect(() => { if (isTauri()) void invoke<{path:string;platform:string}>('get_extension_directory').then(setDirectory).catch(() => setMessage('无法取得插件目录，请检查客户端是否完整安装。')); }, []);
+  useEffect(() => { if (isTauri()) void invoke<{path:string;platform:string;testEnvironment?:boolean}>('get_extension_directory').then(setDirectory).catch(() => setMessage('无法取得插件目录，请检查客户端是否完整安装。')); }, []);
   const command = async (name: string) => { setOpening(true); setMessage(''); try { await invoke(name); } catch (e) { setMessage(String(e)); } finally { setOpening(false); } };
   const step = !state?.pluginReady ? 0 : !state.ready ? 1 : 2;
   const passed = state?.sites.filter(s => s.state === 'ready').length || 0;
   const conflict = /端口|重复|多个/.test(state?.pluginMessage || '');
   return <div className="setup-workspace">
-    <div className="page-heading"><div><span className="eyebrow">运行状态</span><h2>{!state ? '正在检测运行状态' : state.ready ? '运行正常' : '运行状态待处理'}</h2><p>查看浏览器连接与网站验证状态，异常时请按下方提示处理。</p></div><button className="text-button" onClick={onHistory}>查看巡查任务与报告 →</button></div>
+    <div className="page-heading"><div><span className="eyebrow">运行状态</span><h2>{!state ? '正在检测运行状态' : state.ready ? '运行正常' : '运行状态待处理'}</h2><p>查看浏览器连接与网站验证状态，异常时请按下方提示处理。</p></div></div>
     <ol className="setup-steps" aria-label="运行状态检查">{['浏览器连接', '网站验证'].map((label, index) => <li key={label} className={index < step ? 'done' : index === step ? 'current' : ''} aria-current={index === step ? 'step' : undefined}><span>{index < step ? '✓' : index + 1}</span><div>{label}<small>{index < step ? index === 0 ? '已连接' : '全部通过' : index === step ? !state || state.checking ? '检测中' : '待处理' : '等待浏览器连接'}</small></div></li>)}</ol>
     <BridgeDiagnostics active={active} />
     {step === 0 ? <section className="setup-card">
@@ -26,7 +26,7 @@ export function SetupPanel({ state, busy, active = true, onCheck, openSite, onHi
       {message && <p className="notice" role="status">{message}</p>}
     </section> : <>
       <section className="setup-card"><div className="section-heading"><div><h3>各平台连接状态 <span className="inline-count">{passed} / 3</span></h3><p>系统会在 Chrome 后台自动打开缺失的平台页面；请完成登录，登录状态会自动复查。江苏大气站就绪即可监测；起飞需司空就绪，可飞异常不影响监测与起飞。</p></div><button className="secondary-button" disabled={busy || state?.checking} onClick={onCheck}>{state?.checking ? '正在验证…' : '重新验证全部'}</button></div>
-        <div className="health-list">{targetSites.map((site, index) => { const health = state?.sites.find(s => s.id === site.id); return <article className="health-row" key={site.id}><span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 1}</span><div className="health-copy"><h4>{site.name}</h4><p>{health?.message || '等待检测'}</p><small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small></div><span className={`badge ${health?.state === 'ready' ? 'success' : 'warning'}`}>{health ? siteLabels[health.state] : '待验证'}</span><button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button></article>; })}</div>
+        <div className="health-list">{targetSites.map((site, index) => { const health = state?.sites.find(s => s.id === site.id); const checking = state?.checking === true && (!health || health.state === 'unchecked' || health.state === 'not_open'); const label = checking ? '验证中' : health ? siteLabels[health.state] : '待验证'; const message = checking ? '正在验证登录与业务访问' : health?.message || '等待检测'; return <article className="health-row" key={site.id}><span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 1}</span><div className="health-copy"><h4>{site.name}</h4><p>{message}</p><small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small></div><span className={`badge ${health?.state === 'ready' ? 'success' : 'warning'}`}>{label}</span><button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button></article>; })}</div>
       </section>
     </>}
   </div>;

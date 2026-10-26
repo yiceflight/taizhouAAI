@@ -187,6 +187,17 @@ pub fn view(app: &tauri::AppHandle) -> View {
         current: cache.sample.clone(),
     }
 }
+
+/// Returns the current airport wind direction in normalized meteorological
+/// degrees. The source reports the direction the wind comes from.
+pub fn current_wind_direction(app: &tauri::AppHandle) -> Option<f64> {
+    view(app)
+        .current
+        .as_ref()
+        .and_then(|sample| sample.wind_direction)
+        .filter(|value| value.is_finite() && (0.0..=360.0).contains(value))
+        .map(|value| value.rem_euclid(360.0))
+}
 async fn fetch(app: &tauri::AppHandle) -> Result<Sample, String> {
     let bridge = app.state::<crate::bridge::Bridge>();
     let session = bridge.single_session()?;

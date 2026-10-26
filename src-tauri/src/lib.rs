@@ -168,6 +168,8 @@ fn set_dev_app_icon() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    let _background_activity = background_activity::BackgroundActivity::begin();
     let mut context = tauri::generate_context!();
     environment::configure(&mut context);
     let mut builder = tauri::Builder::default();
@@ -186,6 +188,18 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             runtime_log::start(app.handle());
+            runtime_log::record(
+                app.handle(),
+                "info",
+                "app",
+                "app.background_policy",
+                "后台监测策略已启用",
+                serde_json::json!({
+                    "nativeScheduling": true,
+                    "appNapDisabled": cfg!(target_os = "macos"),
+                    "preventsSystemSleep": false,
+                }),
+            );
             app.state::<bridge::Bridge>().start(app.handle().clone());
             readiness::start(app.handle().clone());
             flight::initialize(app.handle()).map_err(std::io::Error::other)?;
@@ -296,6 +310,7 @@ pub fn run() {
 }
 mod extension;
 mod window_lifecycle;
+mod background_activity;
 
 mod bridge;
 mod bridge_diagnostics;

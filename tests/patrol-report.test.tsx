@@ -41,6 +41,17 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
 describe('task-owned reports', () => {
+  it('previews the annotated presentation and preserves both images when saving', async () => {
+    await render(); await click('生成报告');
+    const photo = { name: 'thermal.jpeg', kind: '司空原始照片', dataUrl: 'data:image/jpeg;base64,original',
+      presentation: { method: 'dji-viewer-capture-v1', width: 1280, height: 1024, annotationCount: 2,
+        labels: ['最高温度: 76.7℃', '最低温度: -2.5℃'], capturedAt: Date.now(), dataUrl: 'data:image/png;base64,annotated' } };
+    ipc.invoke.mockResolvedValueOnce({ mission: second, air: { points: [] }, media: { folder: 'Immediate-Media' }, photos: [photo] });
+    await click('自动匹配并读取资料');
+    expect(document.querySelector('.flight-preview img')?.getAttribute('src')).toBe(photo.presentation.dataUrl);
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ data: expect.objectContaining({ photos: [photo] }) }));
+  });
   it('keeps a completed FlightHub receipt visible without inventing flight times from request or check times', async () => {
     missions = []; reports = [];
     const event = { ...completedWithoutAir, statusCheckedAt: Date.parse('2026-09-22T07:30:00+08:00') };
@@ -680,6 +691,157 @@ describe('DJI scheduled flight automation', () => {
     const tasks = patrolTasks([airMission], [photoReport], null, [], 0, [today]);
     expect(tasks).toHaveLength(1); expect(tasks[0].report).toBe(photoReport); expect(tasks[0].djiTask).toBe(today);
     expect(patrolTasks([], [], null, [], today.mission.startTime, [today, yesterday])).toHaveLength(0);
+  });
+});
+
+describe('report interaction during background work', () => {
+  afterEach(() => vi.useRealTimers());
+  const planTabs = [tabs[0], { ...tabs[1], url: DJI_PLAN_URL }];
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  it('collects and regenerates with only the project plan page open', async () => {
+    await render(true, planTabs);
+    await click('重新生成报告');
+    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ djiSession: 'fixture', djiTabId: 2, mission: first }) }));
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: true }));
+  });
+  it.each([
+    { ...tabs[1], url: DJI_PLAN_URL.replace('/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49', '/project/another-project') },
+    { ...tabs[1], url: DJI_PLAN_URL.replace('https://fh.dji.com', 'https://example.com') },
+    { ...tabs[1], url: DJI_PLAN_URL, status: 'loading' },
+  ])('explains the missing usable project page instead of silently disabling collection', async djiTab => {
+    await render(true, [tabs[0], djiTab]);
+    await click('重新生成报告');
+    expect(button('自动匹配并读取资料').disabled).toBe(true);
+    expect(document.querySelector('dialog')?.textContent).toContain('未找到当前项目的司空页面');
+    expect(button('打开媒体库 ↗').disabled).toBe(false);
+    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
+  });
+  it('regenerates with the associated DJI execution time and task ID while preserving the sampling ID', async () => {
+    const actual = { ...first, missionId: 0, missionName: '南侧上午9点航线巡查' };
+    const task = { taskId: 'dji-morning-flight', mission: actual, status: '执行成功', mediaReady: true };
+    const sampling = { ...first, missionName: '50634a31_采样', startTime: first.startTime + 71000, endTime: first.endTime + 539000 };
+    missions = [sampling]; reports = [saved(sampling)];
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'list_dji_report_tasks' ? [task] : original(command, args));
+    await render(true, planTabs);
+    await click('重新生成报告');
+    expect(document.querySelector('dialog')?.textContent).toContain('司空实际时间');
+    await click('自动匹配并读取资料');
+    const mission = { ...sampling, missionName: actual.missionName, startTime: actual.startTime, endTime: actual.endTime };
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ mission, mediaKey: task.taskId }) }));
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ data: expect.objectContaining({ mission }), regenerate: true }));
+  });
+  it('keeps report actions and the manual dialog usable throughout a pending task refresh', async () => {
+    const sync = deferred<unknown>();
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'sync_dji_report_tasks' ? sync.promise : original(command, args));
+    await render(true, planTabs);
+    await click('刷新任务');
+    expect(button('正在读取…').disabled).toBe(true);
+    for (const action of ['打开 Word', '打开文件夹', '重新生成报告', '生成报告']) expect(button(action).disabled).toBe(false);
+    await click('打开 Word'); await click('打开文件夹');
+    expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report', { id: 'report-11' });
+    expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report_directory', { id: 'report-11' });
+    await click('重新生成报告');
+    expect(button('关闭').disabled).toBe(false);
+    await click('关闭');
+    await click('重新生成报告');
+    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await click('自动匹配并读取资料');
+    await act(async () => sync.resolve({ tasks: [], skipped: 1 }));
+    expect(document.querySelector('dialog [role="status"]')?.textContent).toBe('资料读取完成，请核对后生成 Word 快报。');
+    expect(document.querySelector('dialog')?.textContent).not.toContain('司空记录缺少实际飞行时间');
+    expect(button('生成并保存 Word 快报').disabled).toBe(false);
+    await click('生成并保存 Word 快报');
+  });
+  it('pauses automatic collection when the user opens the dialog during synchronization', async () => {
+    vi.useFakeTimers();
+    const sync = deferred<unknown>();
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => command === 'sync_dji_report_tasks' ? sync.promise : original(command, args));
+    await render(true, planTabs);
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    await click('重新生成报告');
+    await act(async () => sync.resolve({ tasks: [{ mission: { ...second, missionId: 0 }, status: '执行成功', mediaReady: true }], skipped: 0 }));
+    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
+    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(1);
+  });
+  it('does not replace a newly saved report with an older in-flight refresh response', async () => {
+    const reportList = deferred<FlightSummary[]>();
+    const original = ipc.invoke.getMockImplementation()!;
+    await render(true, planTabs);
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [], skipped: 0 };
+      if (command === 'list_flight_reports') return reportList.promise;
+      if (command === 'save_flight_report') return { ...saved(), id: 'new-version' };
+      return original(command, args);
+    });
+    await click('刷新任务');
+    await click('重新生成报告');
+    await click('自动匹配并读取资料');
+    await click('生成并保存 Word 快报');
+    await act(async () => reportList.resolve([saved()]));
+    await click('打开 Word');
+    expect(ipc.invoke).toHaveBeenLastCalledWith('open_flight_report', { id: 'new-version' });
+  });
+  it.each([false, true])('gives a queued manual report priority and supports canceling its wait (cancel=%s)', async cancel => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const task = (name: string, offset: number) => ({ taskId: name, mission: { ...first, missionId: 0, missionName: name, startTime: first.startTime - offset, endTime: first.endTime - offset }, status: '执行成功', mediaReady: true });
+    const tasks = [task('后台首份报告', 0), task('手动选择的报告', 15 * 60000), task('下一份自动报告', 30 * 60000)];
+    const collected = deferred<unknown>();
+    const original = ipc.invoke.getMockImplementation()!;
+    let active = 0, maxActive = 0, count = 0;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks, skipped: 0 };
+      if (command === 'collect_flight_report') {
+        count++; active++; maxActive = Math.max(maxActive, active);
+        try { return count === 1 ? await collected.promise : await original(command, args); }
+        finally { active--; }
+      }
+      return original(command, args);
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={[planTabs[1]]} ready={false} mediaReady onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(count).toBe(1);
+    expect(button('刷新任务').disabled).toBe(false);
+    const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent?.includes('手动选择的报告'))!;
+    expect(row.querySelector('button')!.disabled).toBe(false);
+    await act(async () => row.querySelector('button')!.click());
+    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await click('自动匹配并读取资料');
+    expect(button('等待当前报告完成…').disabled).toBe(true);
+    expect(button('关闭').disabled).toBe(false);
+    expect(count).toBe(1);
+    if (cancel) {
+      await click('关闭');
+      // A newly opened dialog must not receive the canceled request's result.
+      await act(async () => row.querySelector('button')!.click());
+    }
+    await act(async () => collected.resolve(await original('collect_flight_report', { request: { withoutAirData: true, mission: tasks[0].mission } })));
+    expect(maxActive).toBe(1);
+    expect(count).toBe(cancel ? 1 : 2);
+    if (cancel) {
+      expect(button('自动匹配并读取资料').disabled).toBe(false);
+      expect(button('生成并保存 Word 快报')).toBeUndefined();
+    } else {
+      expect(button('生成并保存 Word 快报').disabled).toBe(false);
+      const last = ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report').at(-1)!;
+      expect(last[1].request.mission).toEqual(tasks[1].mission);
+      expect(last[1].request.mediaKey).toBe(tasks[1].taskId);
+      expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(1);
+      await click('生成并保存 Word 快报');
+      expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(2);
+    }
   });
 });
 

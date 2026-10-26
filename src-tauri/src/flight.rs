@@ -31,6 +31,10 @@ pub struct Event {
     #[serde(default)]
     source_hour: Option<String>,
     potassium: Option<f64>,
+    #[serde(default)]
+    pm25: Option<f64>,
+    #[serde(default)]
+    route: Option<String>,
     name: String,
     status: String,
     error: Option<String>,
@@ -127,6 +131,62 @@ fn best_route_match(routes: &[FlightRoute], requested: &str) -> Option<String> {
         let name = route_name(&route.name);
         name.starts_with(&wanted) || wanted.starts_with(&name)
     }).max_by_key(|route| route_name(&route.name).len()).map(|route| route.name.clone())
+}
+fn direction_in_rule(direction: f64, start: f64, end: f64) -> bool {
+    if start < end {
+        direction >= start && direction < end
+    } else {
+        direction >= start || direction < end
+    }
+}
+fn configured_route(
+    settings: &crate::settings::Settings,
+    routes: &[FlightRoute],
+    fixed_route: Option<String>,
+    wind_direction: Option<f64>,
+) -> Result<String, String> {
+    if settings.route_selection_mode == "fixed" {
+        return fixed_route.ok_or_else(|| "请先在监测设置中同步并手动选择巡查航线。".into());
+    }
+    let direction = wind_direction
+        .filter(|value| value.is_finite() && (0.0..360.0).contains(value))
+        .ok_or_else(|| "高级航线模式需要有效的机场风向数据，请刷新天气后重试。".to_string())?;
+    let rule = settings
+        .wind_route_rules
+        .iter()
+        .find(|rule| direction_in_rule(direction, rule.start_degrees, rule.end_degrees))
+        .ok_or_else(|| format!("当前风向 {:.0}° 未匹配到航线规则，请完善高级航线配置。", direction))?;
+    let exact = routes
+        .iter()
+        .find(|route| route_name(&route.name) == route_name(&rule.route));
+    let prefix = best_route_match(routes, &rule.route);
+    let matched = exact.or_else(|| prefix.as_ref().and_then(|name| routes.iter().find(|route| route.name == *name)));
+    matched
+        .map(|route| route.name.clone())
+        .ok_or_else(|| format!("风向 {:.0}° 对应的航线“{}”不在已同步航线列表中，请重新同步。", direction, rule.route))
+}
+fn route_configuration_ready(db: &Connection) -> Result<(), String> {
+    let settings = crate::settings::read(db)?;
+    if settings.route_selection_mode == "fixed" {
+        if selected_route(db)?.is_none() {
+            return Err("请先在监测设置中同步并手动选择巡查航线。".into());
+        }
+    } else if read_routes(db)?.is_empty() || settings.wind_route_rules.is_empty() {
+        return Err("请先同步航线并在高级航线模式中至少配置一条风向规则。".into());
+    }
+    Ok(())
+}
+fn launch_route(app: &tauri::AppHandle) -> Result<String, String> {
+    let db = database(app)?;
+    let settings = crate::settings::read(&db)?;
+    configured_route(
+        &settings,
+        &read_routes(&db)?,
+        selected_route(&db)?,
+        (settings.route_selection_mode == "wind")
+            .then(|| crate::weather::current_wind_direction(app))
+            .flatten(),
+    )
 }
 fn current(db: &Connection) -> Result<Option<Event>, String> {
     setting(db, "flight_event")?
@@ -382,6 +442,8 @@ fn new_event(time: String, potassium: Option<f64>, preview: bool) -> Event {
         observed_at: time,
         source_hour: None,
         potassium,
+        pm25: None,
+        route: None,
         name: format!(
             "{}-{}-{}",
             if preview {
@@ -421,10 +483,10 @@ fn observe_with_weather(
     check: Option<WeatherCheck>,
 ) -> Result<Option<Event>, String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
-    let latest: Option<(String, Option<f64>)> = tx.query_row(
-        "SELECT observed_at,potassium FROM hourly_observations WHERE city_code='321200' AND potassium IS NOT NULL ORDER BY observed_at DESC LIMIT 1", [],
-        |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
-    let Some((time, Some(k))) = latest else {
+    let latest: Option<(String, Option<f64>, Option<f64>)> = tx.query_row(
+        "SELECT observed_at,potassium,pm25 FROM hourly_observations WHERE city_code='321200' AND (potassium IS NOT NULL OR pm25 IS NOT NULL) ORDER BY observed_at DESC LIMIT 1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|e| e.to_string())?;
+    let Some((time, k, pm25)) = latest else {
         return Ok(None);
     };
     let age = at - parse(&time)?;
@@ -450,14 +512,20 @@ fn observe_with_weather(
         }
     }
     let settings = crate::settings::read(&tx)?;
-    if k > settings.potassium_threshold {
+    let potassium_exceeded = k.is_some_and(|value| value > settings.potassium_threshold);
+    let pm25_exceeded = pm25.is_some_and(|value| value > settings.pm25_threshold);
+    if potassium_exceeded || pm25_exceeded {
         if let Some(reason) = settings
             .no_fly_reason(parse(&time)?)
             .or_else(|| settings.no_fly_reason(at))
         {
             let key = format!("flight_restricted:{time}");
             if setting(&tx, &key)?.is_none() {
-                let mut record = new_event(time.clone(), Some(k), false);
+                let mut record = new_event(time.clone(), k, false);
+                record.pm25 = pm25;
+                if k.is_none() && pm25.is_some() {
+                    record.name = record.name.replace("钾离子超标", "PM2.5超标");
+                }
                 record.source_hour = Some(time.clone());
                 record.weather_checks.extend(check.clone());
                 record.status = "restricted".into();
@@ -480,7 +548,7 @@ fn observe_with_weather(
             return Ok(None);
         }
     }
-    if k <= crate::settings::read(&tx)?.potassium_threshold {
+    if !potassium_exceeded && !pm25_exceeded {
         put(&tx, "flight_episode", "")?;
         tx.commit().map_err(|e| e.to_string())?;
         return Ok(None);
@@ -497,7 +565,11 @@ fn observe_with_weather(
         tx.commit().map_err(|e| e.to_string())?;
         return Ok(None);
     }
-    let mut event = new_event(time.clone(), Some(k), false);
+    let mut event = new_event(time.clone(), k, false);
+    event.pm25 = pm25;
+    if k.is_none() && pm25.is_some() {
+        event.name = event.name.replace("钾离子超标", "PM2.5超标");
+    }
     event.source_hour = Some(time.clone());
     event.weather_checks.extend(check);
     event.status = "countdown".into();
@@ -538,8 +610,6 @@ async fn require_launch_weather(app: &tauri::AppHandle, event: &Event) -> Result
     result
 }
 async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String> {
-    let route = selected_route(&database(app)?)?
-        .ok_or_else(|| "请先在监测设置中同步并手动选择巡查航线。".to_string())?;
     if prevent_restricted_launch(app, &mut event)? {
         return Ok(());
     }
@@ -549,6 +619,17 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
         update_current(app, &event)?;
         return Err(error);
     }
+    let route = match launch_route(app) {
+        Ok(route) => route,
+        Err(error) => {
+            event.status = "failed".into();
+            event.error = Some(error.clone());
+            update_current(app, &event)?;
+            return Err(error);
+        }
+    };
+    event.route = Some(route.clone());
+    update_current(app, &event)?;
     let auto_submit = !needs_confirmation(&database(app)?, &event)?;
     let preparation = app
         .state::<Bridge>()
@@ -707,7 +788,7 @@ pub async fn after_sync(app: &tauri::AppHandle) -> Result<(), String> {
         } else {
             "巡查触发评估完成，本轮未产生新任务"
         },
-        serde_json::json!({"event":event.as_ref().map(|e| serde_json::json!({"id":e.id,"name":e.name,"status":e.status,"observedAt":e.observed_at,"sourceHour":e.source_hour,"potassium":e.potassium,"error":e.error})),"note":"未产生新任务可能由阈值、数据时效、已有任务或运行设置决定"}),
+        serde_json::json!({"event":event.as_ref().map(|e| serde_json::json!({"id":e.id,"name":e.name,"status":e.status,"observedAt":e.observed_at,"sourceHour":e.source_hour,"potassium":e.potassium,"pm25":e.pm25,"route":e.route,"error":e.error})),"note":"未产生新任务可能由阈值、数据时效、已有任务或运行设置决定"}),
     );
     Ok(())
 }
@@ -1196,6 +1277,12 @@ fn begin_manual_with_weather(
         "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND potassium IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
         [], |row| row.get(0),
     ).optional().map_err(|e| e.to_string())?;
+    if event.source_hour.is_none() {
+        event.source_hour = tx.query_row(
+            "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND pm25 IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
+            [], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+    }
     event.weather_checks.extend(check);
     if !preview {
         event.source = "manual".into();
@@ -1223,9 +1310,7 @@ async fn begin(
     weather_override_confirmed: bool,
 ) -> Result<(), String> {
     crate::readiness::require_flight(&app)?;
-    if selected_route(&database(&app)?)?.is_none() {
-        return Err("请先在监测设置中同步并手动选择巡查航线。".into());
-    }
+    route_configuration_ready(&database(&app)?)?;
     let state = app.state::<Flight>();
     if state.busy.swap(true, Ordering::SeqCst) {
         return Err("巡飞任务正在处理，请稍候。".into());
@@ -1332,6 +1417,31 @@ mod tests {
         assert_eq!(selected_route(&db).unwrap(), None);
         put(&db, "flight_route", "现场巡查航线").unwrap();
         assert_eq!(selected_route(&db).unwrap(), Some("现场巡查航线".into()));
+    }
+    #[test]
+    fn wind_route_rules_match_normal_and_cross_zero_ranges() {
+        let routes = vec![
+            FlightRoute { route_id: "1".into(), name: "东南航线".into(), update_time: 1 },
+            FlightRoute { route_id: "2".into(), name: "西北航线".into(), update_time: 1 },
+        ];
+        let mut settings = crate::settings::Settings::default();
+        settings.route_selection_mode = "wind".into();
+        settings.wind_route_rules = vec![
+            crate::settings::WindRouteRule { start_degrees: 0.0, end_degrees: 135.0, route: "东南航线".into() },
+            crate::settings::WindRouteRule { start_degrees: 315.0, end_degrees: 45.0, route: "西北航线".into() },
+        ];
+        assert_eq!(configured_route(&settings, &routes, None, Some(90.0)).unwrap(), "东南航线");
+        assert_eq!(configured_route(&settings, &routes, None, Some(350.0)).unwrap(), "西北航线");
+        assert!(configured_route(&settings, &routes, None, Some(200.0)).unwrap_err().contains("未匹配"));
+        assert!(configured_route(&settings, &routes, None, None).unwrap_err().contains("有效的机场风向"));
+    }
+    #[test]
+    fn wind_route_rules_support_platform_copy_names() {
+        let routes = vec![FlightRoute { route_id: "1".into(), name: "东南航线-副本(2)".into(), update_time: 1 }];
+        let mut settings = crate::settings::Settings::default();
+        settings.route_selection_mode = "wind".into();
+        settings.wind_route_rules = vec![crate::settings::WindRouteRule { start_degrees: 0.0, end_degrees: 90.0, route: "东南航线".into() }];
+        assert_eq!(configured_route(&settings, &routes, None, Some(45.0)).unwrap(), "东南航线-副本(2)");
     }
     #[test]
     fn clear_task_list_preserves_receipts_guards_and_allows_new_records() {
@@ -1590,7 +1700,10 @@ mod tests {
         db
     }
     fn reading(db: &Connection, time: &str, k: Option<f64>) {
-        db.execute("INSERT OR REPLACE INTO hourly_observations VALUES ('321200',?,?,100,'μg/m³','source','A_6','30','sync')", rusqlite::params![time,k]).unwrap();
+        db.execute("INSERT OR REPLACE INTO hourly_observations VALUES ('321200',?,?,NULL,'μg/m³','source','A_6','30','sync')", rusqlite::params![time,k]).unwrap();
+    }
+    fn reading_pm25(db: &Connection, time: &str, pm25: Option<f64>) {
+        db.execute("INSERT OR REPLACE INTO hourly_observations VALUES ('321200',?,NULL,?,'μg/m³','source','A_6','30','sync')", rusqlite::params![time,pm25]).unwrap();
     }
     fn dismiss(db: &Connection) {
         let mut e = current(db).unwrap().unwrap();
@@ -1758,6 +1871,23 @@ mod tests {
         observe(&mut db, t, true).unwrap();
         reading(&db, "2026-09-22 10:00:00", Some(2.));
         assert!(observe(&mut db, t, true).unwrap().is_none());
+    }
+    #[test]
+    fn pm25_threshold_uses_or_rule_and_strict_boundary() {
+        let mut db = db();
+        configure(&db, 1.0, 5, true);
+        let mut settings = crate::settings::read(&db).unwrap();
+        settings.pm25_threshold = 30.0;
+        put(&db, "workspace_settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        let time = "2026-09-22 09:00:00";
+        let at = parse("2026-09-22 10:00:00").unwrap();
+        reading_pm25(&db, time, Some(30.0));
+        assert!(observe(&mut db, at, true).unwrap().is_none());
+        reading_pm25(&db, time, Some(30.1));
+        let event = observe(&mut db, at, true).unwrap().unwrap();
+        assert_eq!(event.potassium, None);
+        assert_eq!(event.pm25, Some(30.1));
+        assert_eq!(event.source_hour.as_deref(), Some(time));
     }
     #[test]
     fn weather_block_does_not_consume_episode_and_normal_data_rearms() {

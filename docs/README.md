@@ -7,6 +7,7 @@
 | 开发、测试和正式版隔离 | [environment-isolation.md](environment-isolation.md) |
 | 工作台启动与验证 | [workspace-flow.md](workspace-flow.md) |
 | 运行日志与排障证据 | [runtime-logs.md](runtime-logs.md) |
+| 最小化与后台监测 | [background-monitoring.md](background-monitoring.md) |
 | 本机桥接诊断 | [bridge-diagnostics.md](bridge-diagnostics.md) |
 | 小时监测 | [hourly-monitoring.md](hourly-monitoring.md) |
 | 巡查计划和提交 | [flight-plan-preparation.md](flight-plan-preparation.md)、[drone-dispatch.md](drone-dispatch.md) |

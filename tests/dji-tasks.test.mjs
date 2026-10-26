@@ -1,3 +1,4 @@
+import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
@@ -135,7 +136,7 @@ test('worker reuses the project page without creating a shared media tab',async(
   const sync=source.slice(source.indexOf('async function syncDjiTasks('),source.indexOf('async function bridgeTabs('));
   const tabs=[{id:1,url:PLAN_URL.replace('#/plan','#/team'),status:'complete',active:true},{id:2,url:PLAN_URL.replace('#/plan','#/media?page=1&size=50'),status:'complete'},{id:3,url:PLAN_URL,status:'complete',active:false},{id:4,url:PLAN_URL,status:'complete',active:true}];
   const stored={'flight-task-history-tab':3,'flight-task-sync-tab':4};const removed=[];let creates=0;
-  const context=vm.createContext({PLAN_URL,readDjiTasks, evaluationValue:r=>r.result.value,debuggerSession:{acquire:async()=>true,release:async()=>{}},chrome:{debugger:{sendCommand:async()=>({result:{value:{url:PLAN_URL,tasks:[],cursor:null}}})},tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async()=>{creates++;throw Error('unexpected tab')},remove:async ids=>removed.push(...ids)},storage:{local:{get:async()=>stored,set:async v=>Object.assign(stored,v),remove:async keys=>keys.forEach(k=>delete stored[k])}}}});
+  const context=vm.createContext({evaluateBackgroundRead,PLAN_URL,readDjiTasks, evaluationValue:r=>r.result.value,debuggerSession:{acquire:async()=>true,release:async()=>{}},chrome:{debugger:{sendCommand:async()=>({result:{value:{url:PLAN_URL,tasks:[],cursor:null}}})},tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async()=>{creates++;throw Error('unexpected tab')},remove:async ids=>removed.push(...ids)},storage:{local:{get:async()=>stored,set:async v=>Object.assign(stored,v),remove:async keys=>keys.forEach(k=>delete stored[k])}}}});
   vm.runInContext(sync,context);for(let i=0;i<3;i++)await vm.runInContext('syncDjiTasks({includeHistory:true,cursor:null})',context);
   assert.equal(creates,0);assert.deepEqual(removed,[3]);assert.equal(stored['flight-report-media-tab'],undefined);
 });
@@ -149,9 +150,9 @@ test('task sync never selects a media or team page when a plan page is open', as
     { id: 3, url: PLAN_URL, status: 'complete', active: false },
   ];
   const calls = [];
-  const context = vm.createContext({ PLAN_URL, readDjiTasks, evaluationValue: r => r.result.value,
+  const context = vm.createContext({ evaluateBackgroundRead, PLAN_URL, readDjiTasks, evaluationValue: r => r.result.value,
     debuggerSession: { acquire: async () => true, release: async () => {} },
-    chrome: { debugger: { sendCommand: async ({ tabId }) => { calls.push(tabId); return { result: { value: { url: PLAN_URL, tasks: [], cursor: null } } }; } },
+    chrome: { debugger: { sendCommand: async ({ tabId }, method) => { if (method === 'Runtime.evaluate') calls.push(tabId); return { result: { value: { url: PLAN_URL, tasks: [], cursor: null } } }; } },
       tabs: { query: async () => tabs, get: async id => tabs.find(t => t.id === id), remove: async () => {} },
       storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } } } });
   vm.runInContext(sync, context);

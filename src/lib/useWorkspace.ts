@@ -19,7 +19,19 @@ export function useWorkspace() {
       setBridge(b); setReadiness(r); setMonitor(m); setPollError('');
     } catch { setReadiness(null); setBridge(null); setMonitor(null); setPollError('无法读取客户端状态，请重新检测；如持续失败，请重启客户端。'); }
   }, []);
-  useEffect(() => { void refresh(); const timer = setInterval(() => void refresh(), 2000); return () => clearInterval(timer); }, [refresh]);
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === 'visible') void refresh(); };
+    const onFocus = () => { void refresh(); };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 2000);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refresh]);
   const action = useCallback(async (command: string, args?: Record<string, unknown>) => {
     const priority = command === 'cancel_flight';
     if (lock.current && !priority) return false;

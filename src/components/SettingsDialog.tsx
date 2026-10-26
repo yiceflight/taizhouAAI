@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { defaultSettings, type FlightRoute, type WorkspaceSettings } from '../lib/workspace';
+import { defaultSettings, type FlightRoute, type RouteSelectionMode, type WindRouteRule, type WorkspaceSettings } from '../lib/workspace';
 type RoutesView = { routes: FlightRoute[]; selected?: string | null; syncedAt?: number | null };
 
 type Props = { settings: WorkspaceSettings; flightReady?: boolean; routes?: FlightRoute[]; selectedRoute?: string; routesSyncedAt?: number | null; onClose: () => void; onSaved: () => Promise<void>; onRoutesChanged?: () => Promise<void>; onDataCleared?: () => Promise<void> };
@@ -22,6 +22,8 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
   const [delay, setDelay] = useState(String(settings.takeoffDelayMinutes));
   const [manual, setManual] = useState(settings.requireManualConfirmation);
   const [periods, setPeriods] = useState((settings.noFlyPeriods ?? defaultSettings.noFlyPeriods ?? []).map(period => ({ ...period })));
+  const [routeMode, setRouteMode] = useState<RouteSelectionMode>(settings.routeSelectionMode === 'wind' ? 'wind' : 'fixed');
+  const [windRules, setWindRules] = useState<WindRouteRule[]>((settings.windRouteRules ?? []).map(rule => ({ ...rule })));
   const [saving, setSaving] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -68,12 +70,14 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
     setDelay(String(defaultSettings.takeoffDelayMinutes));
     setManual(defaultSettings.requireManualConfirmation);
     setPeriods((defaultSettings.noFlyPeriods ?? []).map(period => ({ ...period })));
+    setRouteMode(defaultSettings.routeSelectionMode ?? 'fixed');
+    setWindRules((defaultSettings.windRouteRules ?? []).map(rule => ({ ...rule })));
     setError('');
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (lock.current) return;
-    const next: WorkspaceSettings = { potassiumThreshold: Number(potassium), pm25Threshold: Number(pm25), takeoffDelayMinutes: manual && (!delay.trim() || !Number.isInteger(Number(delay)) || Number(delay) < 0 || Number(delay) > 1440) ? settings.takeoffDelayMinutes : Number(delay), requireManualConfirmation: manual, noFlyPeriods: periods };
+    const next: WorkspaceSettings = { potassiumThreshold: Number(potassium), pm25Threshold: Number(pm25), takeoffDelayMinutes: manual && (!delay.trim() || !Number.isInteger(Number(delay)) || Number(delay) < 0 || Number(delay) > 1440) ? settings.takeoffDelayMinutes : Number(delay), requireManualConfirmation: manual, noFlyPeriods: periods, routeSelectionMode: routeMode, windRouteRules: windRules };
     if (!potassium.trim() || !pm25.trim() || ![next.potassiumThreshold, next.pm25Threshold].every(value => Number.isFinite(value) && value > 0)) {
       setError('请输入大于 0 的有效浓度阈值。'); return;
     }
@@ -82,6 +86,12 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
     }
     if (periods.some(period => !/^([01]\d|2[0-3]):[0-5]\d$/.test(period.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(period.end) || period.start === period.end)) {
       setError('请填写有效的禁飞时间，开始与结束不能相同。'); return;
+    }
+    if (routeMode === 'wind' && (!routes?.routes.length || !windRules.length)) {
+      setError('高级航线模式需要先同步航线，并至少配置一条风向规则。'); return;
+    }
+    if (routeMode === 'wind' && windRules.some(rule => !Number.isFinite(rule.startDegrees) || !Number.isFinite(rule.endDegrees) || rule.startDegrees < 0 || rule.startDegrees >= 360 || rule.endDegrees < 0 || rule.endDegrees >= 360 || rule.startDegrees === rule.endDegrees || !rule.route.trim())) {
+      setError('请填写有效的风向规则：角度须为 0–359.9 度，开始与结束不能相同，并选择航线。'); return;
     }
     lock.current = true; setSaving(true); setError('');
     try {
@@ -98,7 +108,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
       <div className="settings-body">
         <fieldset disabled={busy} className="settings-section"><legend>监测阈值</legend><div className="settings-fields">
           <label htmlFor="potassium-threshold">钾离子 K⁺ 阈值<div className="settings-input"><input autoFocus id="potassium-threshold" type="number" step="any" min="0.000001" required value={potassium} onChange={event => setPotassium(event.target.value)} /><span>μg/m³</span></div></label>
-        </div><p className="settings-help">钾离子超过阈值时触发巡查计划填写。</p></fieldset>
+        </div><p className="settings-help">K⁺ 或 PM2.5 任一指标超过阈值时触发巡查计划填写。</p></fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>无人机起飞策略</legend>
           <div className="settings-flight-controls">
           <div className="settings-radio-row"><div><strong id="manual-confirmation-label">起飞执行方式</strong><p id="manual-confirmation-help">请选择巡查计划的执行方式</p></div><div className="settings-radio-options" role="radiogroup" aria-labelledby="manual-confirmation-label" aria-describedby="manual-confirmation-help">
@@ -106,13 +116,18 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
             <label className={`settings-radio-option${!manual ? ' is-selected' : ''}`}><input type="radio" name="takeoff-execution-mode" value="automatic" checked={!manual} onChange={() => setManual(false)} /><span className="settings-radio-mark" aria-hidden="true" /><span><strong>自动执行</strong><small>按延迟策略自动起飞</small></span></label>
           </div></div>
           {!manual && <div className="settings-delay"><div className="settings-delay-copy"><label htmlFor="takeoff-delay">钾离子超标后延迟</label><p id="takeoff-delay-help">0 表示不延迟，最多 1440 分钟</p></div><div className="settings-input"><input id="takeoff-delay" type="number" min="0" max="1440" step="1" required aria-describedby="takeoff-delay-help" value={delay} onChange={event => setDelay(event.target.value)} /><span>分钟</span></div></div>}
-          <p className="notice settings-flight-note">钾离子超过阈值后自动创建巡查计划；{manual ? '由工作人员确认后起飞。' : '等待设定延迟结束后自动起飞。'}</p>
+          <p className="notice settings-flight-note">K⁺ 或 PM2.5 超过阈值后自动创建巡查计划；{manual ? '由工作人员确认后起飞。' : '等待设定延迟结束后自动起飞。'}</p>
           </div>
         </fieldset>
         <fieldset disabled={busy} className="settings-section settings-route-section"><legend>巡查航线</legend>
           <p className="settings-help settings-route-intro">从司空泰州项目同步航线列表；填写巡查计划时按所选航线前缀匹配，平台生成的“副本”后缀会保留兼容。</p>
-          <div className="settings-route-row"><label htmlFor="flight-route">当前航线<select id="flight-route" value={routes?.selected ?? ''} onChange={event => void chooseRoute(event.target.value)}>{!routes?.selected && <option value="">{routes ? '请选择航线' : '请先同步航线列表'}</option>}{routes?.routes.map(route => <option key={route.routeId} value={route.name}>{route.name}</option>)}</select></label><button type="button" className="icon-button settings-route-sync" aria-label={syncingRoutes ? '正在同步航线' : '同步司空航线'} title={syncingRoutes ? '正在同步航线' : '同步司空航线'} disabled={!flightReady || busy} onClick={() => void syncRoutes()}><RouteRefreshIcon spinning={syncingRoutes} /></button></div>
+          <div className="settings-radio-row settings-route-mode"><div><strong id="route-selection-label">航线选择方式</strong><p id="route-selection-help">固定航线适合常态巡查；高级模式按起飞前机场风向选择规则航线。</p></div><div className="settings-radio-options" role="radiogroup" aria-labelledby="route-selection-label" aria-describedby="route-selection-help">
+            <label className={`settings-radio-option${routeMode === 'fixed' ? ' is-selected' : ''}`}><input type="radio" name="route-selection-mode" value="fixed" checked={routeMode === 'fixed'} onChange={() => setRouteMode('fixed')} /><span className="settings-radio-mark" aria-hidden="true" /><span><strong>固定航线</strong><small>始终使用当前航线</small></span></label>
+            <label className={`settings-radio-option${routeMode === 'wind' ? ' is-selected' : ''}`}><input type="radio" name="route-selection-mode" value="wind" checked={routeMode === 'wind'} onChange={() => setRouteMode('wind')} /><span className="settings-radio-mark" aria-hidden="true" /><span><strong>按风向选择</strong><small>按机场风向匹配规则</small></span></label>
+          </div></div>
+          <div className="settings-route-row"><label htmlFor="flight-route">{routeMode === 'wind' ? '固定航线（备用）' : '当前航线'}<select id="flight-route" value={routes?.selected ?? ''} onChange={event => void chooseRoute(event.target.value)}>{!routes?.selected && <option value="">{routes ? '请选择航线' : '请先同步航线列表'}</option>}{routes?.routes.map(route => <option key={route.routeId} value={route.name}>{route.name}</option>)}</select></label><button type="button" className="icon-button settings-route-sync" aria-label={syncingRoutes ? '正在同步航线' : '同步司空航线'} title={syncingRoutes ? '正在同步航线' : '同步司空航线'} disabled={!flightReady || busy} onClick={() => void syncRoutes()}><RouteRefreshIcon spinning={syncingRoutes} /></button></div>
           {routes?.selected && <p className="settings-help">已选：{routes.selected}{routes.syncedAt ? ` · 同步于 ${new Date(routes.syncedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}` : ''}</p>}
+          {routeMode === 'wind' && <div className="wind-route-config"><p className="settings-help">使用机场气象的气象风向（风从哪里来）匹配角度区间。区间包含开始角、不包含结束角；如需跨越 0°，可填写 315°–45°。规则按列表从上到下首条匹配；起飞前天气复核失败、风向缺测或无匹配规则时不会起飞。</p><div className="wind-route-rules">{windRules.map((rule, index) => <div className="wind-route-rule" key={index}><label>开始角度<input type="number" min="0" max="359.9" step="0.1" aria-label={`第 ${index + 1} 条风向规则开始角度`} value={rule.startDegrees} onChange={event => setWindRules(current => current.map((item, i) => i === index ? { ...item, startDegrees: Number(event.target.value) } : item))} /><span>°</span></label><span className="no-fly-separator">至</span><label>结束角度<input type="number" min="0" max="359.9" step="0.1" aria-label={`第 ${index + 1} 条风向规则结束角度`} value={rule.endDegrees} onChange={event => setWindRules(current => current.map((item, i) => i === index ? { ...item, endDegrees: Number(event.target.value) } : item))} /><span>°</span></label><label className="wind-route-rule-route">匹配航线<select aria-label={`第 ${index + 1} 条风向规则航线`} value={rule.route} onChange={event => setWindRules(current => current.map((item, i) => i === index ? { ...item, route: event.target.value } : item))}>{!routes?.routes.length && <option value="">请先同步航线列表</option>}{routes?.routes.map(route => <option key={route.routeId} value={route.name}>{route.name}</option>)}</select></label><button type="button" className="text-button" aria-label={`删除第 ${index + 1} 条风向规则`} onClick={() => setWindRules(current => current.filter((_, i) => i !== index))}>删除</button></div>)}</div>{!windRules.length && <p className="settings-help">尚未配置风向规则。</p>}<button type="button" className="secondary-button wind-route-add" disabled={windRules.length >= 16} onClick={() => setWindRules(current => [...current, { startDegrees: 0, endDegrees: 45, route: routes?.routes[0]?.name ?? '' }])}>＋ 添加风向规则</button></div>}
           {routeError && <p className="notice warning settings-route-error" role="alert">{routeError}</p>}
         </fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>禁飞时间（北京时间）</legend>
@@ -125,9 +140,9 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
           {!periods.length && <p className="settings-help">未配置禁飞时间。</p>}
           <button type="button" className="secondary-button no-fly-add" disabled={periods.length >= 24} onClick={() => setPeriods(current => [...current, { start: '12:00', end: '13:00' }])}>＋ 添加时段</button>
         </fieldset>
-        <fieldset disabled={busy} className="settings-section"><legend>报告阈值设置</legend><div className="settings-fields">
-          <label htmlFor="pm25-threshold">PM2.5 报告阈值<div className="settings-input"><input id="pm25-threshold" type="number" step="any" min="0.000001" required value={pm25} onChange={event => setPm25(event.target.value)} /><span>μg/m³</span></div></label>
-        </div><p className="settings-help">用于巡飞报告中可飞 PM2.5 数据的阈值判定。</p></fieldset>
+        <fieldset disabled={busy} className="settings-section"><legend>PM2.5 阈值设置</legend><div className="settings-fields">
+          <label htmlFor="pm25-threshold">PM2.5 阈值<div className="settings-input"><input id="pm25-threshold" type="number" step="any" min="0.000001" required value={pm25} onChange={event => setPm25(event.target.value)} /><span>μg/m³</span></div></label>
+        </div><p className="settings-help">用于自动巡查触发和巡飞报告中 PM2.5 数据的阈值判定。</p></fieldset>
         <fieldset className="settings-section"><legend>AI 巡查分析</legend><div className="analysis-switches">{analyses.map(name => <div key={name} className="analysis-switch-row"><span>{name}巡查分析</span><button type="button" role="switch" aria-label={`${name}巡查分析`} aria-checked={name === '火点'} disabled className="settings-switch"><span /></button></div>)}</div></fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>数据管理</legend>
           <div className="task-clear-content">

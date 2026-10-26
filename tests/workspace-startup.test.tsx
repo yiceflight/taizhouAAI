@@ -38,6 +38,18 @@ afterEach(async () => {
 });
 
 describe('automatic workspace startup', () => {
+  it('refreshes immediately when the window becomes visible or focused, without waiting for timers', async () => {
+    await mount();
+    state = { ...state, ready: true, started: true };
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    await act(async () => { document.dispatchEvent(new window.Event('visibilitychange')); });
+    expect(current.readiness?.ready).toBe(true);
+    state = { ...state, ready: false, pluginReady: false };
+    await act(async () => { window.dispatchEvent(new window.Event('focus')); });
+    expect(current.readiness?.pluginReady).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it('waits for every check, then enters without a click and starts once under StrictMode', async () => {
     await mount();
     expect(start).not.toHaveBeenCalled();

@@ -269,6 +269,18 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .settings-route-section legend { margin-bottom: 10px; }
 .settings-route-intro { margin: 0; line-height: 1.5; }
 .settings-route-section .settings-route-row { margin-top: 14px; }
+.settings-route-mode { margin-top: 18px; }
+.wind-route-config { margin-top: 14px; padding: 12px; border: 1px solid #d8e6dc; border-radius: 8px; background: #f8fcf9; }
+.wind-route-config > .settings-help { margin: 0; line-height: 1.6; }
+.wind-route-rules { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.wind-route-rule { display: grid; grid-template-columns: minmax(72px, .7fr) auto minmax(72px, .7fr) minmax(150px, 1.4fr) auto; align-items: end; gap: 8px; }
+.wind-route-rule label { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 12px; color: #486a54; }
+.wind-route-rule input, .wind-route-rule select { width: 100%; min-width: 0; box-sizing: border-box; padding: 9px 8px; border: 1px solid #cbdcd1; border-radius: 6px; background: #fff; color: #243d33; }
+.wind-route-rule label:not(.wind-route-rule-route) { position: relative; }
+.wind-route-rule label:not(.wind-route-rule-route) span { position: absolute; right: 8px; bottom: 10px; color: #718175; }
+.wind-route-rule label:not(.wind-route-rule-route) input { padding-right: 22px; }
+.wind-route-rule .text-button { margin-bottom: 4px; }
+.wind-route-add { margin-top: 12px; }
 .settings-route-section .settings-route-error { margin: 12px 0 0; }
 .settings-radio-row { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(0, 1.3fr); align-items: start; gap: 18px; }
 .settings-radio-row > div:first-child strong { font-size: 13px; font-weight: 500; }
@@ -303,6 +315,7 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 @media (prefers-reduced-motion: reduce) { .save-message { animation: none; } }
 @media (max-width: 520px) { .workspace-nav { gap: 6px; padding-inline: 12px; }.tabs { gap: 10px; }.settings-trigger { padding-inline: 4px; font-size: 12px; }.settings-trigger svg { display: none; }.settings-header { padding: 16px; }.settings-body { padding-inline: 16px; }.settings-fields { gap: 12px; }.settings-footer { padding: 12px 16px; }.analysis-switches { column-gap: 18px; } }
 @media (max-width: 520px) { .settings-delay { grid-template-columns: minmax(0, 1fr); }.settings-delay .settings-input { width: 100%; } }
+@media (max-width: 620px) { .wind-route-rule { grid-template-columns: minmax(72px, 1fr) auto minmax(72px, 1fr) auto; }.wind-route-rule-route { grid-column: 1 / -2; }.wind-route-rule .text-button { grid-column: -2 / -1; } }
 @media (max-width: 620px) { .settings-radio-row { grid-template-columns: 1fr; gap: 10px; }.settings-radio-options { grid-template-columns: 1fr; } }
 
 .weather-card { padding: 16px 20px; margin-bottom: 18px; border: 1px solid #d4e0d8; border-radius: 8px; background: #fff; }

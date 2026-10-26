@@ -435,7 +435,7 @@ impl Bridge {
                         Ok::<_, StatusCode>(Json(json!({"ok":true})))
                     }
                 }))
-                .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
+                .layer(DefaultBodyLimit::max(36 * 1024 * 1024))
                 .layer(middleware::from_fn(cors))
                 .with_state(bridge.clone());
             if let Err(error) = axum::serve(listener, router).await {

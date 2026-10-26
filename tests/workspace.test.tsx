@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { parseHTML } from 'linkedom';
 import { describe, it, expect } from 'vitest';
 import type { MonitorView, Readiness } from '../src/lib/workspace';
-import { dataQuality, defaultSettings, latestValidRow, potassiumReading } from '../src/lib/workspace';
+import { dataQuality, defaultSettings, flightSummary, latestValidRow, potassiumReading, triggerReading } from '../src/lib/workspace';
 import { SetupPanel } from '../src/components/SetupPanel';
 import { MonitoringPanel } from '../src/components/MonitoringPanel';
 import { DroneStatus } from '../src/components/DroneStatus';
@@ -13,7 +13,7 @@ import { SettingsDialog } from '../src/components/SettingsDialog';
 const noop = () => {};
 const action = async () => true;
 const at = (age: number) => new Date(Date.now() + (8-age)*3600000).toISOString().slice(0,19).replace('T',' ');
-const monitor = (age=0, potassium:number|null=0.2): MonitorView => ({ settings:{...defaultSettings,noFlyPeriods:[]},enabled:true,syncing:false,lastAttempt:at(0),lastSuccess:at(0),error:null,total:1,rows:[{time:at(age),potassium,pm25:35}],queryThrough:at(0),flight:{threshold:1,event:null,selectedRoute:'测试航线'} });
+const monitor = (age=0, potassium:number|null=0.2): MonitorView => ({ settings:{...defaultSettings,noFlyPeriods:[]},enabled:true,syncing:false,lastAttempt:at(0),lastSuccess:at(0),error:null,total:1,rows:[{time:at(age),potassium,pm25:20}],queryThrough:at(0),flight:{threshold:1,event:null,selectedRoute:'测试航线'} });
 const readiness = (ready:boolean):Readiness => ({ pluginReady:true,pluginMessage:'connected',pluginUpdateRequired:false,minimumExtensionVersion:'0.6.0',checking:false,started:false,ready,sites:['map','dji','sniff'].map((id,i)=>({id,state:!ready&&i===1?'login_required':'ready',message:'fixture',checkedAt:at(0),session:'fixture',tabId:i,url:'https://example.test'})) });
 const dom = (element: React.ReactElement) => parseHTML(renderToStaticMarkup(element)).document;
 const button = (document: Document, text: string) => [...document.querySelectorAll('button')].find(b=>b.textContent===text)!;
@@ -42,11 +42,11 @@ describe('workspace readiness and data truthfulness',()=>{
   it('separates report settings and shows delay only for automatic takeoff',()=>{
     const d = dom(<SettingsDialog settings={defaultSettings} onClose={noop} onSaved={async()=>{}}/>);
     expect(d.querySelector('#potassium-threshold')?.getAttribute('value')).toBe('1.0');
-    expect(d.querySelector('#pm25-threshold')?.getAttribute('value')).toBe('60');
+    expect(d.querySelector('#pm25-threshold')?.getAttribute('value')).toBe('30');
     expect(d.querySelector('#takeoff-delay')).toBeNull();
     const automatic = dom(<SettingsDialog settings={{...defaultSettings,noFlyPeriods:[], requireManualConfirmation:false}} onClose={noop} onSaved={async()=>{}}/>);
     expect(automatic.querySelector('#takeoff-delay')?.getAttribute('value')).toBe('5');
-    expect(d.querySelector('#pm25-threshold')?.closest('fieldset')?.querySelector('legend')?.textContent).toBe('报告阈值设置');
+    expect(d.querySelector('#pm25-threshold')?.closest('fieldset')?.querySelector('legend')?.textContent).toBe('PM2.5 阈值设置');
     expect(d.documentElement.textContent).not.toContain('保存到本机');
     expect(d.documentElement.textContent).not.toContain('暂未开放');
     expect(d.documentElement.textContent).toContain('AI 巡查分析');
@@ -101,10 +101,20 @@ describe('workspace readiness and data truthfulness',()=>{
   });
   it('does not equate recent sync with fresh or complete source data and preserves zero',()=>{
     expect(dataQuality(monitor(8)).label).toBe('数据已过期');
-    expect(dataQuality(monitor(0,null)).label).toBe('暂无数据');
+    expect(dataQuality(monitor(0,null)).label).toBe('数据正常');
     expect(dataQuality(monitor(0,0)).label).toBe('数据正常');
     expect(dataQuality(monitor(0,1.1)).label).toBe('K⁺ 超过巡查阈值');
     expect(dataQuality(null).label).toBe('暂无数据');
+  });
+  it('triggers from PM2.5 alone with a strict greater-than threshold',()=>{
+    const data = monitor(0, 0.2);
+    data.rows[0].pm25 = 30;
+    expect(triggerReading(data).exceeded).toBe(false);
+    data.rows[0].pm25 = 30.1;
+    const reading = triggerReading(data);
+    expect(reading.pm25Exceeded).toBe(true);
+    expect(reading.potassiumExceeded).toBe(false);
+    expect(flightSummary(data, true).title).toContain('PM2.5 超标');
   });
   it('shows the latest valid source hour when the newest source row is still empty',()=>{
     const data = monitor(0, null);
@@ -130,9 +140,9 @@ describe('workspace readiness and data truthfulness',()=>{
     const d = dom(<MonitoringPanel data={data} busy={false} ready started action={action} onPrepare={noop} onFlight={noop}/>);
     const cards = d.querySelectorAll('.metric-grid article');
     expect(cards[0]?.querySelector('strong')?.textContent).toBe('0.23');
-    expect(cards[1]?.querySelector('strong')?.textContent).toBe('16');
-    expect(cards[1]?.textContent).toContain('不参与巡查触发');
-    expect(d.querySelector('.time-metric strong')?.textContent).toBe(at(2).slice(0, 16));
+    expect(cards[1]?.querySelector('strong')?.textContent).toBe('15');
+    expect(cards[1]?.textContent).toContain('巡查触发阈值');
+    expect(d.querySelector('.time-metric strong')?.textContent).toBe(at(0).slice(0, 16));
     expect(dataQuality(data).label).toBe('数据正常');
   });
   it('blocks manual sync and a new flight when environment is broken',()=>{

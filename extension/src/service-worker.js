@@ -3,12 +3,15 @@ import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealt
 import { readDjiTasks } from './dji-tasks.js';
 import { readDjiRoutes } from './dji-routes.js';
 import { airinsReport, djiReport } from './flight-report.js';
+import { captureAirinsChart } from './airins-chart.js';
+import { djiPhotoPresentation, captureDjiPresentation } from './dji-photo-presentation.js';
 import { SITE_PATTERNS, allowedUrl, evaluationValue, pageSnapshot } from "./bridge-core.js";
 import { queryJiangsuHourly, normalizeHourly, prepareJiangsuForHealth, findJiangsuApi } from "./jiangsu.js";
 import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue } from "./flight-plan.js";
 import { ENDPOINT } from "./bridge-config.js";
 import { REALTIME_URL, selectAirinsPm25 } from './airins-realtime.js';
 import { createDebuggerSession } from './debugger-session.js';
+import { evaluateBackgroundRead } from './background-read.js';
 const sessionReady = (async () => {
   const saved = await chrome.storage.local.get("bridgeSession");
   if (saved.bridgeSession) return saved.bridgeSession;
@@ -89,7 +92,14 @@ async function capture(tabId, job) {
   let mediaKey = null;
   let completed = false;
   let attached = false;
+  let airChartTab = null;
   try {
+    if (job?.type === 'flight-airins' && job.captureChart) {
+      if (!Number.isSafeInteger(job.missionId) || job.missionId <= 0) throw new Error('可飞任务编号无效');
+      airChartTab = await chrome.tabs.create({url: `https://aai.airins.cn/sniff/HistoryCloud?missionId=${job.missionId}`, active:false});
+      targetTabId = airChartTab.id;
+      await waitTab(targetTabId);
+    }
     if (parallelReport) {
       const owned = await reportTabFor(job);
       targetTabId = owned.tab.id;
@@ -99,19 +109,28 @@ async function capture(tabId, job) {
     if (!allowedUrl(tab.url)) throw new Error("仅支持三个已授权业务网站");
     if (tab.status !== "complete") throw new Error("页面尚未加载完成");
     attached = await debuggerSession.acquire(targetTabId);
-    if (job?.type === 'dji-weather' || job?.type?.startsWith('flight-dji')) await chrome.debugger.sendCommand({ tabId: targetTabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
     const flight = job?.type?.startsWith('flight-');
-    const expression = job?.type === "dji-weather" ? `(${collectDjiWeather.toString()})()` : flight ? `(${(job.type.startsWith('flight-dji') ? djiReport : airinsReport).toString()})(${JSON.stringify(job)})` : null;
-    const response = await chrome.debugger.sendCommand({ tabId: targetTabId }, "Runtime.evaluate", {
+    const expression = job?.type === "dji-weather" ? `(${collectDjiWeather.toString()})()` : flight ? `(${(job.type.startsWith('flight-dji') ? djiReport : airinsReport).toString()})(${JSON.stringify(job)}, ${djiPhotoPresentation.toString()})` : null;
+    const response = await evaluateBackgroundRead(chrome.debugger, targetTabId, {
       expression: (job?.type === "site-health" ? `Promise.race([(${checkSiteHealth.toString()})((${findJiangsuApi.toString()})), new Promise(resolve => setTimeout(() => resolve({url:location.href,state:"error",message:"验证超时，请检查网络后重试"}), 15000))])` : expression) || (job?.type === "jiangsu-hourly" ? `Promise.race([(${queryJiangsuHourly.toString()})(${JSON.stringify(job.startTime)}, ${JSON.stringify(job.endTime)}, (${findJiangsuApi.toString()})), new Promise((_, reject) => setTimeout(() => reject(new Error("江苏大气站查询超时")), 35000))])` : `(${pageSnapshot.toString()})()`), awaitPromise: true, returnByValue: true,
-    });
+    }, ['site-health', 'dji-weather'].includes(job?.type) ? 20000 : 80000);
     const data = evaluationValue(response);
     const current = await chrome.tabs.get(targetTabId);
     if (!allowedUrl(data.url) || current.url !== data.url || new URL(data.url).origin !== new URL(tab.url).origin) throw new Error("采集期间页面发生跳转，请重试");
     if (["site-health", "dji-weather"].includes(job?.type)) return data;
     if (flight) {
+      if (airChartTab) {
+        data.chart = await captureAirinsChart(chrome.debugger, targetTabId, data);
+        if ((await chrome.tabs.get(targetTabId)).url !== data.url) throw new Error('可飞截图期间页面发生跳转');
+      }
       if (job.type === 'flight-dji-image' && !data.dataUrl) throw new Error('未取得照片原图，请关闭照片预览后重试；若持续失败，请更新司空适配器');
-      if (new TextEncoder().encode(JSON.stringify(data)).length > 20000000) throw new Error('巡飞资料超过单次传输限制');
+      if (job.type === 'flight-dji-image') {
+        if (!data.capturePlan) throw new Error('未核对照片标注，未保存不完整图片');
+        data.presentation = await captureDjiPresentation(chrome.debugger, targetTabId, {name: job.name}, data.capturePlan, djiPhotoPresentation);
+        delete data.capturePlan;
+        if ((await chrome.tabs.get(targetTabId)).url !== data.url) throw new Error('照片合成期间页面发生跳转，请重试');
+      }
+      if (new TextEncoder().encode(JSON.stringify(data)).length > 34000000) throw new Error('巡飞资料超过单次传输限制');
       completed = true;
       if (job.type === 'flight-dji-list' && (!Array.isArray(data.files) || data.files.length === 0)) await closeReportTab(mediaKey, targetTabId);
       return data;
@@ -120,8 +139,8 @@ async function capture(tabId, job) {
     if (!data.text && data.tables.length === 0) throw new Error("页面没有可采集的正文或表格；请登录并打开具体业务页面");
     return data;
   } finally {
-    if (job?.type === 'dji-weather' || job?.type?.startsWith('flight-dji')) await chrome.debugger.sendCommand({ tabId: targetTabId }, 'Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
-    await debuggerSession.release(targetTabId, attached);
+    try { await debuggerSession.release(targetTabId, attached); }
+    finally { if (airChartTab) await chrome.tabs.remove(airChartTab.id).catch(() => {}); }
     if (parallelReport && (!completed || job.closeAfter)) await closeReportTab(mediaKey, targetTabId);
     if (!parallelReport) capturing = false;
     if (parallelReport) activeReportCaptures = Math.max(0, activeReportCaptures - 1);
@@ -343,7 +362,7 @@ async function syncDjiTasks(job) {
   const attached = await debuggerSession.acquire(tab.id);
   let result;
   try {
-    const response = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
+    const response = await evaluateBackgroundRead(chrome.debugger, tab.id, {
       expression: `(${readDjiTasks.toString()})(${JSON.stringify(tab.url)}, ${JSON.stringify({ cursor: job.cursor, includeHistory: job.includeHistory })})`,
       awaitPromise: true, returnByValue: true,
     });
@@ -371,7 +390,7 @@ async function syncDjiRoutes() {
     let attached = false;
     try {
       attached = await debuggerSession.acquire(tab.id);
-      const response = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
+      const response = await evaluateBackgroundRead(chrome.debugger, tab.id, {
         expression: `(${readDjiRoutes.toString()})(${JSON.stringify(tab.url)})`,
         awaitPromise: true, returnByValue: true,
       });

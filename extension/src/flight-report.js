@@ -19,10 +19,26 @@ export async function airinsReport(job) {
   const data = await get('/raw/data/box', {missionId:job.missionId,filteringParams:[]});
   const ts = data.missionData?.ts, pm = data.missionData?.ad_9;
   if (!Array.isArray(ts) || !Array.isArray(pm) || !Array.isArray(data.positions) || !ts.length || ts.length > 20000 || ts.length !== pm.length || ts.length !== data.positions.length || ts.length !== data.missionNum) throw new Error('可飞采样数据不完整或超过 20000 点');
-  // ad_9 is the platform's raw PM2.5 channel, μg/m³. Do not convert gas channels.
-  return {url:location.href,missionId:job.missionId,unit:'μg/m³',points:ts.map((time,i)=>({time,pm25:pm[i],longitude:data.positions[i]?.[0],latitude:data.positions[i]?.[1]}))};
+  // Verified against Airins' parameter definitions and CSV export (2026-10-25).
+  // Preserve raw gas units here; the native report applies the documented
+  // platform conversion and archives these arrays alongside all PM2.5 points.
+  // Ox (ad_7) is NOT O3. Never substitute it for the absent ozone channel.
+  const channels = {};
+  for (const [name, sourceChannel, unit] of [
+    ['pm10', 'ad_10', 'μg/m³'], ['so2', 'ad_4', 'ppm'],
+    ['no2', 'ad_6', 'ppm'], ['co', 'ad_5', 'ppm'], ['o3', 'ad_80', 'ppm'],
+  ]) {
+    const values = data.missionData[sourceChannel];
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || values.length !== ts.length
+      || values.some(v => v !== null && (typeof v !== 'number' || !Number.isFinite(v) || v < 0))) {
+      throw new Error(`可飞 ${name.toUpperCase()} 通道数据不完整或数值无效`);
+    }
+    channels[name] = { sourceChannel, unit, values };
+  }
+  return {url:location.href,missionId:job.missionId,unit:'μg/m³',channels,points:ts.map((time,i)=>({time,pm25:pm[i],longitude:data.positions[i]?.[0],latitude:data.positions[i]?.[1]}))};
 }
-export async function djiReport(job) {
+export async function djiReport(job, inspectPresentation) {
   const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
   if (location.origin !== 'https://fh.dji.com' || location.pathname.replace(/\/$/,'') !== project || !location.hash.startsWith('#/media?')) throw new Error('请打开泰州项目的司空媒体库');
   const visible = e => e.getClientRects().length > 0;
@@ -259,7 +275,19 @@ export async function djiReport(job) {
     if(width<600||height<400)throw new Error('司空仅返回缩略图，请等待原图上传');
     if((selected.ext?.width>0 && width!==Number(selected.ext.width))||(selected.ext?.height>0 && height!==Number(selected.ext.height)))throw new Error('下载照片尺寸与平台原图不符');
     const dataUrl=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(new Blob([bytes],{type:mime}));});
-    return {url:location.href,folder,name:job.name,dataUrl,kind:'司空原始照片'};
+    if (typeof inspectPresentation !== 'function') throw new Error('请更新插件以完整保留司空照片标注');
+    let capturePlan = null, previous = '', stable = 0, lastError;
+    for (let check = 0; check < 40; check++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      try {
+        const plan = await inspectPresentation({name: job.name, width, height});
+        stable = plan.signature === previous ? stable + 1 : 0;
+        previous = plan.signature;
+        if (stable >= 3) { capturePlan = plan; break; }
+      } catch (error) { lastError = error; stable = 0; previous = ''; }
+    }
+    if (!capturePlan) throw lastError || new Error('司空照片标注尚未稳定，请等待加载完成后重试');
+    return {url:location.href,folder,name:job.name,dataUrl,kind:'司空原始照片',capturePlan};
   }
   throw new Error('未取得司空照片原图，请关闭预览后重试；如仍失败请检查照片是否已完成上传');
 }

@@ -15,12 +15,16 @@ pub struct Evidence {
     pub review_method: String,
     pub conclusion: String,
     pub recommendation: String,
+    #[serde(default)]
+    pub dji_task: Option<DjiTask>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CityHour {
     pub time: String,
     pub potassium: Option<f64>,
+    #[serde(default)]
+    pub pm25: Option<f64>,
     pub source_url: String,
     pub synced_at: String,
 }
@@ -46,10 +50,15 @@ pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path, now: i64) -> Result<Evidence, String> {
     let start = date(now, "%Y-%m-%d 00:00:00");
     let end = date(now, "%Y-%m-%d %H:%M:%S");
-    // Legacy PM2.5 values are deliberately NOT treated as a verified city source.
-    let mut stmt = db.prepare("SELECT observed_at,potassium,source_url,synced_at FROM hourly_observations WHERE city_code='321200' AND data_source='A_6' AND common_site_type='30' AND unit='μg/m³' AND observed_at>=?1 AND observed_at<=?2 ORDER BY observed_at").map_err(|e| e.to_string())?;
-    let city_hours = stmt.query_map(params![start, end], |r| Ok(CityHour { time:r.get(0)?, potassium:r.get(1)?, source_url:r.get(2)?, synced_at:r.get(3)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+    // Both fields are now populated by the verified Jiangsu city-hour adapter.
+    let mut stmt = db.prepare("SELECT observed_at,potassium,source_url,synced_at,pm25 FROM hourly_observations WHERE city_code='321200' AND data_source='A_6' AND common_site_type='30' AND unit='μg/m³' AND observed_at>=?1 AND observed_at<=?2 ORDER BY observed_at").map_err(|e| e.to_string())?;
+    let city_hours = stmt.query_map(params![start, end], |r| Ok(CityHour { time:r.get(0)?, potassium:r.get(1)?, source_url:r.get(2)?, synced_at:r.get(3)?, pm25:r.get(4)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     let mut e = Evidence { captured_at:now, city_hours, ..Default::default() };
+    let tasks = read_dji_tasks(db)?;
+    let matching: Vec<_> = tasks.into_iter().filter(|t| !t.actual_time_missing
+        && t.mission.mission_name == data.mission.mission_name
+        && t.mission.start_time == data.mission.start_time && t.mission.end_time == data.mission.end_time).collect();
+    if matching.len() == 1 { e.dji_task = matching.into_iter().next(); }
     if let Some(id) = &data.local_event_id {
         for key in ["flight_event".to_string(), format!("flight_history:{id}")] {
             if let Some(raw) = crate::monitoring::setting(db, &key)? {
@@ -62,7 +71,12 @@ pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path,
             }
         }
     } else if let Some(reason) = list_reasons(db)?.get(&data.mission.mission_id.to_string()) {
-        e.trigger = match reason.as_str() { "manual_immediate" => "由人工手动发起", "dji_scheduled" => "由司空定时任务发起", "potassium_manual" => "由K⁺巡查经人工确认发起", "potassium_auto" => "由K⁺监测自动触发", _ => "触发原因待核实" }.into();
+        e.trigger = match reason.as_str() { "manual_immediate" => "由人工手动发起", "dji_scheduled" => "由司空定时任务发起", "potassium_manual" => "由K⁺/PM2.5巡查经人工确认发起", "potassium_auto" => "由K⁺或PM2.5监测自动触发", _ => "触发原因待核实" }.into();
+    }
+    if e.trigger.is_empty() {
+        if let Some(t) = &e.dji_task {
+            e.trigger = format!("由司空平台执行（{}）", t.task_type.as_deref().unwrap_or("任务类型待核实"));
+        }
     }
     // Reviews are explicit local editorial inputs, bound to exact image bytes and flight.
     // A different/partial flight never inherits a conclusion or a pollution finding.
@@ -162,23 +176,47 @@ pub fn photo_facts(bytes: &[u8]) -> PhotoFacts {
     f
 }
 
+fn hour(time: &str) -> &str { time.get(11..16).unwrap_or("时刻未取得") }
+fn valid_value(value: Option<f64>) -> Option<f64> { value.filter(|v| v.is_finite() && *v >= 0.0) }
+fn trend(values: &[(&CityHour, f64)], unit: &str, change: bool) -> String {
+    match (values.first(), values.last()) {
+        (Some((a, x)), Some((b, y))) if a.time != b.time => {
+            let mut text = format!("由{}的{x:.2}{unit}{}{}的{y:.2}{unit}", hour(&a.time), if y>x {"升至"} else if y<x {"降至"} else {"持平至"}, hour(&b.time));
+            if change {
+                if *x > 0.0 { text.push_str(&format!("，{}幅{:.1}%", if y>=x {"升"}else{"降"}, (y-x).abs()/x*100.0)); }
+                else { text.push_str("，起点为0，变化率无法计算"); }
+            }
+            text
+        },
+        (Some((a, x)), _) => format!("在{}为{x:.2}{unit}，仅1个有效小时，不能计算变化", hour(&a.time)),
+        _ => "未取得，无法计算变化".into(),
+    }
+}
 impl Evidence {
     pub fn city_fields(&self) -> Vec<(&'static str,String)> {
-        let valid: Vec<_> = self.city_hours.iter().filter_map(|h| h.potassium.filter(|v|v.is_finite() && *v>=0.0).map(|v|(h,v))).collect();
-        let high:Vec<_>=valid.iter().filter(|(_,v)|*v>1.0).collect();
-        let trend=match (valid.first(),valid.last()) {
-            (Some((a,x)),Some((b,y))) if a.time!=b.time => format!("浓度由{}的{:.2}微克/立方米{}{}的{:.2}微克/立方米", &a.time[11..16],x,if y>x {"升至"}else if y<x {"降至"}else {"持平至"},&b.time[11..16],y),
-            (Some((a,x)),_) => format!("浓度在{}为{:.2}微克/立方米，仅1个有效小时，不能计算变化",&a.time[11..16],x),
-            _=>"浓度尚无有效观测".into(),
+        let k: Vec<_> = self.city_hours.iter().filter_map(|h| valid_value(h.potassium).map(|v|(h,v))).collect();
+        let pm: Vec<_> = self.city_hours.iter().filter_map(|h| valid_value(h.pm25).map(|v|(h,v))).collect();
+        let ratios: Vec<_> = self.city_hours.iter().filter_map(|h| {
+            let p=valid_value(h.pm25).filter(|v|*v>0.0)?;
+            Some((h,valid_value(h.potassium)?/p*100.0))
+        }).collect();
+        let high: Vec<_> = k.iter().filter(|(_,v)|*v>1.0).collect();
+        let peak = k.iter().max_by(|a,b|a.1.total_cmp(&b.1));
+        let high_text = if k.is_empty() { "的高值小时数无法统计；".into() } else {
+            format!("的高值在{}个有效观测小时中共{}小时，{}；", k.len(), high.len(), if high.is_empty() {"未见高值时段（仅限有效小时）".into()} else {format!("对应时刻为{}",high.iter().map(|(h,_)|hour(&h.time)).collect::<Vec<_>>().join("、"))})
         };
-        let peak=valid.iter().max_by(|a,b|a.1.total_cmp(&b.1));
-        let high_text=if valid.is_empty(){"的高值小时数无法统计；".into()}else{
-            format!("的高值在{}个有效观测小时中共{}小时，{}；",valid.len(),high.len(),if high.is_empty(){"未见高值时段（仅限有效小时）".into()}else{format!("对应时刻为{}",high.iter().map(|(h,_)|h.time[11..16].to_string()).collect::<Vec<_>>().join("、"))})
-        };
-        let peak_text=peak.map(|(h,v)|format!("明显高值过程划分尚未确定；全窗有效观测K⁺峰值为{v:.2}微克/立方米，发生于{}，该小时对应PM",&h.time[11..16])).unwrap_or_else(||"高值过程及K⁺峰值无法判断，对应PM".into());
+        let peak_text = peak.map(|(h,v)|format!("明显高值过程划分规则待确定；全窗有效观测K⁺峰值为{v:.2}微克/立方米，发生于{}，该小时对应PM",hour(&h.time)))
+            .unwrap_or_else(||"K⁺峰值无法判断，对应PM".into());
+        let peak_pm = peak.and_then(|(h,_)|valid_value(h.pm25)).map(|v|format!("浓度为{v:.2}微克/立方米，全分析窗口K⁺/PM"))
+            .unwrap_or_else(||"浓度未取得，全分析窗口K⁺/PM".into());
+        let max_ratio = ratios.iter().max_by(|a,b|a.1.total_cmp(&b.1)).map(|(h,v)|format!("比值最高为{v:.2}%（{}）",hour(&h.time)))
+            .unwrap_or_else(||"最高比值无法计算".into());
         let expected=((self.captured_at+8*3600000).rem_euclid(86400000)/3600000+1) as usize;
-        let note=format!("。本章使用泰州市城市口径K⁺小时数据；当日截至生成时刻应有{}个整点，已取得{}个有效值，{}个缺测或未发布，未补0。{}城市PM2.5未接入，不用无人机采样替代。当前资料不足以确认生物质燃烧；本次巡飞时间和启动原因见第二章。", expected,valid.len(),expected.saturating_sub(valid.len()),self.city_hours.last().map(|h|format!("来源最新返回时刻为{}。",&h.time)).unwrap_or_default());
-        vec![("CITY_PM","浓度未取得，升降幅无法计算".into()),("CITY_K",trend),("CITY_RATIO","比值无法计算；高于".into()),("CITY_HIGH",high_text+&peak_text),("CITY_PEAK_PM","浓度未取得，时段内K⁺/PM".into()),("CITY_MAX_RATIO","最高比值无法计算".into()),("CITY_NOTE",note)]
+        let note=format!("。采用泰州市城市小时数据，截至生成时刻共{}个整点，K⁺有效{}个、PM2.5有效{}个、可配对比值{}个；缺测或未发布值不补0。当前资料不足以确认生物质燃烧；巡飞时间和启动原因见第二章。", expected,k.len(),pm.len(),ratios.len());
+        vec![("CITY_PM",format!("浓度{}",trend(&pm,"微克/立方米",true))),
+             ("CITY_K",format!("浓度{}",trend(&k,"微克/立方米",false))),
+             ("CITY_RATIO",format!("比值{}；高于",trend(&ratios,"%",false))),
+             ("CITY_HIGH",high_text+&peak_text),("CITY_PEAK_PM",peak_pm),("CITY_MAX_RATIO",max_ratio),("CITY_NOTE",note)]
     }
 }
 
@@ -209,12 +247,33 @@ pub fn location_plot(facts: &[PhotoFacts]) -> Result<Option<Vec<u8>>,String> {
         label(&mut pixels,30,y-6,&format!("{:.5}",bottom+dy*(4-tick) as f64/4.0));
     }
     label(&mut pixels,970,563,"E");label(&mut pixels,30,40,"N");
-    for (i,lon,lat) in points {
-        let x=180+((lon-left)/dx*720.0).round() as i32;
-        let y=540-((lat-bottom)/dy*460.0).round() as i32;
-        for a in -6..=6{for b in -6..=6{if a*a+b*b<=36{dot(&mut pixels,x+a,y+b,[190,45,45]);}}}
-        label(&mut pixels,if i%2==1{x+12}else{x-28},if i%2==1{y-22}else{y+10},&i.to_string());
+    // Keep labels legible for paired cameras and nearby capture points. Leader
+    // lines connect a displaced label to its unchanged coordinate, not a route.
+    let projected:Vec<_>=points.iter().map(|(i,lon,lat)|(*i,
+        180+((lon-left)/dx*720.0).round() as i32,
+        540-((lat-bottom)/dy*460.0).round() as i32)).collect();
+    let mut occupied:Vec<(i32,i32,i32,i32)>=vec![];
+    for (i,x,y) in &projected {
+        let text=i.to_string();let width=text.len() as i32*12;
+        let mut position=None;
+        'search: for radius in [14,30,46,62,78,94,110,126,142] {
+            for (a,b) in [(radius,-radius),(radius,radius),(-radius-width,-radius),(-radius-width,radius),(-width/2,-radius),(-width/2,radius)] {
+                let (lx,ly)=(x+a,y+b);
+                let rect=(lx-3,ly-3,lx+width+3,ly+17);
+                if rect.0<181||rect.1<81||rect.2>899||rect.3>539 {continue;}
+                if occupied.iter().any(|r|rect.0<r.2&&rect.2>r.0&&rect.1<r.3&&rect.3>r.1)
+                    ||projected.iter().any(|(_,px,py)|*px+8>rect.0&&*px-8<rect.2&&*py+8>rect.1&&*py-8<rect.3){continue;}
+                occupied.push(rect);position=Some((lx,ly));break 'search;
+            }
+        }
+        if let Some((lx,ly))=position {
+            let (tx,ty)=(lx+width/2,ly+7);
+            let steps=(tx-x).abs().max((ty-y).abs()).max(1);
+            for step in 0..=steps {dot(&mut pixels,x+(tx-x)*step/steps,y+(ty-y)*step/steps,[175,175,175]);}
+            label(&mut pixels,lx,ly,&text);
+        }
     }
+    for (_,x,y) in projected {for a in -6..=6{for b in -6..=6{if a*a+b*b<=36{dot(&mut pixels,x+a,y+b,[190,45,45]);}}}}
     let mut bytes=vec![];
     {let mut enc=png::Encoder::new(&mut bytes,w as u32,h as u32);enc.set_color(png::ColorType::Rgb);enc.set_depth(png::BitDepth::Eight);let mut writer=enc.write_header().map_err(|e|e.to_string())?;writer.write_image_data(&pixels).map_err(|e|e.to_string())?;}
     Ok(Some(bytes))
@@ -226,9 +285,9 @@ mod tests {
     #[test]
     fn missing_hours_zero_and_threshold_are_not_confused() {
         let e=Evidence {captured_at:1791739800000,city_hours:vec![
-            CityHour{time:"2026-10-12 00:00:00".into(),potassium:Some(0.0),source_url:String::new(),synced_at:String::new()},
-            CityHour{time:"2026-10-12 01:00:00".into(),potassium:Some(1.0),source_url:String::new(),synced_at:String::new()},
-            CityHour{time:"2026-10-12 02:00:00".into(),potassium:None,source_url:String::new(),synced_at:String::new()},
+            CityHour{time:"2026-10-12 00:00:00".into(),potassium:Some(0.0),pm25:None,source_url:String::new(),synced_at:String::new()},
+            CityHour{time:"2026-10-12 01:00:00".into(),potassium:Some(1.0),pm25:None,source_url:String::new(),synced_at:String::new()},
+            CityHour{time:"2026-10-12 02:00:00".into(),potassium:None,pm25:None,source_url:String::new(),synced_at:String::new()},
         ],..Default::default()};
         let fields=e.city_fields();
         let text=fields.iter().map(|(_,s)|s.as_str()).collect::<Vec<_>>().join("");
@@ -239,7 +298,7 @@ mod tests {
         assert!(text.contains("最高比值无法计算"));
     }
     #[test]
-    fn snapshot_uses_only_current_city_k_and_matching_event() {
+    fn snapshot_uses_verified_city_hours_and_matching_event() {
         let db=crate::monitoring::connect(Path::new(":memory:")).unwrap();
         for (time,k,city) in [("2026-10-11 23:00:00",9.0,"321200"),("2026-10-12 00:00:00",0.39,"321200"),("2026-10-12 01:00:00",0.35,"321200"),("2026-10-12 00:00:00",8.0,"other")] {
             db.execute("INSERT INTO hourly_observations VALUES (?1,?2,?3,99,'μg/m³','source','A_6','30','sync')",params![city,time,k]).unwrap();
@@ -251,7 +310,21 @@ mod tests {
         assert_eq!(e.city_hours.len(),1); // generated 00:34; 01:00 is outside window
         assert_eq!(e.city_hours[0].potassium,Some(0.39));
         assert!(e.trigger.is_empty());
-        assert!(e.city_fields().iter().any(|(k,v)|*k=="CITY_PM"&&v.contains("未取得")));
+        assert_eq!(e.city_hours[0].pm25,Some(99.0));
+        assert!(e.city_fields().iter().any(|(k,v)|*k=="CITY_PM"&&v.contains("99.00")));
+    }
+    #[test]
+    fn city_ratios_pair_same_hour_and_k_peak_uses_corresponding_pm() {
+        let mut e=Evidence::default();
+        for (hour,k,pm) in [("00:00",Some(0.0),Some(0.0)),("01:00",Some(2.0),Some(10.0)),("02:00",None,Some(100.0)),("03:00",Some(1.0),Some(2.0))] {
+            e.city_hours.push(CityHour{time:format!("2026-10-25 {hour}:00"),potassium:k,pm25:pm,source_url:String::new(),synced_at:String::new()});
+        }
+        let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
+        assert!(fields["CITY_PM"].contains("起点为0"));
+        assert!(fields["CITY_PEAK_PM"].contains("10.00"));
+        assert!(fields["CITY_MAX_RATIO"].contains("50.00%（03:00）"));
+        assert!(fields["CITY_NOTE"].contains("可配对比值2个"));
+        assert!(fields["CITY_HIGH"].contains("共1小时"));
     }
     #[test]
     fn image_type_requires_metadata_and_missing_gps_never_becomes_zero() {
@@ -269,7 +342,7 @@ mod tests {
         let db=crate::monitoring::connect(Path::new(":memory:")).unwrap();
         let mut data=super::super::tests::sample();
         let (bytes,_)=decode_image(super::super::tests::PNG).unwrap();
-        data.photos=vec![Photo{name:"x".into(),kind:"x".into(),data_url:super::super::tests::PNG.into()}];
+        data.photos=vec![Photo{name:"x".into(),kind:"x".into(),data_url:super::super::tests::PNG.into(),presentation:None}];
         let path=std::env::temp_dir().join(format!("{}.json",Uuid::new_v4()));
         let write=|hash:String,start:i64|fs::write(&path,json!({"localEventId":null,"missionStart":start,"missionEnd":data.mission.end_time,"photos":{hash:{"description":"test scene","result":"unverified"}},"conclusion":"reviewed","recommendation":"check"}).to_string()).unwrap();
         write(digest(&bytes),data.mission.start_time+1);

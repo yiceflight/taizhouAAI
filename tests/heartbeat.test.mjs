@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
+import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 const source = await readFile(new URL('../extension/src/service-worker.js', import.meta.url), 'utf8');
 const loop = source.slice(source.indexOf('async function bridgeTabs()'), source.indexOf('\nfunction start()'));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -78,4 +79,32 @@ test('single-job protocol asks native scheduling again immediately after complet
   await run(); await done.promise;
   assert.deepEqual(executed, [1, 2]);
   assert.deepEqual(completed, [1, 2]);
+});
+
+test('a frozen background read expires while heartbeats continue, then the next probe can run', async () => {
+  const entered = deferred(), drained = deferred();
+  const completed = [], evaluated = [];
+  let claims = 0, busyBeats = 0;
+  const api = { sendCommand: async ({ tabId }, method) => {
+    if (method !== 'Runtime.evaluate') return;
+    evaluated.push(tabId);
+    if (tabId === 1) { entered.resolve(); return new Promise(() => {}); }
+    return { result: { value: { state: 'ready' } } };
+  } };
+  const run = fixture(async (path, body) => {
+    if (path === 'complete') { completed.push(body); return {}; }
+    if (body.busy) { busyBeats++; return { jobs: [] }; }
+    claims++;
+    if (claims > 2) { drained.resolve(); return { jobs: [] }; }
+    return { keepAliveSupported: true, singleJobSupported: true, jobs: [{ id: claims, type: 'capture', tabId: claims }] };
+  }, async tabId => (await evaluateBackgroundRead(api, tabId, { expression: 'probe()' }, 20)).result.value);
+  const pending = run();
+  await entered.promise;
+  await run();
+  await pending;
+  await drained.promise;
+  assert.equal(busyBeats, 1);
+  assert.deepEqual(evaluated, [1, 2]);
+  assert.match(completed[0].error, /后台页面读取超时/);
+  assert.equal(completed[1].data.state, 'ready');
 });

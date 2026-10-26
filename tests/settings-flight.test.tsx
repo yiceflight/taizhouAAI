@@ -31,7 +31,7 @@ it('persists the execution strategy without a separate automatic patrol switch',
 it('shows manual or automatic execution as the only execution choice', async () => {
   await render();
   expect(document.body.textContent).toContain('自动执行');
-  expect(document.body.textContent).toContain('钾离子超过阈值后自动创建巡查计划');
+  expect(document.body.textContent).toContain('K⁺ 或 PM2.5 超过阈值后自动创建巡查计划');
   const choices = [...document.querySelectorAll<HTMLInputElement>('input[name="takeoff-execution-mode"]')];
   expect(choices).toHaveLength(2);
   expect(choices.map(choice => choice.value)).toEqual(['manual', 'automatic']);
@@ -123,6 +123,22 @@ it('shows the synced route choice and persists a changed route prefix', async ()
   ipc.invoke.mockResolvedValueOnce({ routes: [{ routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }], selected: '东南火点巡查航线-改-副本(6)' });
   await act(async () => { select.options[1].selected = true; select.dispatchEvent(new window.Event('change', { bubbles: true })); });
   expect(ipc.invoke).toHaveBeenCalledWith('set_flight_route', { route: '东南火点巡查航线-改-副本(6)' });
+});
+it('configures wind based route selection with direction ranges', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南航线' }, { routeId: 'r2', name: '西北航线' }]} selectedRoute="东南航线" onClose={onClose} onSaved={onSaved} />));
+  await act(async () => document.querySelector<HTMLInputElement>('input[name="route-selection-mode"][value="wind"]')!.click());
+  await act(async () => [...document.querySelectorAll('button')].find(button => button.textContent === '＋ 添加风向规则')!.click());
+  expect(document.querySelector('[aria-label="第 1 条风向规则开始角度"]')).not.toBeNull();
+  expect(document.querySelector('[aria-label="第 1 条风向规则航线"]')?.value).toBe('东南航线');
+  await submit();
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', { settings: expect.objectContaining({ routeSelectionMode: 'wind', windRouteRules: [{ startDegrees: 0, endDegrees: 45, route: '东南航线' }] }) });
+});
+it('requires at least one wind rule before enabling advanced mode', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南航线' }]} selectedRoute="东南航线" onClose={onClose} onSaved={onSaved} />));
+  await act(async () => document.querySelector<HTMLInputElement>('input[name="route-selection-mode"][value="wind"]')!.click());
+  await submit();
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain('至少配置一条风向规则');
 });
 it('keeps the sync prompt only before the first route sync', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} />));

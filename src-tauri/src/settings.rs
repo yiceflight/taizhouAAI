@@ -16,6 +16,17 @@ fn default_no_fly_periods() -> Vec<NoFlyPeriod> {
         end: "08:00".into(),
     }]
 }
+fn default_route_selection_mode() -> String {
+    "fixed".into()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WindRouteRule {
+    pub start_degrees: f64,
+    pub end_degrees: f64,
+    pub route: String,
+}
 fn minute(value: &str) -> Result<u32, String> {
     let bytes = value.as_bytes();
     if bytes.len() != 5
@@ -43,16 +54,22 @@ pub struct Settings {
     pub require_manual_confirmation: bool,
     #[serde(default = "default_no_fly_periods")]
     pub no_fly_periods: Vec<NoFlyPeriod>,
+    #[serde(default = "default_route_selection_mode")]
+    pub route_selection_mode: String,
+    #[serde(default)]
+    pub wind_route_rules: Vec<WindRouteRule>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             potassium_threshold: 1.0,
-            pm25_threshold: 60.0,
+            pm25_threshold: 30.0,
             takeoff_delay_minutes: 5,
             require_manual_confirmation: true,
             no_fly_periods: default_no_fly_periods(),
+            route_selection_mode: default_route_selection_mode(),
+            wind_route_rules: Vec::new(),
         }
     }
 }
@@ -63,10 +80,31 @@ impl Settings {
             return Err("钾离子阈值必须是大于 0 的有效数值。".into());
         }
         if !self.pm25_threshold.is_finite() || self.pm25_threshold <= 0.0 {
-            return Err("PM2.5 报告阈值必须是大于 0 的有效数值。".into());
+            return Err("PM2.5 阈值必须是大于 0 的有效数值。".into());
         }
         if self.takeoff_delay_minutes > 1440 {
             return Err("起飞延迟须为 0 至 1440 之间的整数分钟。".into());
+        }
+        if !matches!(self.route_selection_mode.as_str(), "fixed" | "wind") {
+            return Err("航线选择模式无效，请选择固定航线或按风向选择。".into());
+        }
+        if self.wind_route_rules.len() > 16 {
+            return Err("最多可配置 16 条风向航线规则。".into());
+        }
+        for rule in &self.wind_route_rules {
+            if !rule.start_degrees.is_finite()
+                || !(0.0..360.0).contains(&rule.start_degrees)
+                || !rule.end_degrees.is_finite()
+                || !(0.0..360.0).contains(&rule.end_degrees)
+            {
+                return Err("风向角度必须在 0 至 360 度之间。".into());
+            }
+            if (rule.start_degrees - rule.end_degrees).abs() < f64::EPSILON {
+                return Err("风向规则的开始角度与结束角度不能相同。".into());
+            }
+            if rule.route.trim().is_empty() {
+                return Err("每条风向规则都必须选择航线。".into());
+            }
         }
         if self.no_fly_periods.len() > 24 {
             return Err("最多可配置 24 段禁飞时间。".into());
@@ -184,6 +222,8 @@ mod tests {
                     end: "01:30".into(),
                 },
             ],
+            route_selection_mode: "fixed".into(),
+            wind_route_rules: Vec::new(),
         };
         save(&db, &settings).unwrap();
         drop(db);

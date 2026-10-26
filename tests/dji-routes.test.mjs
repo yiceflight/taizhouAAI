@@ -1,3 +1,4 @@
+import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
@@ -115,7 +116,7 @@ test('worker retries another open project tab when the active tab has an expired
   const calls = [];
   const result = { url: PLAN_URL, apiVersion: 1, routes: [{ routeId: id(4), name: '可用航线', updateTime: 1 }] };
   const context = vm.createContext({
-    PLAN_URL,
+    PLAN_URL, evaluateBackgroundRead,
     readDjiRoutes: async () => result,
     evaluationValue: response => response.result.value,
     debuggerSession: { acquire: async tabId => { calls.push(tabId); if (tabId === 1) throw new Error('司空登录已过期'); return true; }, release: async () => {} },

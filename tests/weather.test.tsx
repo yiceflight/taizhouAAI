@@ -115,7 +115,10 @@ describe('weather status explanation', () => {
     }
     expect(trigger().textContent).toContain('暂无天气数据，将自动获取');
     const missing = { ...good(), current: null, level: 'unknown' as const, reasons: ['测试版插件未连接，请加载开发版插件。'] };
-    expect(trigger(missing).textContent).not.toContain('插件未连接');
+    expect(trigger(missing).textContent).toContain('插件未连接');
+    const failedRead = { ...missing, reasons: ['司空气象未就绪：机场设备卡片尚未加载；请稍后刷新天气'] };
+    expect(trigger(failedRead).textContent).toContain('机场设备卡片尚未加载');
+    expect(doc(<WeatherPanel weather={failedRead} busy={false} onRefresh={noop}/>).querySelector('section')?.textContent).toContain('机场设备卡片尚未加载');
     expect(trigger({ ...missing, refreshing: true }).textContent).toContain('正在向司空获取最新天气');
   });
 });

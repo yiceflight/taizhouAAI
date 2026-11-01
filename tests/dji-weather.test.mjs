@@ -177,3 +177,28 @@ test('a stalled weather page still times out and restores focus', async t => {
   await rejected;
   assert.deepEqual(focus, [true, false]);
 });
+
+test('expands a collapsed airport group before waiting for lazily mounted cards', async () => {
+  const f = fixture();
+  let expanded = false, opened = false, clicks = 0, polls = 0;
+  const group = { textContent: ' 机场/地面站 ', getAttribute: () => expanded ? 'true' : 'false', click: () => { clicks++; expanded = true; } };
+  const card = { $options: { name: 'TsaDeviceItem' }, device: { parents: [{ device_sn: 'AHRXNBN00A029A' }] }, onOpenLiveDetail: () => { opened = true; } };
+  f.context.document.querySelectorAll = selector => {
+    if (selector.includes('[role="button"]')) return [group];
+    if (selector.includes('#real-time-app-container')) return opened ? [{ __vue__: f.component }] : [];
+    return expanded && ++polls >= 3 ? [{ __vue__: card }] : [];
+  };
+  assert.equal((await f.run()).airworthy, 1);
+  assert.equal(clicks, 1);
+  assert.equal(opened, true);
+});
+
+test('does not collapse an expanded group while opening its device detail', async () => {
+  const f = fixture();
+  let opened = false;
+  const group = { textContent: '机场/地面站', getAttribute: () => 'true', click: () => assert.fail('must not collapse group') };
+  const card = { $options: { name: 'TsaDeviceItem' }, device: { parents: [{ device_sn: 'AHRXNBN00A029A' }] }, onOpenLiveDetail: () => { opened = true; } };
+  f.context.document.querySelectorAll = selector => selector.includes('[role="button"]') ? [group]
+    : selector.includes('#real-time-app-container') ? opened ? [{ __vue__: f.component }] : [] : [{ __vue__: card }];
+  assert.equal((await f.run()).airworthy, 1);
+});

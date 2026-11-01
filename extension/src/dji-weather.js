@@ -46,7 +46,8 @@ export async function openDjiWeather(chrome, capture) {
 }
 
 // Serialized into the authorized FlightHub page. Tokens stay in that page.
-// DOM is used only to locate Vue roots: never read rendered text or parse HTML.
+// DOM locates Vue roots and the airport group toggle only; weather values and
+// verdicts still come exclusively from platform components and APIs.
 export async function collectDjiWeather() {
   const projectId = 'c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
   const dockSn = 'AHRXNBN00A029A';
@@ -87,7 +88,7 @@ export async function collectDjiWeather() {
   };
   const weather = () => components('#real-time-app-container,#__qiankun_microapp_wrapper_for_real_time_app__ *')
     .filter(v => v.$options?.name === 'WeatherFullDisplay' && v.currentDeviceDetail?.device_sn === dockSn);
-  let opened = false, component;
+  let opened = false, expandedGroup = false, component;
   let waitingFor = '机场设备卡片尚未加载';
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
@@ -113,6 +114,16 @@ export async function collectDjiWeather() {
           && Date.now() - osd.osd_timestamp <= 120000 && Date.now() - osd.osd_timestamp >= -60000) { component = candidate; break; }
     }
     if (!opened && !matches.length) {
+      // The platform can defer mounting device cards until this group opens.
+      // Scope to the project panel and only expand: never toggle a loaded group
+      // closed or infer weather/device identity from rendered card text.
+      const groups = [...document.querySelectorAll('#project-app-container [role="button"][aria-expanded]')]
+        .filter(el => el.textContent?.replace(/\s+/g, '').trim() === '机场/地面站');
+      if (groups.length > 1) throw new Error('司空机场分组不唯一，暂不能读取天气');
+      if (groups.length === 1 && groups[0].getAttribute('aria-expanded') === 'false') {
+        waitingFor = '机场分组已请求展开，等待设备卡片加载';
+        if (!expandedGroup) { groups[0].click(); expandedGroup = true; }
+      }
       const cards = components('#project-app-container,#__qiankun_microapp_wrapper_for_project_app__ *')
         .filter(v => v.$options?.name === 'TsaDeviceItem' && v.device?.parents?.some(p => p.device_sn === dockSn) && typeof v.onOpenLiveDetail === 'function');
       if (cards.length === 1) { cards[0].onOpenLiveDetail(); opened = true; }

@@ -19,12 +19,13 @@ const getReadiness = () => ({
 let enabled = true;
 let flightEvent: any = null;
 let flightRecords: any[] = [];
+const fixtureRoutes = [{ routeId: 'fixture-north', name: '北侧巡查航线 · 模拟' }, { routeId: 'fixture-southeast', name: '东南侧巡查航线 · 模拟' }];
 const now = new Date(); now.setMinutes(0,0,0);
 const date = (time:number) => new Date(time+8*3600000).toISOString().slice(0,19).replace('T',' ');
 const getMonitor = () => ({settings,enabled,syncing:false,lastAttempt:date(Date.now()),lastSuccess:date(Date.now()),error:null,total:168,queryThrough:date(now.getTime()),
   rows: Array.from({length:168},(_,i)=>({time:date(now.getTime() - (i+(scenario==='stale'?8:0))*3600000),potassium: i===0 && scenario==='stale' ? null : 0.32+(Math.sin(i)*0.12),pm25:33+Math.round(Math.cos(i)*10)})),
   weather:{location:'泰州环境监测 Dock 3',latitude:32.43,longitude:119.93,source:'测试天气',refreshing:false,allowed:true,level:'ok',label:'天气条件通过',reasons:['模拟天气'],current:{observedAt:Date.now()/1000,fetchedAt:Date.now()/1000,temperature:22,weatherCode:0,windSpeed:2,windGusts:3,windDirection:90,precipitation:0}},
-  flight:{threshold:settings.potassiumThreshold,delayMinutes:settings.takeoffDelayMinutes,event:flightEvent,records:flightRecords},
+  flight:{threshold:settings.potassiumThreshold,delayMinutes:settings.takeoffDelayMinutes,event:flightEvent,records:flightRecords,routes:fixtureRoutes,selectedRoute:fixtureRoutes[0].name,routesSyncedAt:now.getTime()},
 });
 mockIPC(async (command, payload) => {
   if(command==='diagnose_bridge')return {
@@ -48,7 +49,7 @@ mockIPC(async (command, payload) => {
   }
   if(command==='cancel_flight'){if(flightEvent?.id!==payload?.eventId)throw Error('任务已变化');flightEvent={...flightEvent,status:'canceled',launchAt:null};return;}
   if(command==='launch_flight'){flightEvent={id:'fixture-manual',observedAt:date(now.getTime()),potassium:null,name:'手动巡查 · UI 模拟',status:'submitted',error:null,preview:false,source:'manual',launchAt:null};return;}
-  if(command==='dismiss_flight'){flightEvent={...flightEvent,status:'dismissed'};return;}
+  if(command==='resolve_flight'){flightEvent={...flightEvent,status:'dismissed'};return;}
   if(command==='refresh_weather')return;
   if(command==='save_workspace_settings'){settings=payload?.settings as WorkspaceSettings;return;}
   if(command==='get_extension_directory')return {path:'/UI-TEST/extension',platform:'macos'};

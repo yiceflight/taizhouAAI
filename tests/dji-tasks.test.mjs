@@ -8,7 +8,7 @@ import { PLAN_URL } from '../extension/src/flight-plan.js';
 const project = 'c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
 const row = (id, extra = {}) => ({ uuid: `00000000-0000-4000-8000-${String(id).padStart(12,'0')}`, prj_uuid: project, sn: 'AHRXNBN00A029A', name: `巡查-${id}`, status: 5,
   begin_at: '2026-09-22T01:00:00Z', run_at: '2026-09-22T01:00:08Z', completed_at: '2026-09-22T01:25:01Z', folder_id: id + 100, folder_info: { expected_file_count: 4, uploaded_file_count: 4 }, media_upload_status: 2, ...extra });
-function fixture({ total = 476, map = x => x, failurePage = 0, code = 0, token = 'fixture-user', auth = 'fixture-auth', document = undefined } = {}) {
+function fixture({ total = 476, map = x => x, failurePage = 0, code = 0, token = 'fixture-user', auth = 'fixture-auth', document = undefined, pageTotal = () => total, pageRows = rows => rows } = {}) {
   const requests = [];
   const location = new URL(PLAN_URL.replace('#/plan', '#/team'));
   const context = { location, URLSearchParams, AbortSignal, setTimeout, document, localStorage: {getItem:k=>k==='x-user-token'?token:auth}, fetch: async (url, options) => {
@@ -20,7 +20,7 @@ function fixture({ total = 476, map = x => x, failurePage = 0, code = 0, token =
     assert.equal(u.searchParams.get('flight_task_status'), '2');
     assert.equal(options.method, 'GET'); assert.equal(options.credentials, 'omit'); assert.equal(options.redirect, 'error');
     if (page === failurePage) throw Error('untrusted upstream text');
-    return {ok:true,json:async()=>({code,data: {list:Array.from({length:Math.max(0,Math.min(50,total-(page-1)*50))},(_,i)=>map(row((page-1)*50+i+1))),pagination:{page,page_size:50,total}}})};
+    return {ok:true,json:async()=>({code,data: {list:pageRows(Array.from({length:Math.max(0,Math.min(50,pageTotal(page)-(page-1)*50))},(_,i)=>map(row((page-1)*50+i+1))),page),pagination:{page,page_size:50,total:pageTotal(page)}}})};
   }};
   return { requests, location, run: options => vm.runInNewContext(`(${readDjiTasks.toString()})(${JSON.stringify(location.href)}, ${JSON.stringify(options || {})})`, context) };
 }
@@ -194,4 +194,27 @@ test('report media tabs are owned per task and closed after collection', async (
 test('restarts history if new executions shift the pagination total', async()=>{
  const f=fixture({total:477});const r=await f.run({includeHistory:true,cursor:{apiVersion:1,page:7,total:476}});
  assert.equal(f.requests[1].page,2);assert.equal(r.cursor.total,477);
+});
+
+test('reports exact scan boundaries across bounded leases and omits them for latest-only refresh', async () => {
+  const f=fixture({total:301});
+  const first=await f.run();
+  assert.deepEqual(JSON.parse(JSON.stringify(first.historyScan)),{startPage:2,nextPage:7,total:301});
+  const last=await f.run({cursor:first.cursor});
+  assert.deepEqual(JSON.parse(JSON.stringify(last.historyScan)),{startPage:7,nextPage:8,total:301});
+  assert.equal(last.historyComplete,true);
+  assert.equal((await f.run({includeHistory:false})).historyScan,null);
+});
+test('invalidates a scan when the platform total changes within a lease', async () => {
+  const f=fixture({total:301,pageTotal:page=>page===1?301:302});
+  const result=await f.run();
+  assert.equal(result.historyComplete,false);assert.equal(result.historyScan,null);
+  assert.equal(result.cursor.page,2);assert.match(result.historyError,/总数/);
+  assert.equal(result.tasks.length,50);
+});
+test('does not declare a short final page complete', async () => {
+  const f=fixture({total:51,pageRows:(rows,page)=>page===2?[]:rows});
+  const result=await f.run();
+  assert.equal(result.historyComplete,false);assert.equal(result.cursor.page,2);
+  assert.match(result.historyError,/不完整/);
 });

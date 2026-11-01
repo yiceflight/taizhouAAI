@@ -3,11 +3,12 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { version as configuredVersion } from "../../src-tauri/tauri.conf.json";
 import { checkForAppUpdate, type AppUpdateProgress, type AvailableAppUpdate } from "../lib/appUpdater";
+import { RequiredSetupDialog, type EnvironmentCheckProps } from './RequiredSetupDialog';
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
-export function UpdateBanner() {
+export function UpdateBanner({ environment }: { environment?: EnvironmentCheckProps } = {}) {
   const [testEnvironment, setTestEnvironment] = useState<boolean | null>(null);
   useEffect(() => {
     let alive = true;
@@ -97,14 +98,12 @@ export function UpdateBanner() {
     } catch (error) {
       if (mounted.current) {
         setError(true);
-        setMessage(`更新失败：${String(error)}`);
-      }
-    } finally {
-      busy.current = false;
-      if (mounted.current) {
+        setMessage('更新未完成，请检查网络连接后重试。如仍失败，请联系技术支持。');
         setInstalling(false);
         setProgress(null);
       }
+    } finally {
+      busy.current = false;
     }
   };
 
@@ -113,17 +112,22 @@ export function UpdateBanner() {
   const installLabel = progress?.phase === "installing" ? "安装并重启中…"
     : installing ? `下载中${percent === null ? "…" : ` ${percent}%`}` : "下载并重启";
 
-  if (testEnvironment === true) return <div className="update-status"><span className="app-version">测试版客户端 v{version}</span><span>独立数据与桥接端口 · 复用当前 Chrome · 不接收正式版更新</span></div>;
+  const requiredUpdate = update ? <section className="required-update" aria-labelledby="required-update-title">
+    <div className="section-heading"><div><h3 id="required-update-title">客户端新版本 v{update.latestVersion}</h3><p>当前版本 v{version} · 本次更新为必需更新</p></div><span className="badge warning">必须更新</span></div>
+    {!!update.releaseNotes.length && <ul className="required-release-notes">{update.releaseNotes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
+    {installing && <div className="required-update-progress"><progress aria-label="客户端更新进度" max={100} value={percent ?? undefined} /><span role="status">{installLabel}</span></div>}
+    {error && message && <p className="notice warning" role="alert">{message}</p>}
+    <button className="primary-button update-install" disabled={installing} onClick={() => void installUpdate()}>有新版本 v{update.latestVersion}，{error ? '重试更新' : installLabel}</button>
+  </section> : undefined;
 
-  return <div className="update-status">
+  if (testEnvironment === true) return <><div className="update-status"><span className="app-version">测试版客户端 v{version}</span><span>独立数据与桥接端口 · 复用当前 Chrome · 不接收正式版更新</span></div><RequiredSetupDialog environment={environment} /></>;
+
+  return <><div className="update-status">
     <span className="app-version">当前客户端 v{version}</span>
     {(!update || message) && <span className={`update-message${error ? " error" : ""}`} role="status" title={message}>
       {message || (automatic ? "已开启自动检查更新" : "")}
     </span>}
-    {update ? <button className="update-install" disabled={installing} title={update.releaseNotes.join("\n")} onClick={() => void installUpdate()}>
-      <span className="update-install-icon" aria-hidden="true">↻</span>
-      <span>有新版本 v{update.latestVersion}，{installLabel}</span>
-    </button>
+    {update ? <span className="update-message">有新版本 v{update.latestVersion}，请在弹窗中完成更新</span>
       : <button className="update-action" disabled={checking || testEnvironment === null} onClick={() => void checkUpdate()}>{checking ? "正在检查…" : "检查更新"}</button>}
-  </div>;
+  </div><RequiredSetupDialog environment={environment} update={requiredUpdate} /></>;
 }

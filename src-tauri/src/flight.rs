@@ -7,21 +7,16 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use tauri::Manager;
 
 pub const PLAN_URL: &str = "https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan";
 #[derive(Default)]
 pub struct Flight {
-    busy: AtomicBool,
+    busy: Arc<AtomicBool>,
     status_gate: tokio::sync::Mutex<()>,
     pub(crate) gate: Mutex<()>,
-}
-impl Flight {
-    pub(crate) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
-    }
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -117,20 +112,36 @@ fn selected_route(db: &Connection) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let routes = read_routes(db)?;
-    Ok(routes
-        .iter()
-        .find(|route| route_name(&route.name) == route_name(&stored))
-        .map(|route| route.name.clone()))
+    // An ambiguous saved name is not a valid selection, but the catalog must
+    // remain readable so the operator can choose another route or sync again.
+    Ok(exact_route_match(&routes, &stored).unwrap_or(None))
+}
+fn exact_route_match(routes: &[FlightRoute], requested: &str) -> Result<Option<String>, String> {
+    let exact: Vec<_> = routes.iter()
+        .filter(|route| route_name(&route.name) == route_name(requested))
+        .cloned().collect();
+    best_route_match(&exact, requested)
 }
 fn route_view(db: &Connection) -> Result<RoutesView, String> {
     Ok(RoutesView { routes: read_routes(db)?, selected: selected_route(db)?, synced_at: setting(db, "flight_routes_synced_at")?.and_then(|v| v.parse().ok()) })
 }
-fn best_route_match(routes: &[FlightRoute], requested: &str) -> Option<String> {
+// For prefix-related names, edit distance is exactly the difference in
+// Unicode character counts. Exact matches score zero. Never break a tie by
+// list order, update time or route name: those do not identify the intended route.
+fn best_route_match(routes: &[FlightRoute], requested: &str) -> Result<Option<String>, String> {
     let wanted = route_name(requested);
-    routes.iter().filter(|route| {
+    if wanted.is_empty() { return Ok(None); }
+    let mut candidates: Vec<_> = routes.iter().filter_map(|route| {
         let name = route_name(&route.name);
-        name.starts_with(&wanted) || wanted.starts_with(&name)
-    }).max_by_key(|route| route_name(&route.name).len()).map(|route| route.name.clone())
+        (!name.is_empty() && (name.starts_with(&wanted) || wanted.starts_with(&name)))
+            .then(|| (name.chars().count().abs_diff(wanted.chars().count()), route))
+    }).collect();
+    candidates.sort_by_key(|(distance, _)| *distance);
+    let Some((distance, route)) = candidates.first() else { return Ok(None); };
+    if candidates.get(1).is_some_and(|(next, _)| next == distance) {
+        return Err(format!("航线“{requested}”有多个差异相同的匹配，请重新选择唯一航线。"));
+    }
+    Ok(Some(route.name.clone()))
 }
 fn direction_in_rule(direction: f64, start: f64, end: f64) -> bool {
     if start < end {
@@ -142,48 +153,46 @@ fn direction_in_rule(direction: f64, start: f64, end: f64) -> bool {
 fn configured_route(
     settings: &crate::settings::Settings,
     routes: &[FlightRoute],
-    fixed_route: Option<String>,
+    default_route: Option<String>,
     wind_direction: Option<f64>,
 ) -> Result<String, String> {
-    if settings.route_selection_mode == "fixed" {
-        return fixed_route.ok_or_else(|| "请先在监测设置中同步并手动选择巡查航线。".into());
+    let default_route = default_route
+        .as_deref().map(|selected| exact_route_match(routes, selected))
+        .transpose()?.flatten();
+    if settings.wind_route_rules.is_empty() {
+        return default_route.ok_or_else(|| "请先在监测设置中同步并选择有效的默认航线。".into());
     }
-    let direction = wind_direction
-        .filter(|value| value.is_finite() && (0.0..360.0).contains(value))
-        .ok_or_else(|| "高级航线模式需要有效的机场风向数据，请刷新天气后重试。".to_string())?;
+    let Some(direction) = wind_direction
+        .filter(|value| value.is_finite() && (0.0..360.0).contains(value)) else {
+        return default_route
+            .ok_or_else(|| "缺少有效预报风向，请先同步并选择有效的默认航线。".to_string());
+    };
     let rule = settings
         .wind_route_rules
         .iter()
-        .find(|rule| direction_in_rule(direction, rule.start_degrees, rule.end_degrees))
-        .ok_or_else(|| format!("当前风向 {:.0}° 未匹配到航线规则，请完善高级航线配置。", direction))?;
-    let exact = routes
-        .iter()
-        .find(|route| route_name(&route.name) == route_name(&rule.route));
-    let prefix = best_route_match(routes, &rule.route);
-    let matched = exact.or_else(|| prefix.as_ref().and_then(|name| routes.iter().find(|route| route.name == *name)));
-    matched
-        .map(|route| route.name.clone())
+        .find(|rule| direction_in_rule(direction, rule.start_degrees, rule.end_degrees));
+    let Some(rule) = rule else {
+        return default_route
+            .ok_or_else(|| format!("当前风向 {:.0}° 未匹配到航线规则，请先同步并选择有效的默认航线。", direction));
+    };
+    best_route_match(routes, &rule.route)?
         .ok_or_else(|| format!("风向 {:.0}° 对应的航线“{}”不在已同步航线列表中，请重新同步。", direction, rule.route))
 }
 fn route_configuration_ready(db: &Connection) -> Result<(), String> {
-    let settings = crate::settings::read(db)?;
-    if settings.route_selection_mode == "fixed" {
-        if selected_route(db)?.is_none() {
-            return Err("请先在监测设置中同步并手动选择巡查航线。".into());
-        }
-    } else if read_routes(db)?.is_empty() || settings.wind_route_rules.is_empty() {
-        return Err("请先同步航线并在高级航线模式中至少配置一条风向规则。".into());
+    if selected_route(db)?.is_none() {
+        return Err("请先在监测设置中同步并选择有效的默认航线。".into());
     }
     Ok(())
 }
 fn launch_route(app: &tauri::AppHandle) -> Result<String, String> {
     let db = database(app)?;
+    route_configuration_ready(&db)?;
     let settings = crate::settings::read(&db)?;
     configured_route(
         &settings,
         &read_routes(&db)?,
         selected_route(&db)?,
-        (settings.route_selection_mode == "wind")
+        (!settings.wind_route_rules.is_empty())
             .then(|| crate::weather::current_wind_direction(app))
             .flatten(),
     )
@@ -211,6 +220,15 @@ fn delay(db: &Connection) -> Result<u32, String> {
 fn needs_confirmation(db: &Connection, event: &Event) -> Result<bool, String> {
     Ok(event.preview
         || (event.source == "auto" && crate::settings::read(db)?.require_manual_confirmation))
+}
+pub(crate) fn require_clearable(db: &Connection) -> Result<(), String> {
+    if current(db)?.is_some_and(|event| {
+        !matches!(event.status.as_str(), "failed" | "completed" | "canceled" | "dismissed" | "restricted" | "not_flown")
+            || trackable(&event)
+    }) {
+        return Err("仍有待执行、执飞中或结果待核查的巡查任务，请先在司空核实并结束处理后再清空数据。".into());
+    }
+    Ok(())
 }
 fn terminal(event: &Event) -> bool {
     matches!(
@@ -312,6 +330,7 @@ fn clear_tasks(db: &Connection, confirmed: bool, at: i64) -> Result<ClearTasksRe
 }
 #[tauri::command]
 pub fn clear_task_list(app: tauri::AppHandle, confirmed: bool) -> Result<ClearTasksResult, String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<Flight>();
     let _gate = state.gate.lock().unwrap();
     clear_tasks(
@@ -393,6 +412,21 @@ fn auto_handled_for_hour(db: &Connection, hour: &str) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 fn recover(db: &Connection) -> Result<(), String> {
+    // Repair the ended-manual-task release regression: observed_at is the request
+    // time, not the monitoring hour. Only repair our confirmed archived receipt.
+    if current(db)?.is_none() {
+        if let Some(marker) = setting(db, "flight_episode")?.filter(|s| !s.is_empty()) {
+            let raw: Option<String> = db.query_row(
+                "SELECT value FROM monitor_settings WHERE key LIKE 'flight_history:%' AND json_extract(value, '$.source')='manual' AND json_extract(value, '$.status')='flight_error' AND json_extract(value, '$.observedAt')=?1 AND json_extract(value, '$.error') LIKE '司空任务已结束：%' ORDER BY rowid DESC LIMIT 1",
+                [&marker], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+            if let Some(raw) = raw {
+                let event: Event = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                if let Some(hour) = event.source_hour.filter(|h| parse(h).is_ok() && h < &marker) {
+                    put(db, "flight_episode", &hour)?;
+                }
+            }
+        }
+    }
     // Older clients released an uncertain task on explicit refresh and guarded
     // it only with flight_episode. Restore that reservation before interpreting
     // the legacy timestamp as an hourly marker.
@@ -472,14 +506,18 @@ fn new_event(time: String, potassium: Option<f64>, preview: bool) -> Event {
 fn observe(
     db: &mut Connection,
     at: chrono::NaiveDateTime,
-    weather_allowed: bool,
+    weather_available: bool,
 ) -> Result<Option<Event>, String> {
-    observe_with_weather(db, at, weather_allowed, None)
+    let check = if weather_available {
+        None
+    } else {
+        Some(tests::recorded_weather("creation", false, true))
+    };
+    observe_with_weather(db, at, check)
 }
 fn observe_with_weather(
     db: &mut Connection,
     at: chrono::NaiveDateTime,
-    weather_allowed: bool,
     check: Option<WeatherCheck>,
 ) -> Result<Option<Event>, String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -523,7 +561,7 @@ fn observe_with_weather(
             if setting(&tx, &key)?.is_none() {
                 let mut record = new_event(time.clone(), k, false);
                 record.pm25 = pm25;
-                if k.is_none() && pm25.is_some() {
+                if !potassium_exceeded && pm25_exceeded {
                     record.name = record.name.replace("钾离子超标", "PM2.5超标");
                 }
                 record.source_hour = Some(time.clone());
@@ -555,19 +593,18 @@ fn observe_with_weather(
     }
     // Legacy episode timestamps now suppress only that hour (and older data).
     // Persistent handled-hour receipts remain authoritative across restarts.
-    if !weather_allowed
-        || setting(&tx, "flight_episode")?.is_some_and(|hour| !hour.is_empty() && hour >= time)
+    if setting(&tx, "flight_episode")?.is_some_and(|hour| !hour.is_empty() && hour >= time)
         || current(&tx)?.is_some_and(|e| !terminal(&e))
         || auto_handled_for_hour(&tx, &time)?
     {
-        // Persist the released failure even when current weather or settings
+        // Persist the released failure even when settings
         // prevent a new task; a later sync can reevaluate the latest reading.
         tx.commit().map_err(|e| e.to_string())?;
         return Ok(None);
     }
     let mut event = new_event(time.clone(), k, false);
     event.pm25 = pm25;
-    if k.is_none() && pm25.is_some() {
+    if !potassium_exceeded && pm25_exceeded {
         event.name = event.name.replace("钾离子超标", "PM2.5超标");
     }
     event.source_hour = Some(time.clone());
@@ -582,8 +619,8 @@ fn observe_with_weather(
     tx.commit().map_err(|e| e.to_string())?;
     Ok(Some(event))
 }
-struct Busy<'a>(&'a AtomicBool);
-impl Drop for Busy<'_> {
+struct Busy(Arc<AtomicBool>);
+impl Drop for Busy {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
@@ -599,26 +636,11 @@ fn update_current(app: &tauri::AppHandle, event: &Event) -> Result<bool, String>
         Ok(false)
     }
 }
-fn has_manual_weather_override(event: &Event) -> bool {
-    event.source == "manual"
-        && !event.preview
-        && event.weather_override_confirmed_at.is_some_and(|at| at > 0)
-}
-async fn require_launch_weather(app: &tauri::AppHandle, event: &Event) -> Result<(), String> {
-    // Recheck launch safety without replacing or appending to the creation snapshot.
-    let (_, result) = crate::weather::check_launch(app, has_manual_weather_override(event)).await;
-    result
-}
 async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String> {
     if prevent_restricted_launch(app, &mut event)? {
         return Ok(());
     }
-    if let Err(error) = require_launch_weather(app, &event).await {
-        event.status = "failed".into();
-        event.error = Some(error.clone());
-        update_current(app, &event)?;
-        return Err(error);
-    }
+    crate::weather::refresh_for_route(app).await;
     let route = match launch_route(app) {
         Ok(route) => route,
         Err(error) => {
@@ -663,12 +685,7 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
     if prevent_restricted_launch(app, &mut event)? {
         return Ok(());
     }
-    if let Err(error) = require_launch_weather(app, &event).await {
-        event.status = "failed".into();
-        event.error = Some(error.clone());
-        update_current(app, &event)?;
-        return Err(error);
-    }
+    // FlightHub decides whether to allow takeoff when the request is submitted.
     // Cancel can win while preparation awaits Chrome. The short gate is held only
     // across the persisted claim, never across browser I/O.
     {
@@ -757,6 +774,7 @@ fn prevent_restricted_launch(app: &tauri::AppHandle, event: &mut Event) -> Resul
     Ok(false)
 }
 pub async fn after_sync(app: &tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     if let Err(error) = crate::readiness::require_flight(app) {
         crate::runtime_log::record(
             app,
@@ -775,7 +793,6 @@ pub async fn after_sync(app: &tauri::AppHandle) -> Result<(), String> {
     let event = observe_with_weather(
         &mut database(app)?,
         now(),
-        check.weather.allowed,
         Some(check),
     )?;
     crate::runtime_log::record(
@@ -817,11 +834,12 @@ fn claim_due(db: &Connection, at: i64) -> Result<Option<Event>, String> {
     Ok(Some(event))
 }
 async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<Flight>();
     if state.busy.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let _busy = Busy(&state.busy);
+    let _busy = Busy(state.busy.clone());
     let pending = {
         let _gate = state.gate.lock().unwrap();
         claim_due(&database(app)?, chrono::Utc::now().timestamp_millis())?
@@ -876,6 +894,35 @@ fn apply_observation(db: &Connection, id: &str, name: &str, status: &str) -> Res
     }
     save(db, &event)
 }
+// A validated, uniquely matched actual end receipt releases the local slot.
+// Media uploads and a partial outcome remain in history; neither keeps a flight active.
+pub(crate) fn reconcile_ended_tasks(db: &Connection, tasks: &[crate::flight_report::DjiTask]) -> Result<(), String> {
+    let Some(mut event) = current(db)?.filter(|e| trackable(e)) else { return Ok(()); };
+    let matches: Vec<_> = tasks.iter().filter(|task| task.mission.mission_name == event.name).collect();
+    if matches.len() != 1 { return Ok(()); }
+    let task = matches[0];
+    if task.actual_time_missing || task.mission.start_time <= 0
+        || task.mission.end_time <= task.mission.start_time
+        || task.mission.end_time > chrono::Utc::now().timestamp_millis()
+        || !matches!(task.status.as_str(), "执行成功" | "部分执行" | "执行失败" | "执行终止") {
+        return Ok(());
+    }
+    event.status = if task.status == "执行成功" { "completed" } else { "flight_error" }.into();
+    event.error = if task.status == "执行成功" { None } else {
+        Some(format!("司空任务已结束：{}{}", task.status,
+            task.partial_reason.as_deref().filter(|s| !s.trim().is_empty()).map(|s| format!("；{s}")).unwrap_or_default()))
+    };
+    event.status_checked_at = Some(chrono::Utc::now().timestamp_millis());
+    event.status_check_error = None;
+    archive(db, &event)?;
+    // Preserve the handled episode so releasing the slot cannot replay this alert.
+    if setting(db, "flight_episode")?.is_none_or(|s| s.is_empty()) {
+        put(db, "flight_episode", event.source_hour.as_deref().unwrap_or(&event.observed_at))?;
+    }
+    db.execute("DELETE FROM monitor_settings WHERE key='flight_event'", []).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // Enrichment is independent of the flight state machine: completed flights
 // remain terminal, including while an older record is being backfilled.
 fn apply_flight_time(
@@ -977,6 +1024,7 @@ fn handle_unmatched_status(db: &Connection, id: &str, name: &str) -> Result<(), 
     record_check_error(db, id, name, "司空列表未识别到该任务状态，请检查平台页面或日期范围；结果未确认，继续核查以避免重复起飞。")
 }
 async fn watch(app: &tauri::AppHandle, expected_id: Option<&str>) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<Flight>();
     let _status_gate = state.status_gate.lock().await;
     let event = current(&database(app)?)?;
@@ -1130,19 +1178,17 @@ fn cancel(db: &Connection, id: &str) -> Result<(), String> {
 }
 #[tauri::command]
 pub fn cancel_flight(app: tauri::AppHandle, event_id: String) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<Flight>();
     let _gate = state.gate.lock().unwrap();
     cancel(&database(&app)?, &event_id)
-}
-#[tauri::command]
-pub fn list_flight_routes(app: tauri::AppHandle) -> Result<RoutesView, String> {
-    route_view(&database(&app)?)
 }
 #[tauri::command]
 pub async fn sync_flight_routes(
     app: tauri::AppHandle,
     bridge: tauri::State<'_, Bridge>,
 ) -> Result<RoutesView, String> {
+    let _access = crate::data_reset::access(&app)?;
     crate::readiness::require_flight(&app)?;
     let result = bridge.sync_flight_routes().await?;
     if result["url"].as_str() != Some(PLAN_URL) {
@@ -1156,10 +1202,10 @@ pub async fn sync_flight_routes(
     let mut db = database(&app)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let previous = selected_route(&tx)?;
-    let selected = previous.as_deref().and_then(|previous| {
-        routes.iter().find(|route| route_name(&route.name) == route_name(previous)).map(|route| route.name.clone())
-            .or_else(|| best_route_match(&routes, previous))
-    });
+    // An ambiguous replacement fails the entire sync; never silently switch routes.
+    let selected = previous.as_deref()
+        .map(|previous| best_route_match(&routes, previous))
+        .transpose()?.flatten();
     put(&tx, "flight_routes", &serde_json::to_string(&routes).map_err(|e| e.to_string())?)?;
     put(&tx, "flight_route", selected.as_deref().unwrap_or(""))?;
     put(&tx, "flight_routes_synced_at", &chrono::Utc::now().timestamp_millis().to_string())?;
@@ -1168,18 +1214,15 @@ pub async fn sync_flight_routes(
 }
 #[tauri::command]
 pub fn set_flight_route(app: tauri::AppHandle, route: String) -> Result<RoutesView, String> {
+    let _access = crate::data_reset::access(&app)?;
     let normalized = route_name(&route);
     if normalized.is_empty() || normalized.len() > 200 { return Err("航线名称无效。".into()); }
     let db = database(&app)?;
     let routes = read_routes(&db)?;
-    let chosen = routes.iter().find(|item| route_name(&item.name) == normalized).map(|item| item.name.clone())
+    let chosen = exact_route_match(&routes, &route)?
         .ok_or("请先同步司空航线列表，再选择航线。")?;
     put(&db, "flight_route", &chosen)?;
     route_view(&db)
-}
-#[tauri::command]
-pub fn set_flight_delay(app: tauri::AppHandle, minutes: u32) -> Result<(), String> {
-    crate::settings::set_delay(&database(&app)?, minutes)
 }
 // Closing is an explicit local disposition, never a platform cancellation or success.
 fn close_reviewed(
@@ -1193,7 +1236,9 @@ fn close_reviewed(
     if event.id != id || event.status != expected_status {
         return Err("任务状态已变化，请刷新后重新核查。".into());
     }
-    if !matches!(event.status.as_str(), "failed" | "ready" | "flight_error") {
+    if !matches!(event.status.as_str(), "failed" | "ready" | "flight_error")
+        && !(event.status == "not_flown" && trackable(&event))
+    {
         return Err("当前任务不能结束处理，请继续核查司空状态。".into());
     }
     if !confirmed {
@@ -1216,18 +1261,13 @@ fn close_reviewed(
     tx.commit().map_err(|e| e.to_string())
 }
 #[tauri::command]
-pub fn dismiss_flight(app: tauri::AppHandle, event_id: String) -> Result<(), String> {
-    let state = app.state::<Flight>();
-    let _gate = state.gate.lock().unwrap();
-    close_reviewed(&database(&app)?, &event_id, "failed", true)
-}
-#[tauri::command]
 pub fn resolve_flight(
     app: tauri::AppHandle,
     event_id: String,
     expected_status: String,
     confirmed: bool,
 ) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<Flight>();
     let _gate = state.gate.lock().unwrap();
     close_reviewed(&database(&app)?, &event_id, &expected_status, confirmed)
@@ -1274,15 +1314,9 @@ fn begin_manual_with_weather(
     }
     let mut event = new_event(now().format("%Y-%m-%d %H:%M:%S").to_string(), None, preview);
     event.source_hour = tx.query_row(
-        "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND potassium IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
+        "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND (potassium IS NOT NULL OR pm25 IS NOT NULL) ORDER BY observed_at DESC LIMIT 1",
         [], |row| row.get(0),
     ).optional().map_err(|e| e.to_string())?;
-    if event.source_hour.is_none() {
-        event.source_hour = tx.query_row(
-            "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND pm25 IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
-            [], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
-    }
     event.weather_checks.extend(check);
     if !preview {
         event.source = "manual".into();
@@ -1309,12 +1343,14 @@ async fn begin(
     retry_event_id: Option<String>,
     weather_override_confirmed: bool,
 ) -> Result<(), String> {
+    let access = crate::data_reset::access(&app)?;
     crate::readiness::require_flight(&app)?;
     route_configuration_ready(&database(&app)?)?;
     let state = app.state::<Flight>();
     if state.busy.swap(true, Ordering::SeqCst) {
         return Err("巡飞任务正在处理，请稍候。".into());
     }
+    let busy = Busy(state.busy.clone());
     crate::weather::refresh(&app, true).await;
     let event = {
         let _gate = state.gate.lock().unwrap();
@@ -1328,16 +1364,10 @@ async fn begin(
             )
         })
     };
-    let event = match event {
-        Ok(event) => event,
-        Err(error) => {
-            state.busy.store(false, Ordering::SeqCst);
-            return Err(error);
-        }
-    };
+    let event = event?;
     tauri::async_runtime::spawn(async move {
-        let state = app.state::<Flight>();
-        let _busy = Busy(&state.busy);
+        let _access = access;
+        let _busy = busy;
         if let Err(error) = execute(&app, event).await {
             eprintln!("Flight task: {error}");
         }
@@ -1367,6 +1397,7 @@ pub async fn prepare_flight(app: tauri::AppHandle, preview: bool) -> Result<(), 
 }
 #[tauri::command]
 pub async fn open_prepared_flight(app: tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let event = current(&database(&app)?)?.ok_or("没有待查看的巡查计划。")?;
     let bridge = app.state::<Bridge>();
     let snapshot = bridge.status();
@@ -1398,13 +1429,23 @@ pub async fn open_prepared_flight(app: tauri::AppHandle) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn route_matching_prefers_the_longest_prefix_and_keeps_copy_names() {
+    fn manual_binds_latest_valid_source_hour() {
+        let db = db();
+        reading(&db, "2026-10-11 10:00:00", Some(0.1));
+        reading_pm25(&db, "2026-10-11 11:00:00", Some(80.0));
+        let event = begin_manual(&db, false).unwrap();
+        assert_eq!(event.source_hour.as_deref(), Some("2026-10-11 11:00:00"));
+    }
+
+    #[test]
+    fn route_matching_prefers_the_smallest_difference_and_keeps_copy_names() {
         let routes = vec![
             FlightRoute { route_id: "1".into(), name: "东南火点巡查航线".into(), update_time: 1 },
             FlightRoute { route_id: "2".into(), name: "东南火点巡查航线-改".into(), update_time: 2 },
             FlightRoute { route_id: "3".into(), name: "东南火点巡查航线-改-副本(6)".into(), update_time: 3 },
         ];
-        assert_eq!(best_route_match(&routes, "东南火点巡查航线"), Some("东南火点巡查航线-改-副本(6)".into()));
+        assert_eq!(best_route_match(&routes, "东南火点巡查航线").unwrap(), Some("东南火点巡查航线".into()));
+        assert_eq!(best_route_match(&routes[1..], "东南火点巡查航线").unwrap(), Some("东南火点巡查航线-改".into()));
         assert_eq!(route_name(" 东南火点巡查航线-改 - 副本(6) "), "东南火点巡查航线-改-副本(6)");
     }
     #[test]
@@ -1417,6 +1458,34 @@ mod tests {
         assert_eq!(selected_route(&db).unwrap(), None);
         put(&db, "flight_route", "现场巡查航线").unwrap();
         assert_eq!(selected_route(&db).unwrap(), Some("现场巡查航线".into()));
+    }
+    #[test]
+    fn eight_wind_sectors_match_exact_boundaries_clockwise() {
+        let sectors = [
+            ("北风", 337.5, 22.5), ("东北风", 22.5, 67.5),
+            ("东风", 67.5, 112.5), ("东南风", 112.5, 157.5),
+            ("南风", 157.5, 202.5), ("西南风", 202.5, 247.5),
+            ("西风", 247.5, 292.5), ("西北风", 292.5, 337.5),
+        ];
+        let routes: Vec<_> = sectors.iter().enumerate().map(|(i, (name, _, _))| FlightRoute {
+            route_id: i.to_string(), name: name.to_string(), update_time: 1,
+        }).collect();
+        let mut settings = crate::settings::Settings::default();
+        settings.route_selection_mode = "wind".into();
+        settings.wind_route_rules = sectors.iter().map(|(name, start, end)| crate::settings::WindRouteRule {
+            start_degrees: *start, end_degrees: *end, route: name.to_string(),
+        }).collect();
+        for (i, (name, start, _)) in sectors.iter().enumerate() {
+            assert_eq!(configured_route(&settings, &routes, None, Some(*start)).unwrap(), *name);
+            assert_eq!(configured_route(&settings, &routes, None, Some(start - 0.000001)).unwrap(), sectors[(i + 7) % 8].0);
+            assert_eq!(configured_route(&settings, &routes, None, Some(start + 0.000001)).unwrap(), *name);
+        }
+        for direction in [0.0, 359.999999] {
+            assert_eq!(configured_route(&settings, &routes, None, Some(direction)).unwrap(), "北风");
+        }
+        assert_eq!(configured_route(&settings, &routes, None, Some(66.0)).unwrap(), "东北风");
+        settings.wind_route_rules.remove(1);
+        assert_eq!(configured_route(&settings, &routes, Some("北风".into()), Some(66.0)).unwrap(), "北风");
     }
     #[test]
     fn wind_route_rules_match_normal_and_cross_zero_ranges() {
@@ -1433,7 +1502,55 @@ mod tests {
         assert_eq!(configured_route(&settings, &routes, None, Some(90.0)).unwrap(), "东南航线");
         assert_eq!(configured_route(&settings, &routes, None, Some(350.0)).unwrap(), "西北航线");
         assert!(configured_route(&settings, &routes, None, Some(200.0)).unwrap_err().contains("未匹配"));
-        assert!(configured_route(&settings, &routes, None, None).unwrap_err().contains("有效的机场风向"));
+        assert!(configured_route(&settings, &routes, None, None).unwrap_err().contains("默认航线"));
+    }
+    #[test]
+    fn wind_route_fallback_handles_missing_invalid_and_unconfigured_directions() {
+        let routes = vec![
+            FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1 },
+            FlightRoute { route_id: "2".into(), name: "北侧航线".into(), update_time: 1 },
+        ];
+        let mut settings = crate::settings::Settings::default();
+        settings.route_selection_mode = "wind".into();
+        settings.wind_route_rules = vec![crate::settings::WindRouteRule {
+            start_degrees: 337.5, end_degrees: 22.5, route: "北侧航线".into(),
+        }];
+        settings.route_selection_mode = "fixed".into();
+        let fallback = Some("默认航线".into());
+        assert_eq!(configured_route(&settings, &routes, fallback.clone(), Some(0.0)).unwrap(), "北侧航线");
+        for direction in [22.5, 66.0, 337.499999] {
+            assert_eq!(configured_route(&settings, &routes, fallback.clone(), Some(direction)).unwrap(), "默认航线");
+        }
+        for missing in [None, Some("已删除航线".into()), Some("默认".into())] {
+            assert!(configured_route(&settings, &routes, missing, Some(66.0)).unwrap_err().contains("默认航线"));
+        }
+        settings.wind_route_rules[0].route = "已删除航线".into();
+        assert!(configured_route(&settings, &routes, fallback.clone(), Some(0.0)).unwrap_err().contains("不在已同步航线列表"));
+        for invalid in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0), Some(360.0)] {
+            assert_eq!(configured_route(&settings, &routes, fallback.clone(), invalid).unwrap(), "默认航线");
+            for missing in [None, Some("已删除航线".into()), Some("默认".into())] {
+                assert!(configured_route(&settings, &routes, missing, invalid).unwrap_err().contains("默认航线"));
+            }
+        }
+        settings.wind_route_rules.clear();
+        for direction in [None, Some(66.0), Some(f64::NAN)] {
+            assert_eq!(configured_route(&settings, &routes, fallback.clone(), direction).unwrap(), "默认航线");
+        }
+        assert!(configured_route(&settings, &routes, Some("已删除航线".into()), None).is_err());
+    }
+    #[test]
+    fn wind_route_configuration_requires_synced_default_but_allows_no_rules() {
+        let db = db();
+        let mut settings = crate::settings::Settings::default();
+        settings.route_selection_mode = "wind".into();
+        crate::settings::save_and_reconcile(&db, &settings, now()).unwrap();
+        assert!(route_configuration_ready(&db).unwrap_err().contains("默认航线"));
+        let routes = vec![FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1 }];
+        put(&db, "flight_routes", &serde_json::to_string(&routes).unwrap()).unwrap();
+        put(&db, "flight_route", "已删除航线").unwrap();
+        assert!(route_configuration_ready(&db).is_err());
+        put(&db, "flight_route", "默认航线").unwrap();
+        assert!(route_configuration_ready(&db).is_ok());
     }
     #[test]
     fn wind_route_rules_support_platform_copy_names() {
@@ -1569,7 +1686,6 @@ mod tests {
             assert!(observe_with_weather(
                 &mut db,
                 parse("2026-10-11 19:00:00").unwrap(),
-                true,
                 None
             )
             .unwrap()
@@ -1580,7 +1696,6 @@ mod tests {
                 let next = observe_with_weather(
                     &mut db,
                     parse("2026-10-11 20:00:00").unwrap(),
-                    true,
                     None,
                 )
                 .unwrap()
@@ -1613,7 +1728,7 @@ mod tests {
                 .is_none());
         }
     }
-    fn recorded_weather(stage: &str, allowed: bool, missing: bool) -> WeatherCheck {
+    pub(super) fn recorded_weather(stage: &str, allowed: bool, missing: bool) -> WeatherCheck {
         let weather = serde_json::from_value(serde_json::json!({
             "location": "泰州环境监测 Dock 3", "latitude": 32.434525, "longitude": 119.92992,
             "source": "Open-Meteo", "refreshing": false, "allowed": allowed,
@@ -1639,7 +1754,6 @@ mod tests {
         let mut event = observe_with_weather(
             &mut db,
             at,
-            true,
             Some(recorded_weather("creation", true, false)),
         )
         .unwrap()
@@ -1659,7 +1773,7 @@ mod tests {
             &db,
             false,
             Some(&event.id),
-            true,
+            false,
             Some(recorded_weather("creation", true, false)),
         )
         .unwrap();
@@ -1681,7 +1795,6 @@ mod tests {
         observe_with_weather(
             &mut db,
             parse("2026-10-09 07:00:00").unwrap(),
-            false,
             Some(recorded_weather("creation", false, true)),
         )
         .unwrap();
@@ -1890,19 +2003,19 @@ mod tests {
         assert_eq!(event.source_hour.as_deref(), Some(time));
     }
     #[test]
-    fn weather_block_does_not_consume_episode_and_normal_data_rearms() {
-        let mut db = db();
-        let t = parse("2026-09-22 10:00:00").unwrap();
-        reading(&db, "2026-09-22 09:00:00", Some(2.));
-        assert!(observe(&mut db, t, false).unwrap().is_none());
-        assert!(current(&db).unwrap().is_none());
-        assert!(observe(&mut db, t, true).unwrap().is_some());
-        dismiss(&db);
-        reading(&db, "2026-09-22 10:00:00", Some(0.));
-        observe(&mut db, t, false).unwrap();
-        reading(&db, "2026-09-22 10:00:00", Some(2.));
-        assert!(observe(&mut db, t, false).unwrap().is_none());
-        assert!(observe(&mut db, t, true).unwrap().is_some());
+    fn platform_weather_verdicts_never_block_creation_and_snapshots_are_preserved() {
+        for level in ["ok", "caution", "unsafe", "unknown"] {
+            let mut db = db();
+            let at = parse("2026-09-22 10:00:00").unwrap();
+            reading(&db, "2026-09-22 09:00:00", Some(2.));
+            let mut check = recorded_weather("creation", level == "ok", level == "unknown");
+            check.weather.level = level.into();
+            let snapshot = serde_json::to_value(&check).unwrap();
+            let event = observe_with_weather(&mut db, at, Some(check)).unwrap().unwrap();
+            assert_eq!(event.status, "countdown");
+            assert_eq!(serde_json::to_value(&event.weather_checks[0]).unwrap(), snapshot);
+            assert!(observe(&mut db, at, false).unwrap().is_none());
+        }
     }
     #[test]
     fn exceedances_always_create_tasks_and_unresolved_plans_block_new_events() {
@@ -2205,20 +2318,16 @@ mod tests {
         assert!(observe(&mut db, at, true).unwrap().is_none());
     }
     #[test]
-    fn released_failure_waits_for_weather_without_consuming_hour() {
+    fn released_failure_creates_next_hour_even_when_weather_is_unavailable() {
         let mut db = db();
         failed_automatic(&mut db);
         let time = "2026-10-08 20:00:00";
         let at = parse(time).unwrap();
         reading(&db, time, Some(1.36));
-        assert!(observe(&mut db, at, false).unwrap().is_none());
-        assert!(current(&db).unwrap().is_none());
-        assert!(setting(&db, &format!("flight_handled:{time}"))
-            .unwrap()
-            .is_none());
-        assert_eq!(setting(&db, "flight_episode").unwrap().as_deref(), Some(""));
-        recover(&db).unwrap();
-        assert!(observe(&mut db, at, true).unwrap().is_some());
+        let next = observe(&mut db, at, false).unwrap().unwrap();
+        assert_eq!(next.weather_checks[0].weather.level, "unknown");
+        assert!(serde_json::to_value(&next.weather_checks[0]).unwrap()["weather"]["current"].is_null());
+        assert!(observe(&mut db, at, true).unwrap().is_none());
     }
     #[test]
     fn missing_expired_or_future_hours_do_not_release_a_failure() {
@@ -2321,14 +2430,9 @@ mod tests {
             }
             recover(&db).unwrap();
             reading(&db, "2026-10-14 00:00:00", Some(2.));
-            // Release occupancy even while weather blocks the new flight.
-            assert!(
-                observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), false)
-                    .unwrap()
-                    .is_none(),
-                "{source}"
-            );
-            assert!(current(&db).unwrap().is_none(), "{source}");
+            // The new hour can proceed with a recorded weather failure.
+            let next = observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), false)
+                .unwrap().unwrap();
             let archived: serde_json::Value = serde_json::from_str(
                 &setting(&db, &format!("flight_history:{}", failed.id))
                     .unwrap()
@@ -2342,13 +2446,6 @@ mod tests {
                     .as_deref(),
                 Some("prior-auto-attempt")
             );
-            assert!(setting(&db, "flight_handled:2026-10-14 00:00:00")
-                .unwrap()
-                .is_none());
-            recover(&db).unwrap();
-            let next = observe(&mut db, parse("2026-10-14 01:00:00").unwrap(), true)
-                .unwrap()
-                .unwrap();
             assert_eq!(next.source, "auto");
             assert_eq!(next.status, "countdown");
             assert_ne!(next.id, failed.id);
@@ -2418,12 +2515,8 @@ mod tests {
             let time = format!("2026-10-11 {hour:02}:00:00");
             let at = parse(&time).unwrap();
             reading(&db, &time, Some(2.));
-            // Weather initially blocks every new hour without consuming it.
-            assert!(observe(&mut db, at, false).unwrap().is_none());
-            assert!(setting(&db, &format!("flight_handled:{time}"))
-                .unwrap()
-                .is_none());
-            let event = observe(&mut db, at, true).unwrap().unwrap();
+            // A failed weather read is recorded and does not suppress this hour.
+            let event = observe(&mut db, at, false).unwrap().unwrap();
             assert_eq!(event.observed_at, time);
             assert!(observe(&mut db, at, true).unwrap().is_none());
             let mut finished = event.clone();
@@ -2556,8 +2649,8 @@ mod tests {
     #[test]
     fn manual_flights_can_share_the_same_latest_hourly_observation() {
         let db = db();
-        let hour = "2026-09-22 14:00:00";
-        reading(&db, hour, Some(2.0));
+        let hour = "2026-09-22 15:00:00";
+        reading(&db, "2026-09-22 14:00:00", Some(2.0));
         db.execute(
             "INSERT OR REPLACE INTO hourly_observations VALUES ('321200',?,?,?,'μg/m³','source','A_6','30','sync')",
             rusqlite::params!["2026-09-22 15:00:00", Option::<f64>::None, Some(15.0_f64)],
@@ -2675,7 +2768,7 @@ mod tests {
         let manual = begin_manual_request(&db, false, Some(&automatic.id), true).unwrap();
         assert_ne!(manual.id, automatic.id);
         assert_eq!(manual.source, "manual");
-        assert!(has_manual_weather_override(&manual));
+        assert!(manual.weather_override_confirmed_at.is_some());
         let history: Event = serde_json::from_str(
             &setting(&db, &format!("flight_history:{}", automatic.id))
                 .unwrap()
@@ -2691,7 +2784,7 @@ mod tests {
         assert!(begin_manual_request(&db, false, Some(&automatic.id), true).is_err());
         cancel(&db, &manual.id).unwrap();
         let next = begin_manual(&db, false).unwrap();
-        assert!(!has_manual_weather_override(&next));
+        assert!(!next.weather_override_confirmed_at.is_some());
         assert!(next.weather_override_confirmed_at.is_none());
     }
     #[test]
@@ -2715,29 +2808,6 @@ mod tests {
             assert!(begin_manual_request(&db, false, None, true).is_err());
             assert_eq!(current(&db).unwrap().unwrap().id, event.id);
         }
-    }
-    #[test]
-    fn weather_override_is_opt_in_and_exclusive_to_real_manual_attempts() {
-        let db = db();
-        let normal = begin_manual(&db, false).unwrap();
-        assert!(!has_manual_weather_override(&normal));
-        let mut automatic = new_event("2026-10-08 19:00:00".into(), Some(2.), false);
-        automatic.weather_override_confirmed_at = Some(1);
-        assert!(!has_manual_weather_override(&automatic));
-        let mut preview = automatic.clone();
-        preview.source = "manual".into();
-        preview.preview = true;
-        assert!(!has_manual_weather_override(&preview));
-        assert!(begin_manual_request(&db, true, None, true).is_err());
-        // Older persisted events have no confirmation and continue to use weather gates.
-        let mut legacy = serde_json::to_value(&normal).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("weatherOverrideConfirmedAt");
-        assert!(!has_manual_weather_override(
-            &serde_json::from_value(legacy).unwrap()
-        ));
     }
     #[test]
     fn checking_a_pending_platform_task_resolves_uncertainty_without_allowing_retry() {
@@ -2791,15 +2861,7 @@ mod tests {
         );
         let next_hour = "2026-10-13 15:00:00";
         reading(&db, next_hour, Some(2.));
-        assert!(observe(&mut db, parse(next_hour).unwrap(), false)
-            .unwrap()
-            .is_none());
-        assert!(setting(&db, &format!("flight_handled:{next_hour}"))
-            .unwrap()
-            .is_none());
-        let next = observe(&mut db, parse(next_hour).unwrap(), true)
-            .unwrap()
-            .unwrap();
+        let next = observe(&mut db, parse(next_hour).unwrap(), false).unwrap().unwrap();
         assert_ne!(next.id, event.id);
         assert_eq!(next.observed_at, next_hour);
     }
@@ -2899,14 +2961,8 @@ mod tests {
         );
         recover(&db).unwrap();
         reading(&db, "2026-10-11 15:00:00", Some(2.));
-        assert!(
-            observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), false)
-                .unwrap()
-                .is_none()
-        );
-        let next = observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), true)
-            .unwrap()
-            .unwrap();
+        let next = observe(&mut db, parse("2026-10-11 15:00:00").unwrap(), false)
+            .unwrap().unwrap();
         assert_ne!(next.id, event.id);
         assert_eq!(next.source, "auto");
         assert!(view(&db)
@@ -3002,6 +3058,70 @@ mod tests {
             "Human-confirmed flight must leave ready when platform confirms completion"
         );
     }
+    #[test]
+    fn ended_partial_task_releases_slot_but_keeps_receipt_and_episode() {
+        let db = db();
+        let mut event = begin_manual(&db, false).unwrap();
+        event.status = "flight_error".into();
+        save(&db, &event).unwrap();
+        let end = chrono::Utc::now().timestamp_millis() - 1000;
+        let mut task: crate::flight_report::DjiTask = serde_json::from_value(serde_json::json!({
+            "mission": {"missionId":0,"missionName":event.name,"startTime":end-60000,"endTime":end,"geoLocation":""},
+            "status":"部分执行","mediaReady":false,"partialReason":"操作员终止任务"
+        })).unwrap();
+        task.actual_time_missing = true;
+        reconcile_ended_tasks(&db, &[task.clone()]).unwrap();
+        assert!(current(&db).unwrap().is_some());
+        task.actual_time_missing = false;
+        reconcile_ended_tasks(&db, &[task.clone(), task.clone()]).unwrap();
+        assert!(current(&db).unwrap().is_some());
+        let mut unrelated = task.clone();
+        unrelated.mission.mission_name = "other".into();
+        reconcile_ended_tasks(&db, &[unrelated]).unwrap();
+        assert!(current(&db).unwrap().is_some());
+        reconcile_ended_tasks(&db, &[task]).unwrap();
+        assert!(current(&db).unwrap().is_none());
+        let saved: Event = serde_json::from_str(&setting(&db, &format!("flight_history:{}",event.id)).unwrap().unwrap()).unwrap();
+        assert_eq!(saved.status, "flight_error");
+        assert!(saved.error.unwrap().contains("操作员终止任务"));
+        assert_eq!(setting(&db, "flight_episode").unwrap().unwrap(), event.observed_at);
+        assert!(begin_manual(&db, false).is_ok());
+    }
+
+    #[test]
+    fn ended_manual_task_does_not_consume_newer_pm25_hour() {
+        for legacy in [false, true] {
+            let mut db = db();
+            configure(&db, 1.0, 5, false);
+            let mut event = new_event("2026-10-31 21:52:39".into(), None, false);
+            event.source = "manual".into();
+            event.source_hour = Some("2026-10-31 20:00:00".into());
+            event.status = "flight_error".into();
+            save(&db, &event).unwrap();
+            let task: crate::flight_report::DjiTask = serde_json::from_value(serde_json::json!({
+                "mission":{"missionId":0,"missionName":event.name,"startTime":1793454780000_i64,"endTime":1793455920000_i64,"geoLocation":""},
+                "status":"部分执行","mediaReady":false
+            })).unwrap();
+            reconcile_ended_tasks(&db, &[task]).unwrap();
+            if legacy { put(&db, "flight_episode", &event.observed_at).unwrap(); }
+            recover(&db).unwrap();
+            assert_eq!(setting(&db, "flight_episode").unwrap().as_deref(), Some("2026-10-31 20:00:00"));
+            reading(&db, "2026-10-31 20:00:00", Some(0.94));
+            db.execute("UPDATE hourly_observations SET pm25=63", []).unwrap();
+            assert!(observe(&mut db, parse("2026-10-31 21:00:00").unwrap(), true).unwrap().is_none());
+            reading(&db, "2026-10-31 21:00:00", Some(0.94));
+            db.execute("UPDATE hourly_observations SET pm25=63 WHERE observed_at='2026-10-31 21:00:00'", []).unwrap();
+            let at = parse("2026-10-31 22:00:00").unwrap();
+            let next = observe(&mut db, at, true).unwrap().unwrap();
+            assert_eq!(next.status, "countdown");
+            assert_eq!(next.source_hour.as_deref(), Some("2026-10-31 21:00:00"));
+            assert!(next.name.starts_with("PM2.5超标巡查"));
+            assert_eq!(next.launch_at, Some((at-Duration::hours(8)).and_utc().timestamp_millis()+300000));
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+            assert!(setting(&db, &format!("flight_history:{}",event.id)).unwrap().is_some());
+        }
+    }
+
     #[test]
     fn review_flight_error_can_reconcile_later_platform_success() {
         let db = db();
@@ -3237,4 +3357,82 @@ mod tests {
         apply_observation(&db, &previous.id, &previous.name, "执行成功").unwrap();
         assert_eq!(current(&db).unwrap().unwrap().id, next.id);
     }
+
+    #[test]
+    fn prefix_route_distance_handles_unicode_exact_matches_and_ambiguity() {
+        let route = |name: &str, id: &str| FlightRoute {name:name.into(), route_id:id.into(), update_time:0};
+        let routes = vec![route("北侧航线-副本(123)", "1"), route("北侧航线-副本(1)", "2")];
+        assert_eq!(best_route_match(&routes, " 北侧 航线 ").unwrap().as_deref(), Some("北侧航线-副本(1)"));
+        assert_eq!(best_route_match(&routes, "北侧航线-副本(123)").unwrap().as_deref(), Some("北侧航线-副本(123)"));
+        assert!(best_route_match(&routes, "南侧航线").unwrap().is_none());
+        assert!(best_route_match(&routes, "").unwrap().is_none());
+        let tied = vec![route("北侧航线-副本(1)", "1"),route("北侧航线-副本(2)", "2")];
+        assert!(best_route_match(&tied, "北侧航线").unwrap_err().contains("差异相同"));
+        let duplicate = vec![route("北侧航线", "1"),route("北侧航线", "2")];
+        assert!(best_route_match(&duplicate, "北侧航线").is_err());
+        assert!(exact_route_match(&duplicate, "北侧航线").is_err());
+        let db = db();
+        put(&db, "flight_routes", &serde_json::to_string(&duplicate).unwrap()).unwrap();
+        put(&db, "flight_route", "北侧航线").unwrap();
+        assert!(selected_route(&db).unwrap().is_none());
+        assert!(route_view(&db).unwrap().selected.is_none());
+        assert!(route_configuration_ready(&db).is_err());
+        assert!(exact_route_match(&routes, "北侧航线").unwrap().is_none());
+        let shorter = vec![route("北侧", "1"),route("北侧航线", "2")];
+        assert_eq!(best_route_match(&shorter, "北侧航线-副本(1)").unwrap().as_deref(), Some("北侧航线"));
+        // Count Unicode characters, not UTF-8 bytes (both suffixes add one).
+        assert!(best_route_match(&[route("北侧航线甲", "1"),route("北侧航线A", "2")], "北侧航线").is_err());
+        let mut settings = crate::settings::Settings::default();
+        settings.wind_route_rules = vec![crate::settings::WindRouteRule {start_degrees:0.,end_degrees:90.,route:"北侧航线".into()}];
+        assert!(configured_route(&settings, &tied, Some(tied[0].name.clone()), Some(45.)).is_err());
+        assert_eq!(configured_route(&settings, &routes, Some(routes[0].name.clone()), Some(45.)).unwrap(), "北侧航线-副本(1)");
+    }
+    #[test]
+    fn pm25_only_exceedance_names_both_missing_and_normal_potassium_correctly() {
+        for k in [None, Some(0.5), Some(1.0)] {
+            let mut db = db(); configure(&db,1.0,5,false);
+            let time = "2026-10-27 10:00:00";
+            reading(&db,time,k); reading_pm25(&db,time,Some(61.0));
+            let event = observe(&mut db,parse(time).unwrap(),true).unwrap().unwrap();
+            assert_eq!(event.name,"PM2.5超标巡查-20261027-10");
+            assert_eq!(event.source_hour.as_deref(),Some(time));
+        }
+    }
+    #[test]
+    fn clearing_preserves_unresolved_flights_even_when_no_operation_is_busy() {
+        let db = db();
+        let mut event = new_event("2026-10-27 10:00:00".into(),Some(2.),false);
+        for status in ["countdown","preparing","ready","submitting","submitted","uncertain","flying","paused","flight_error","unknown"] {
+            event.status = status.into(); save(&db,&event).unwrap();
+            let before = setting(&db,"flight_event").unwrap();
+            assert!(require_clearable(&db).is_err(),"{status}");
+            assert_eq!(setting(&db,"flight_event").unwrap(),before);
+        }
+        for status in ["failed","completed","canceled","dismissed","restricted","not_flown"] {
+            event.status = status.into(); save(&db,&event).unwrap();
+            assert!(require_clearable(&db).is_ok(),"{status}");
+        }
+        event.status="not_flown".into();
+        event.error=Some("司空平台天气阻飞：风速过高；未继续执行".into());
+        save(&db,&event).unwrap();
+        assert!(require_clearable(&db).is_err(),"operator can still confirm this platform draft");
+        assert!(close_reviewed(&db, &event.id, "not_flown", false).is_err());
+        assert!(require_clearable(&db).is_err());
+        close_reviewed(&db, &event.id, "not_flown", true).unwrap();
+        assert!(require_clearable(&db).is_ok());
+        let archived: Event = serde_json::from_str(&setting(&db, &format!("flight_history:{}", event.id)).unwrap().unwrap()).unwrap();
+        assert_eq!(archived.error, event.error);
+        assert!(archived.resolved_at.is_some());
+    }
+    #[test]
+    fn countdown_is_kept_when_new_data_returns_to_normal() {
+        let mut db=db(); configure(&db,1.,120,false);
+        reading(&db,"2026-10-27 10:00:00",Some(2.));
+        let event=observe(&mut db,parse("2026-10-27 10:00:00").unwrap(),true).unwrap().unwrap();
+        reading(&db,"2026-10-27 11:00:00",Some(0.5));
+        assert!(observe(&mut db,parse("2026-10-27 11:00:00").unwrap(),true).unwrap().is_none());
+        assert_eq!(current(&db).unwrap().unwrap().launch_at,event.launch_at);
+        assert_eq!(claim_due(&db,event.launch_at.unwrap()).unwrap().unwrap().id,event.id);
+    }
+
 }

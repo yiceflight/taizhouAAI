@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { weatherPasses, currentWeatherText, rainfallText, type WeatherView } from '../lib/weather';
+import { weatherPasses, currentWeatherText, rainfallText, forecastWindLabel, type WeatherView } from '../lib/weather';
 type WeatherProps = { weather?: WeatherView; busy: boolean; onRefresh: () => void };
 const number = (n: number | null | undefined) => n == null ? '—' : n.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
 const time = (n: number | undefined) => n == null ? '尚未获取' : new Date(n * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
@@ -9,7 +9,7 @@ function weatherPresentation(weather: WeatherView | undefined) {
   const refreshing = !!weather?.refreshing;
   if (!weather?.current || weather.level === 'unknown') return { allowed: false, label: weather?.current ? '暂无法判断' : refreshing ? '正在获取天气' : '暂无法判断', reasons: weather?.reasons.length ? weather.reasons : [refreshing ? '正在向司空获取最新天气和适飞结论，请稍候。' : '等待司空气象数据和适飞结论。'], refreshing };
   const now = Date.now() / 1000, sample = weather.current;
-  if (now - sample.observedAt < -60 || now - sample.observedAt > 600 || now - sample.fetchedAt < 0 || now - sample.fetchedAt > 600) {
+  if (now - sample.observedAt < -60 || now - sample.observedAt > 1920 || now - sample.fetchedAt < 0 || now - sample.fetchedAt > 1800) {
     return { allowed: false, label: '天气已过期', reasons: ['天气数据已过期，请刷新。'], refreshing };
   }
   const ranked = [...(sample.items ?? [])].filter(item => item.level > 1).sort((a, b) => b.level - a.level).map(item => `${item.label}：${item.value}`);
@@ -56,7 +56,7 @@ export function WeatherPanel({ weather, busy, onRefresh }: WeatherProps) {
     <section className="weather-metric-group" aria-label="机场实测"><h4>机场实测</h4>
       <div className="weather-metrics"><span className={(s?.items?.find(item => item.key === 'windSpeed')?.level ?? 1) > 1 ? 'weather-metric-alert' : undefined}>机场实测风速 <strong>{number(s?.windSpeed)} <small>m/s</small></strong></span><span className={(s?.items?.find(item => item.key === 'rainfall')?.level ?? 1) > 1 ? 'weather-metric-alert' : undefined}>机场实测降雨 <strong>{rainfallText(s)}</strong></span><span>机场实测气温 <strong>{number(s?.temperature)} <small>°C</small></strong></span></div>
     </section>
-    {s?.items?.some(item => item.key.endsWith('Online')) ? <section className="weather-metric-group" aria-label="司空预报"><h4>司空预报</h4><div className="weather-metrics">{s.items.filter(item => item.key.endsWith('Online')).map(item => <span key={item.key} className={item.level > 1 ? 'weather-metric-alert' : undefined}>{item.label}<strong>{item.value}</strong>{item.level > 1 && <small className="weather-metric-verdict">{item.level === 3 ? '无法飞行' : '不宜飞行'}</small>}</span>)}</div></section> : null}
-    <div className="weather-details"><h4>数据来源</h4><p>机场实测时刻：{time(s?.observedAt)}（北京时间）</p><p>预报时刻：{time(s?.forecast?.observedAt)}（北京时间）</p><p>位置：{weather?.longitude ?? 119.929701}° E，{weather?.latitude ?? 32.434676}° N · <a href="https://fh.dji.com/" target="_blank" rel="noreferrer">大疆司空 2</a> · 每 5 分钟更新</p><p>适飞结论采用司空当前项目的天气判定。请保持 Chrome 已登录司空；登录失效或数据过期时需重新获取。</p><p>实际起飞仍需确认现场天气及设备状态。</p></div>
+    {s?.forecast || s?.items?.some(item => item.key.endsWith('Online')) ? <section className="weather-metric-group" aria-label="司空预报"><h4>司空预报</h4><div className="weather-metrics"><span>预报风向<strong>{forecastWindLabel(weather)}</strong></span>{s.items?.filter(item => item.key.endsWith('Online')).map(item => <span key={item.key} className={item.level > 1 ? 'weather-metric-alert' : undefined}>{item.label}<strong>{item.value}</strong>{item.level > 1 && <small className="weather-metric-verdict">{item.level === 3 ? '无法飞行' : '不宜飞行'}</small>}</span>)}</div></section> : null}
+    <div className="weather-details"><h4>数据来源</h4><p>机场实测时刻：{time(s?.observedAt)}（北京时间）</p><p>预报时刻：{time(s?.forecast?.observedAt)}（北京时间）</p><p>位置：{weather?.longitude ?? 119.929701}° E，{weather?.latitude ?? 32.434676}° N · <a href="https://fh.dji.com/" target="_blank" rel="noreferrer">大疆司空 2</a> · 每 5 分钟更新 · 数据有效期 30 分钟 · 准备任务时更新风向</p><p>天气结论来自司空当前项目，仅供记录与查看；App 根据有效风向选线，是否允许起飞由大疆后台决定。</p></div>
   </section>;
 }

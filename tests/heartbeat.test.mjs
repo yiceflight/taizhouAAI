@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { evaluateBackgroundRead } from '../extension/src/background-read.js';
+import { readOnlyJob, createReadScheduler } from '../extension/src/read-scheduler.js';
 const source = await readFile(new URL('../extension/src/service-worker.js', import.meta.url), 'utf8');
 const loop = source.slice(source.indexOf('async function bridgeTabs()'), source.indexOf('\nfunction start()'));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -10,9 +11,10 @@ function fixture(post, capture, now = Date.now) {
   const context = vm.createContext({
     chrome: { runtime: { getManifest: () => ({ version: '0.7.17' }) }, tabs: { query: async () => [] }, action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {}, setTitle: async () => {} } },
     SITE_PATTERNS: [], allowedUrl: () => true, debuggerSession: { maintain: async () => {} },
+    createReadScheduler,
     prioritizeHealthJobs: jobs => jobs, post, capture, Date: { now },
   });
-  vm.runInContext('let polling = false, rerunRequested = false, keepingAlive = false, keepAliveSupported = false;\n' + loop, context);
+  vm.runInContext('let polling = false, rerunRequested = false, keepingAlive = false, keepAliveSupported = false;\n' + loop + '\nconst readScheduler = createReadScheduler(executeJob, () => void heartbeat());', context);
   return () => vm.runInContext('heartbeat()', context);
 }
 
@@ -107,4 +109,31 @@ test('a frozen background read expires while heartbeats continue, then the next 
   assert.deepEqual(evaluated, [1, 2]);
   assert.match(completed[0].error, /后台页面读取超时/);
   assert.equal(completed[1].data.state, 'ready');
+});
+
+
+test('new protocol polls and completes unlimited reads while a serial browser job is still running', async () => {
+  const held = deferred(), entered = deferred();
+  const completed = [], executed = [];
+  let claims = 0;
+  const run = fixture(async (path, body) => {
+    if (path === 'complete') { completed.push(body.id); return {}; }
+    assert.equal(body.parallelReads, true);
+    claims++;
+    if (claims === 1) return { parallelReadsSupported: true, jobs: [{ id: 'serial', type: 'flight-missions', tabId: 1 }] };
+    assert.equal(body.busy, !completed.includes('serial'));
+    return { parallelReadsSupported: true, jobs: claims === 2 ? Array.from({ length: 40 }, (_, i) => ({ id: i, tabId: i + 2, type: 'capture' })) : [] };
+  }, async id => {
+    executed.push(id);
+    if (id === 1) { entered.resolve(); await held.promise; }
+    return {};
+  });
+  await run(); await entered.promise;
+  await run();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(executed.length, 41);
+  assert.equal(completed.length, 40);
+  held.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed.length, 41);
 });

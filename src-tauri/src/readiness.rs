@@ -310,18 +310,11 @@ pub async fn refresh(app: &tauri::AppHandle) -> Result<(), String> {
         state.sites.lock().unwrap().clear();
         return Ok(());
     }
-    // Site checks remain serial. Queueing all three at once starts their
-    // expiry clocks together; a later check can then spend most of its
-    // 120-second lease waiting behind the earlier checks and be discarded as
-    // expired. Report media jobs have a separate bounded parallel path.
-    for site in [SITES[2], SITES[0], SITES[1]] {
-        // A background page can finish loading while the previous site's
-        // request is running. Refresh the tab inventory before each site so
-        // that a stale `loading` snapshot cannot be written back as
-        // `unchecked` after the page is already usable.
-        let latest = bridge.status();
-        check_site(app, &latest, site).await;
-    }
+    tokio::join!(
+        check_site(app, &snapshot, SITES[0]),
+        check_site(app, &snapshot, SITES[1]),
+        check_site(app, &snapshot, SITES[2]),
+    );
     Ok(())
 }
 async fn check_site(
@@ -386,6 +379,11 @@ async fn check_site(
         );
         health.url = expected_url.clone();
         health.tab_id = (tab_id >= 0).then_some(tab_id);
+        if let Err(error) = &result {
+            if error.starts_with("浏览器任务排队超时") || error.starts_with("采集超时") || error == "采集连接已中断。" {
+                health.message = error.clone();
+            }
+        }
         if let Ok(raw) = result {
             let actual_url = raw["url"].as_str();
             let valid_url = if id == "map" {
@@ -462,15 +460,14 @@ pub fn start(app: tauri::AppHandle) {
                 app.state::<Readiness>().sites.lock().unwrap().clear();
                 // Do not put a newly connected plugin behind a 45-second timer.
                 next_check = Instant::now();
-            } else if !app.state::<Bridge>().busy()
-                && (Instant::now() >= next_check
-                    || current.sites.iter().any(|s| s.state == "unchecked"))
+            } else if Instant::now() >= next_check
+                    || current.sites.iter().any(|s| s.state == "unchecked")
             {
                 let _ = refresh(&app).await;
                 // A site check can take up to ~35 seconds while a background
                 // page loads and its authenticated API is read. Retrying a
                 // not-yet-ready workspace every 10 seconds needlessly starts
-                // another long serial pass and makes the UI oscillate.
+                // another verification pass and makes the UI oscillate.
                 next_check = Instant::now()
                     + Duration::from_secs(if view(&app).ready { 45 } else { 30 });
             }
@@ -517,6 +514,7 @@ pub async fn start_workspace(app: tauri::AppHandle) -> Result<(), String> {
     result
 }
 async fn start_workspace_inner(app: &tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     require_monitoring(app, false)?;
     // First read cannot trigger an automatic flight preparation.
     crate::monitoring::verify_first_sync(app).await?;

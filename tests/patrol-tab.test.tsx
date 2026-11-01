@@ -1,0 +1,44 @@
+import React, { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { parseHTML } from 'linkedom';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import App from '../src/App';
+import { defaultSettings } from '../src/lib/workspace';
+
+const state = vi.hoisted(() => ({ workspace: {} as any }));
+vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => true, invoke: vi.fn(async () => []) }));
+vi.mock('../src/lib/useWorkspace', () => ({ useWorkspace: () => state.workspace }));
+vi.mock('../src/components/MonitoringPanel', () => ({ MonitoringPanel: () => null }));
+vi.mock('../src/components/CapturePanel', () => ({ CapturePanel: () => null }));
+vi.mock('../src/components/UpdateBanner', () => ({ UpdateBanner: () => null }));
+vi.mock('../src/components/DroneStatus', () => ({ DroneStatus: () => null }));
+vi.mock('../src/components/WeatherPanel', () => ({ WeatherStatus: () => null }));
+vi.mock('../src/components/RuntimeLogs', () => ({ RuntimeLogs: () => null }));
+let root: ReturnType<typeof createRoot>;
+beforeEach(() => {
+  const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
+  vi.stubGlobal('window', window); vi.stubGlobal('document', window.document);
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  root = createRoot(document.getElementById('root')!);
+  state.workspace = { bridge: null, readiness: null, monitor: { settings: defaultSettings, flight: { records: [], routes: [] } }, error: '', acting: false, action: vi.fn() };
+});
+afterEach(async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); });
+const render = async () => { await act(async () => root.render(<App />)); };
+const clickTab = async (id: string) => { await act(async () => document.getElementById(`tab-${id}`)!.click()); };
+it('shows a red dot for new task rows, clears on opening the tab, and does not re-alert on status updates', async () => {
+  await render();
+  expect(document.querySelector('.nav-unread-dot')).toBeNull();
+  state.workspace.monitor.flight.event = { id: 'new-flight', name: '新巡查', observedAt: '2026-10-31 09:00:00', status: 'submitted' };
+  await render();
+  expect(document.querySelector('#tab-flight .nav-unread-dot')?.getAttribute('aria-label')).toBe('有未查看的巡查记录');
+  expect(document.getElementById('tab-flight')?.textContent).toBe('巡查任务');
+  await clickTab('flight');
+  expect(document.querySelector('.nav-unread-dot')).toBeNull();
+  expect(document.querySelector('#panel-flight tbody')?.textContent).toContain('新巡查');
+  await clickTab('monitoring');
+  state.workspace.monitor.flight.event.status = 'completed';
+  await render(); expect(document.querySelector('.nav-unread-dot')).toBeNull();
+  state.workspace.monitor.flight.records = [state.workspace.monitor.flight.event];
+  state.workspace.monitor.flight.event = { ...state.workspace.monitor.flight.event, id: 'next-flight', name: '下一次巡查' };
+  await render(); expect(document.querySelector('#tab-flight .nav-unread-dot')).not.toBeNull();
+});

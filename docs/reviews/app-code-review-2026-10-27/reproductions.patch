@@ -1,0 +1,73 @@
+--- a/src-tauri/src/flight.rs
++++ b/src-tauri/src/flight.rs
+@@ -3312,3 +3312,16 @@
+         assert_eq!(current(&db).unwrap().unwrap().id, next.id);
+     }
+ }
++
++#[cfg(test)]
++mod review_regressions {
++    use super::*;
++    #[test]
++    fn review_rejects_ambiguous_route_replacement() {
++        let mut settings = crate::settings::Settings::default();
++        settings.wind_route_rules = vec![crate::settings::WindRouteRule { start_degrees: 0., end_degrees: 90., route: "巡查航线".into() }];
++        let routes = vec![FlightRoute { route_id: "a".into(), name: "巡查航线-副本(1)".into(), update_time: 0 }, FlightRoute { route_id: "b".into(), name: "巡查航线-副本(2)".into(), update_time: 0 }];
++        let selected = configured_route(&settings, &routes, Some(routes[0].name.clone()), Some(45.));
++        assert!(selected.is_err(), "ambiguous routes silently selected: {selected:?}");
++    }
++}
+--- a/src-tauri/src/monitoring.rs
++++ b/src-tauri/src/monitoring.rs
+@@ -638,3 +638,19 @@
+         assert!(requested_window("12").is_err());
+     }
+ }
++
++#[cfg(test)]
++mod review_regressions {
++    use super::*;
++    #[test]
++    fn review_manual_today_refresh_must_not_skip_pending_history() {
++        let mut db = connect(Path::new(":memory:")).unwrap();
++        let old = (current_hour() - Duration::days(20)).format(FORMAT).to_string();
++        put(&db, "query_through", &old).unwrap();
++        let (start, end) = requested_window("today").unwrap();
++        let batch = Batch { url: SOURCE_URL.into(), city: "泰州市".into(), city_code: "321200".into(), unit: "μg/m³".into(), data_source: "A_6".into(), common_site_type: "30".into(), start_time:start.clone(), end_time:end.clone(), rows:vec![] };
++        persist(&mut db, batch, &start, &end).unwrap();
++        let next_start = window(&db).unwrap().0;
++        assert!(parse(&next_start).unwrap() <= parse(&old).unwrap(), "manual today refresh jumped automatic backfill from {old} to {next_start}");
++    }
++}
+--- a/tests/patrol-report.test.tsx
++++ b/tests/patrol-report.test.tsx
+@@ -972,3 +972,18 @@
+     expect(tasks.find(t => t.report === report)?.mission?.missionId).toBe(0);
+   });
+ });
++
++it('review preserves local event evidence when collecting a report with Airins data', async () => {
++  const event: LocalFlightEvent = { ...completedWithoutAir, name: first.missionName, route: '历史实际航线', flightTime: {startTime:first.startTime,endTime:first.endTime,durationMs:first.endTime-first.startTime,source:'dji-plan',precision:'minute'} };
++  await act(async () => root.render(<FlightReportPanel tabs={tabs} ready flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
++  await click('重新生成报告');
++  await click('自动匹配并读取资料');
++  const call = ipc.invoke.mock.calls.find(call => call[0] === 'collect_flight_report');
++  expect(call?.[1].request.localEventId).toBe(event.id);
++});
++it('review displays historical route instead of current default', async () => {
++  const event: LocalFlightEvent = { ...completedWithoutAir, name: first.missionName, route: '历史实际航线', flightTime: {startTime:first.startTime,endTime:first.endTime,durationMs:first.endTime-first.startTime,source:'dji-plan',precision:'minute'} };
++  await act(async () => root.render(<FlightReportPanel tabs={tabs} ready routeName="当前默认航线" flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
++  const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes(first.missionName));
++  expect(row?.textContent).toContain('历史实际航线');
++});
+--- /dev/null
++++ b/tests/review-pm25.test.mjs
+@@ -0,0 +1,8 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { validatePlanJob, validateSubmitJob } from '../extension/src/flight-plan.js';
++const job={type:'dji-prepare',submit:false,eventId:'00000000-0000-4000-8000-000000000001',name:'PM2.5超标巡查-20261027-10',route:'巡查航线'};
++test('review accepts the PM2.5-only task name emitted by Rust',()=>{
++  assert.doesNotThrow(()=>validatePlanJob(job));
++  assert.doesNotThrow(()=>validateSubmitJob({...job,type:'dji-submit',submit:true}));
++});

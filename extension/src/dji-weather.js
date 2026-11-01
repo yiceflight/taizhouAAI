@@ -1,5 +1,9 @@
 import { PLAN_URL } from './flight-plan.js';
 
+// Two 12s API requests plus up to 20s for the platform component; leave
+// headroom for CDP delivery and page scheduling. The native job allows 85s.
+export const WEATHER_READ_TIMEOUT_MS = 50000;
+
 export const WEATHER_URL = PLAN_URL.replace('#/plan', '#/team');
 // Use a dedicated background tab so a refresh neither navigates the user's
 // project nor reuses an old component's cached forecast. No device commands.
@@ -124,6 +128,10 @@ export async function collectDjiWeather() {
   const now = Date.now();
   const hourly = (forecast?.hourly || []).filter(h => Number.isFinite(Date.parse(h.time)) && Date.parse(h.time) <= now && now - Date.parse(h.time) <= 3600000).sort((a,b) => Date.parse(b.time) - Date.parse(a.time))[0];
   if (!hourly) throw new Error('司空预报缺少当前时段数据');
+  // wind360 is forecast meteorological direction, not a Dock OSD measurement.
+  // Keep missing/invalid data null: zero is a valid north wind, never a fallback.
+  const windDirection = finite(hourly.wind360) && hourly.wind360 >= 0 && hourly.wind360 <= 360
+    ? hourly.wind360 % 360 : null;
   // These properties are FlightHub's decoded WebSocket OSD API values, not DOM.
   const current = component.currentDeviceThingProperties;
   if (component.currentDeviceDetail?.device_sn !== dockSn || current.latitude !== coordinates.latitude || current.longitude !== coordinates.longitude) throw new Error('气象读取期间机场或坐标发生变化，请刷新');
@@ -140,7 +148,7 @@ export async function collectDjiWeather() {
   return { url, projectId, dockSn, adapterVersion: 1,
     observedAt: Math.floor(current.osd_timestamp / 1000), fetchedAt: Math.floor(now / 1000),
     latitude: current.latitude, longitude: current.longitude,
-    temperature: current.environment_temperature, windSpeed: current.wind_speed, rainfall: current.rainfall,
+    temperature: current.environment_temperature, windSpeed: current.wind_speed, rainfall: current.rainfall, windDirection,
     airworthy: component.airworthy, label: component.getTipByAirworthy, items,
     forecast: { observedAt: Math.floor(Date.parse(hourly.time) / 1000), condition: hourly.text, temperature: hourly.temp, humidity: hourly.humidity, precipitation: hourly.precip },
   };

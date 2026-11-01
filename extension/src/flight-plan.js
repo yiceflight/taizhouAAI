@@ -7,7 +7,7 @@ export const PLAN_RECIPE = Object.freeze({
 });
 export function validatePlanJob(job) {
   if (job.type !== 'dji-prepare' || job.submit !== false || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
-      typeof job.name !== 'string' || !/^((钾离子超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
+      typeof job.name !== 'string' || !/^((钾离子超标巡查|PM2\.5超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
       typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
     throw new Error('司空任务参数无效；只允许填写，禁止提交');
   }
@@ -15,7 +15,7 @@ export function validatePlanJob(job) {
 
 export function validateSubmitJob(job) {
   if (job.type !== 'dji-submit' || job.submit !== true || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
-      typeof job.name !== 'string' || !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
+      typeof job.name !== 'string' || !/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
       typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
     throw new Error('起飞任务参数无效；演练任务禁止提交');
   }
@@ -25,14 +25,16 @@ export function validateSubmitJob(job) {
 // are observations of nothing, never evidence that a flight finished.
 export async function readFlightStatus(name, expectedUrl) {
   if (location.href !== expectedUrl) throw new Error('司空计划列表页面不匹配');
-  if (!/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('巡飞计划名称无效');
+  if (!/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('巡飞计划名称无效');
   // FlightHub labels an active mission "任务执行 (3/9)". Keep the
   // bridge's canonical status so existing clients can reconcile it.
   const states = ['待执行', '执行中', '任务执行', '已暂停', '已挂起', '部分执行', '执行成功', '执行失败', '执行终止'];
   const visible = e => e.getClientRects().length > 0;
   const label = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
   const all = selector => [...document.querySelectorAll(selector)].filter(visible);
-  const deadline = Date.now() + 60000;
+  // Finish before the worker watchdog (25s), so timed-out reads do not
+  // continue changing filters while the next status query is running.
+  const deadline = Date.now() + 20000;
   const signature = () => all('tbody tr,tr[role="row"]').map(label).join('|');
   const wait = async (condition = () => true) => {
     let stable = 0;
@@ -92,7 +94,7 @@ export async function readFlightStatus(name, expectedUrl) {
       if (!clear) throw new Error('司空日期筛选无法清空，未能核查完整任务范围');
       clear.click(); await wait(() => !dateInput.value);
     }
-    const search = all('input').find(e => /按航线或计划名搜索/.test(e.placeholder));
+    const search = all('input').find(e => /按航线或计划名搜索|航线名称\s*[/／]\s*计划名称/.test(e.placeholder));
     if (search && search.value !== name) {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
       if (!setter) throw new Error('司空计划搜索不可用');
@@ -165,7 +167,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
     const issue = readSubmissionIssue(expectedUrl);
     if (issue) throw new Error(issue);
   }
-  if (submit && !/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
+  if (submit && !/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
   const text = e => (e.innerText || e.textContent || '').replace(/\s+/g, '').trim();
   const norm = s => s.replace(/\s+/g, '');
@@ -235,7 +237,9 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
       return null;
     }, '航线库内的指定航线');
     const candidates = routeNames(library);
-    click(unique(candidates, '视频指定航线'));
+    const distance = e => [...text(e)].length - [...routePrefix].length;
+    const minimum = Math.min(...candidates.map(distance));
+    click(unique(candidates.filter(e => distance(e) === minimum), '差异最小的指定航线'));
     await wait(routeSelected, '选中航线');
   }
   const deviceCards = root => {
@@ -317,7 +321,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   while (footer && !leaves('确定', footer).length) footer = footer.parentElement;
   const confirmation = unique(leaves('确定', footer || form), '最终确定按钮');
   if (!submit) return { status: 'ready', submitted: false, name, url: location.href, verified: checks.map(([, label]) => label) };
-  if (!/^(钾离子超标巡查-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
+  if (!/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   check();
   const button = confirmation.closest('button,[role="button"]');
   if (!button || text(button) !== '确定' || button.disabled || button.getAttribute('aria-disabled') === 'true') throw new Error('最终确定按钮不可用，未提交');

@@ -179,3 +179,14 @@ for (const [name, url, open] of [['Airins',air,openAirinsForHealth],['DJI',dji,o
     assert.equal(result.state,'login_required');
   });
 }
+
+test('Jiangsu launcher on the login route requests business verification without claiming login success', async () => {
+  const url = 'http://61.155.4.60:18080/#/login';
+  const document = { body: { innerText: '综合分析 离线分析 数据管理 运维中心 温室气体' }, querySelectorAll: () => [] };
+  const result = await run(url, { document });
+  assert.equal(result.state, 'page_required');
+  assert.equal(result.needsBusinessPage, true);
+  assert.equal((await run(url)).state, 'login_required');
+  assert.equal((await run(url, { document: { ...document, querySelectorAll: () => [{ getClientRects: () => [1] }] } })).state, 'login_required');
+  assert.equal((await run('https://fh.dji.com/#/login', { document })).state, 'login_required');
+});

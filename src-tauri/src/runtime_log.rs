@@ -444,6 +444,7 @@ pub fn export_runtime_logs(
     log: tauri::State<'_, RuntimeLog>,
     mut filter: Filter,
 ) -> Result<String, String> {
+    let _access = crate::data_reset::access(&app)?;
     filter.before_id = None;
     let page = log.read(&filter, MAX_ROWS)?;
     let directory = app
@@ -472,6 +473,7 @@ pub fn export_runtime_logs(
 }
 #[tauri::command]
 pub fn open_runtime_log_exports(app: tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let path = app
         .path()
         .app_data_dir()

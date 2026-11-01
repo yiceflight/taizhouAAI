@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { dataQuality, defaultSettings, flightDisplay, hourTime, isCurrentFlightEvent, latestValidRow, triggerReading, type WorkspaceSettings, type HourRow, type MonitorView } from '../lib/workspace';
 import { DroneStatus } from './DroneStatus';
+import { windDirectionForRule } from '../lib/windDirections';
 const format = (value: number | null | undefined) => value == null ? '暂无数据' : value.toLocaleString('zh-CN', { maximumFractionDigits: 4 });
 const dateValue = hourTime;
 type ViewMode = 'chart' | 'table';
@@ -112,7 +113,7 @@ function MonitoringChart({ rows, settings }: { rows: HourRow[]; settings: Worksp
       </g>)}
       {chartRows.map((row, index) => row.potassium != null && <rect key={row.time} x={x(index) - barWidth / 2} y={y(row.potassium, potassiumMax)} width={barWidth} height={Math.max(0, row.potassium / potassiumMax * plotHeight)} className={`potassium-bar ${row.potassium > settings.potassiumThreshold ? 'exceeded-point' : 'potassium-point'}`} />)}
       <path d={pathFor('pm25', pm25Max)} className="chart-line pm25-stroke" />
-      {chartRows.map((row) => row.pm25 != null && <circle key={`pm25-${row.time}`} cx={xAt(dateValue(row.time))} cy={y(row.pm25, pm25Max)} r="2.4" className={`chart-point ${row.pm25 > settings.pm25Threshold ? 'exceeded-point' : 'pm25-point'}`}><title>{`${row.time.slice(0, 16)} · PM2.5 ${format(row.pm25)} μg/m³`}</title></circle>)}
+      {chartRows.map((row) => row.pm25 != null && <circle key={`pm25-${row.time}`} cx={xAt(dateValue(row.time))} cy={y(row.pm25, pm25Max)} r={row.pm25 > settings.pm25Threshold ? 5 : 2.4} className={`chart-point ${row.pm25 > settings.pm25Threshold ? 'exceeded-point' : 'pm25-point'}`}><title>{`${row.time.slice(0, 16)} · PM2.5 ${format(row.pm25)} μg/m³`}</title></circle>)}
       <line x1={margin.left} x2={width - margin.right} y1={y(settings.potassiumThreshold, potassiumMax)} y2={y(settings.potassiumThreshold, potassiumMax)} className="threshold-line" />
       <text x={margin.left + 8} y={y(settings.potassiumThreshold, potassiumMax) - 6} className="threshold-label">K⁺ 巡查阈值 {format(settings.potassiumThreshold)}</text>
       {labelIndexes.map((index) => <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === chartRows.length - 1 ? "end" : "middle"} className="chart-axis-label">{chartRows[index].time.slice(5, 13)}</text>)}
@@ -132,7 +133,7 @@ function MonitoringChart({ rows, settings }: { rows: HourRow[]; settings: Worksp
   </div>;
 }
 
-type Props = { data: MonitorView | null; busy: boolean; ready: boolean; flightReady?: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void; onSettings?: () => void; onAir?: () => void; reportGenerating?: boolean };
+type Props = { data: MonitorView | null; busy: boolean; ready: boolean; flightReady?: boolean; started: boolean; action: (command: string, args?: Record<string, unknown>) => Promise<boolean>; onPrepare: () => void; onFlight: () => void; onSettings?: () => void; };
 function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
   return <svg className={`refresh-icon${spinning ? ' is-spinning' : ''}`} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
     <path d="M20 11a8 8 0 0 0-14.9-3.9L3 9" />
@@ -141,7 +142,7 @@ function RefreshIcon({ spinning = false }: { spinning?: boolean }) {
     <path d="M21 20v-5h-5" />
   </svg>;
 }
-export function MonitoringPanel({ data, busy, ready, flightReady = ready, started, action, onPrepare, onFlight, onSettings = () => {}, onAir, reportGenerating }: Props) {
+export function MonitoringPanel({ data, busy, ready, flightReady = ready, started, action, onPrepare, onFlight, onSettings = () => {} }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('chart');
   const [range, setRange] = useState<Range>(24);
   const trigger = triggerReading(data);
@@ -155,9 +156,8 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
     if (range === 'today') return row.time.slice(0, 10) === today;
     return !latest || dateValue(row.time) >= dateValue(latest.time) - (range - 1) * 3600000;
   });
-  const { event: plan, records: history } = flightDisplay(data);
+  const { event: plan } = flightDisplay(data);
   const pending = isCurrentFlightEvent(plan);
-  const records = plan && !pending ? [plan, ...history] : history;
   const syncRange = range === 'today' ? 'today' : String(range);
   const manualConfirmation = settings.requireManualConfirmation;
   const noFlyPeriods = settings.noFlyPeriods ?? [];
@@ -168,9 +168,9 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
   const executionDetail = manualConfirmation
     ? '计划填写完成后，由工作人员确认起飞'
     : `计划填写完成后，延迟 ${settings.takeoffDelayMinutes} 分钟自动提交`;
-  const windRouteMode = settings.routeSelectionMode === 'wind';
-  const routeValue = windRouteMode ? '按风向选择航线' : data?.flight.selectedRoute || '尚未选择航线';
-  const routeDetail = windRouteMode ? `起飞前按机场风向匹配 ${settings.windRouteRules?.length ?? 0} 条规则` : '填写巡查计划时使用此航线';
+  const windRules = settings.windRouteRules ?? [];
+  const hasWindRules = windRules.length > 0;
+  const defaultRoute = data?.flight.selectedRoute;
   return <div className="monitoring-workspace">
     <div className={`page-heading monitoring-heading ${quality.tone}`}><div>
       <span className="eyebrow">泰州市 · 小时监测</span>
@@ -185,51 +185,55 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
       <article className={latestPm25?.pm25 == null || quality.label === '数据已过期' || (latestPm25?.pm25 != null && latestPm25.pm25 > settings.pm25Threshold) ? 'metric-warning' : ''}><span>PM2.5 <small>μg/m³</small></span><strong>{format(latestPm25?.pm25)}</strong><small>巡查触发阈值 &gt; {format(settings.pm25Threshold)}</small></article>
       <article className={`time-metric ${quality.tone === 'warning' ? 'metric-warning' : ''}`}><span>数据所属时间</span><strong>{latest?.time.slice(0, 16) || '暂无数据'}</strong><small>{quality.label} · {latest ? '北京时间' : '等待首次读取'}</small></article>
     </div>
-    {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>查看运行状态 →</button>}</div>}
+    {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>重新检查环境</button>}</div>}
     <section id="monitoring-task-details" className={`task-details ${pending ? 'task-callout' : 'data-card'}`} aria-label="巡查任务详情">
-      <div className="task-panel-heading"><div><span className="eyebrow">无人机巡查</span><h3>巡查任务</h3><p>当前策略、触发条件和执行状态</p></div><button className="text-button" onClick={onFlight}>查看任务 →</button></div>
+      <div className="task-panel-heading"><div><h3>巡查任务</h3><p>当前策略、触发条件和执行状态</p></div><button type="button" className="text-button monitoring-route-summary" onClick={onSettings} aria-label="去设置：巡查策略">去设置 →</button></div>
       <div className="task-policy-grid" role="table" aria-label="巡查策略">
         <div className="task-policy-row task-policy-header" role="row">
           <span role="columnheader">规则项</span>
           <span role="columnheader">当前值</span>
           <span role="columnheader">说明</span>
-          <span aria-hidden="true" />
         </div>
-        <div className="task-policy-row" role="row">
-          <span className="task-policy-key" role="rowheader">当前航线</span>
-          <strong className="task-policy-value" role="cell">{routeValue}</strong>
-          <small className="task-policy-detail" role="cell">{routeDetail}</small>
-          <button type="button" className="monitoring-route-summary" onClick={onSettings} aria-label={`去设置：${routeValue}`}>
-            去设置 →
-          </button>
+        <div className={`task-policy-row task-route-row${!defaultRoute ? ' is-warning' : ''}`} role="row">
+          <span className="task-policy-key" role="rowheader">航线设置</span>
+          <div className="task-route-config" role="cell">
+            <span className="task-route-default"><span>默认航线</span><strong>{defaultRoute || '尚未选择，请先设置'}</strong></span>
+          </div>
+          <div className="task-policy-detail task-route-detail" role="cell">
+            <p>{hasWindRules ? '起飞前按司空预报风向匹配；缺少有效风向或该风向未配置航线时，使用默认航线。' : '未配置风向规则，起飞时直接使用默认航线。'}</p>
+            {!defaultRoute && <p className="task-route-warning">请先同步并选择默认航线，完成后才能起飞。</p>}
+            {hasWindRules && <details className="task-route-rules">
+              <summary>查看风向规则（{windRules.length} 条）</summary>
+              <dl>{windRules.map((rule, index) => <div key={index}>
+                <dt>{windDirectionForRule(rule)?.label ?? `${rule.startDegrees}°–${rule.endDegrees}°`}</dt>
+                <dd>{rule.route}</dd>
+              </div>)}</dl>
+            </details>}
+          </div>
         </div>
         <div className={`task-policy-row ${manualConfirmation ? 'is-warning' : 'is-active'}`} role="row">
           <span className="task-policy-key" role="rowheader">起飞执行方式</span>
           <strong className="task-policy-value" role="cell">{executionValue}</strong>
           <small className="task-policy-detail" role="cell">{executionDetail}</small>
-          <span aria-hidden="true" />
         </div>
         <div className="task-policy-row" role="row">
           <span className="task-policy-key" role="rowheader">触发条件</span>
           <strong className="task-policy-value" role="cell">K⁺ &gt; {format(settings.potassiumThreshold)} 或 PM2.5 &gt; {format(settings.pm25Threshold)} μg/m³</strong>
           <small className="task-policy-detail" role="cell">任一指标超过阈值后填写巡查计划</small>
-          <span aria-hidden="true" />
         </div>
         <div className="task-policy-row" role="row">
-          <span className="task-policy-key" role="rowheader">天气门控</span>
-          <strong className="task-policy-value" role="cell">天气通过后执行</strong>
-          <small className="task-policy-detail" role="cell">天气不通过时不会自动起飞</small>
-          <span aria-hidden="true" />
+          <span className="task-policy-key" role="rowheader">天气用途</span>
+          <strong className="task-policy-value" role="cell">记录天气与风向选线</strong>
+          <small className="task-policy-detail" role="cell">是否允许起飞由大疆后台决定</small>
         </div>
         <div className="task-policy-row" role="row">
           <span className="task-policy-key" role="rowheader">禁飞时段</span>
           <strong className="task-policy-value" role="cell">{noFlySummary}</strong>
           <small className="task-policy-detail" role="cell">禁飞时段内仅记录，不发起起飞</small>
-          <span aria-hidden="true" />
         </div>
       </div>
-      <div className="task-policy-note"><span aria-hidden="true">i</span><p>{manualConfirmation ? '执行流程：K⁺ 或 PM2.5 超过阈值 → 填写巡查计划 → 工作人员确认 → 执行起飞。' : `执行流程：K⁺ 或 PM2.5 超过阈值 → 填写巡查计划 → 延迟 ${settings.takeoffDelayMinutes} 分钟 → 自动起飞。`} 天气不通过或处于禁飞时段时不会自动起飞。</p></div>
-      <DroneStatus data={data} ready={flightReady} started={started} busy={busy} action={action} onFlight={onFlight} onAir={onAir} reportGenerating={reportGenerating} />
+      <div className="task-policy-note"><span aria-hidden="true">i</span><p>{manualConfirmation ? '执行流程：K⁺ 或 PM2.5 超过阈值 → 填写巡查计划 → 工作人员确认 → 执行起飞。' : `执行流程：K⁺ 或 PM2.5 超过阈值 → 填写巡查计划 → 延迟 ${settings.takeoffDelayMinutes} 分钟 → 自动起飞。`} 天气用于任务记录和风向选线，是否允许起飞由大疆后台决定；禁飞时段不提交起飞请求。</p></div>
+      <DroneStatus data={data} ready={flightReady} started={started} busy={busy} action={action} onFlight={onFlight} />
       {pending && plan && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>{plan.sourceHour && <p>绑定小时数据：{plan.sourceHour.slice(0, 16)}（北京时间）</p>}
         {plan.status === 'uncertain' && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
       </div>}
@@ -238,10 +242,9 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
         {plan.statusCheckError && <p>司空核查：{plan.statusCheckError}</p>}
         {plan.status === 'uncertain' && <p>手动刷新后，若司空仍未识别到任务状态，将保留历史记录并恢复起飞入口；再次起飞前请核对平台任务。</p>}
       </div>}
-      {!!records.length && <details className="task-records"><summary>最近巡查记录（{records.length}）</summary><ul>{records.map(record => <li key={record.id}><strong>{record.observedAt.slice(0, 16)}{record.resolvedAt ? ' · 已结束处理' : ''} · {record.status === 'restricted' ? '禁飞时间 · 仅记录' : record.status === 'failed' ? '起飞未完成 · 待人工核验' : record.status === 'completed' ? '巡飞已结束' : record.status === 'uncertain' ? '起飞结果未确认 · 历史记录' : record.status === 'flight_error' ? '执飞异常' : record.status === 'not_flown' ? '未起飞' : record.status === 'canceled' ? '任务已取消' : '历史任务'}</strong><p>{record.name}{record.potassium != null ? ` · K⁺ ${format(record.potassium)} μg/m³` : ''}{record.pm25 != null ? ` · PM2.5 ${format(record.pm25)} μg/m³` : ''}</p>{record.sourceHour && <p>绑定小时数据：{record.sourceHour.slice(0, 16)}（北京时间）</p>}{record.status === 'restricted' ? <p>{record.error}</p> : record.error && <details><summary>查看原始回执</summary><p>{record.error}</p></details>}{record.statusCheckError && <p>司空核查：{record.statusCheckError}</p>}</li>)}</ul></details>}
     </section>
     <section className="data-card"><div className="chart-toolbar"><h3>小时变化趋势</h3><div className="button-row"><RangePicker value={range} onChange={setRange} /><div className="view-switcher-buttons" role="group" aria-label="数据展示方式"><button className={viewMode === 'chart' ? 'active' : ''} aria-pressed={viewMode === 'chart'} onClick={() => setViewMode('chart')}>图表</button><button className={viewMode === 'table' ? 'active' : ''} aria-pressed={viewMode === 'table'} onClick={() => setViewMode('table')}>表格</button></div></div></div>
-    {!rows.length ? <div className="empty-state"><h3>暂无数据</h3><p>环境就绪后将自动读取首批数据。</p><button className="secondary-button" onClick={onPrepare}>查看运行状态</button></div> : viewMode === 'chart' ? <MonitoringChart rows={rows} settings={settings} /> : <div className="hourly-table-wrap"><table className="hourly-table"><thead><tr><th>数据时间</th><th>K⁺（μg/m³）</th><th>PM2.5（μg/m³）</th></tr></thead><tbody>{rows.map(row => <tr key={row.time}><td>{row.time.slice(0,16)}</td><td className={row.potassium != null && row.potassium > settings.potassiumThreshold ? 'missing-value' : ''}>{format(row.potassium)}</td><td>{format(row.pm25)}</td></tr>)}</tbody></table></div>}
+    {!rows.length ? <div className="empty-state"><h3>暂无数据</h3><p>环境就绪后将自动读取首批数据。</p><button className="secondary-button" onClick={onPrepare}>重新检查环境</button></div> : viewMode === 'chart' ? <MonitoringChart rows={rows} settings={settings} /> : <div className="hourly-table-wrap"><table className="hourly-table"><thead><tr><th>数据时间</th><th>K⁺（μg/m³）</th><th>PM2.5（μg/m³）</th></tr></thead><tbody>{rows.map(row => <tr key={row.time}><td>{row.time.slice(0,16)}</td><td className={row.potassium != null && row.potassium > settings.potassiumThreshold ? 'missing-value' : ''}>{format(row.potassium)}</td><td>{format(row.pm25)}</td></tr>)}</tbody></table></div>}
     </section>
   </div>;
 }

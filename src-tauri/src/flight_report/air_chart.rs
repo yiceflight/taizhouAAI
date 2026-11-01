@@ -77,7 +77,7 @@ mod tests {
         assert!(super::super::validate(&changed, i64::MAX).is_err());
     }
     #[test]
-    fn screenshot_is_embedded_after_table_and_archived_without_changing_statistics() {
+    fn screenshot_is_archived_without_adding_content_to_fixed_template() {
         let data = sample();
         let png = super::super::tests::PNG;
         let root = std::env::temp_dir().join(format!("air-chart-test-{}", Uuid::new_v4()));
@@ -86,12 +86,11 @@ mod tests {
         let dir = Path::new(&saved.path).parent().unwrap();
         let archived = fs::read(dir.join("airins-pm25-chart.png")).unwrap();
         let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&saved.path).unwrap())).unwrap();
-        let mut image = vec![]; zip.by_name("word/media/airins-pm25-chart.png").unwrap().read_to_end(&mut image).unwrap();
-        assert_eq!(image, archived);
+        assert!(!archived.is_empty());
+        assert!(zip.by_name("word/media/airins-pm25-chart.png").is_err());
         let mut doc = String::new();zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
-        let pos = doc.find("rIdFlight21000").unwrap();
-        assert!(pos > doc.find("最高值").unwrap() && pos < doc.find("实际执飞时段内PM2.5最高值").unwrap());
-        assert!(doc.contains("平台原图截图") && doc.contains("48.0 μg/m³"));
+        assert!(doc.contains("最高值") && doc.contains("48.0"));
+        assert!(!doc.contains("平台原图截图"));
         fs::remove_dir_all(root).unwrap();
     }
 }

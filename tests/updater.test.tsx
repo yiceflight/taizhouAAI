@@ -17,6 +17,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.stubEnv('PROD', true);
   const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
+  window.HTMLElement.prototype.showModal = function () { this.setAttribute('open', ''); };
+  window.HTMLElement.prototype.close = function () { this.removeAttribute('open'); };
   vi.stubGlobal('window', window);
   vi.stubGlobal('document', window.document);
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -70,7 +72,7 @@ it('retries immediately when connectivity returns and skips overlapping requests
   expect(api.check).toHaveBeenCalledTimes(2);
 });
 
-it('offers an update automatically but waits for the user to install it', async () => {
+it('opens a mandatory update dialog automatically and waits for the user to install it', async () => {
   const install = vi.fn();
   const close = vi.fn().mockResolvedValue(undefined);
   api.check.mockResolvedValue({ currentVersion: '0.2.0', latestVersion: '0.2.2', releaseNotes: [], install, close });
@@ -78,6 +80,11 @@ it('offers an update automatically but waits for the user to install it', async 
   const updateButton = document.querySelector<HTMLButtonElement>('.update-install');
   expect(updateButton?.textContent).toContain('有新版本 v0.2.2，下载并重启');
   expect(updateButton?.disabled).toBe(false);
+  expect(document.querySelector('dialog[open]')?.getAttribute('aria-modal')).toBe('true');
+  const cancel = new window.Event('cancel', { cancelable: true });
+  await act(async () => { document.querySelector('dialog')!.dispatchEvent(cancel); });
+  expect(cancel.defaultPrevented).toBe(true);
+  expect(document.querySelector('dialog[open]')).not.toBeNull();
   await event('online');
   await advance(6 * 60 * 60_000);
   expect(api.check).toHaveBeenCalledTimes(1);
@@ -132,4 +139,29 @@ it('does not contact update services before the native environment is known', as
   await advance(6 * 60 * 60_000);
   expect(api.check).not.toHaveBeenCalled();
   expect(document.querySelector<HTMLButtonElement>('.update-action')?.disabled).toBe(true);
+});
+
+
+it('keeps the update gate open on failure, shows progress and allows retry without duplicate downloads', async () => {
+  let fail!: (error: Error) => void;
+  const install = vi.fn().mockImplementationOnce((progress) => {
+    progress({ phase: 'downloading', downloadedBytes: 50, totalBytes: 100 });
+    return new Promise((_, reject) => { fail = reject; });
+  }).mockImplementationOnce(async progress => { progress({ phase: 'installing' }); });
+  api.check.mockResolvedValue({ latestVersion: '0.3.0', releaseNotes: ['改进连接检查'], install, close: vi.fn().mockResolvedValue(undefined) });
+  await mount();
+  const clickInstall = async () => { await act(async () => { document.querySelector<HTMLButtonElement>('.update-install')!.click(); }); };
+  await clickInstall();
+  expect(document.querySelector('progress')?.getAttribute('value')).toBe('50');
+  expect(document.querySelector<HTMLButtonElement>('.update-install')?.disabled).toBe(true);
+  await clickInstall();
+  expect(install).toHaveBeenCalledTimes(1);
+  await act(async () => fail(new Error('sensitive network details')));
+  expect(document.querySelector('dialog[open]')).not.toBeNull();
+  expect(document.body.textContent).toContain('重试更新');
+  expect(document.body.textContent).not.toContain('sensitive network details');
+  await clickInstall();
+  expect(install).toHaveBeenCalledTimes(2);
+  expect(document.body.textContent).toContain('安装并重启中');
+  expect(document.querySelector<HTMLButtonElement>('.update-install')?.disabled).toBe(true);
 });

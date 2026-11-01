@@ -181,6 +181,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(runtime_log::RuntimeLog::default())
         .manage(bridge::Bridge::default())
+        .manage(data_reset::DataAccess::default())
         .manage(monitoring::Monitor::default())
         .manage(flight::Flight::default())
         .manage(readiness::Readiness::default())
@@ -246,15 +247,12 @@ pub fn run() {
             monitoring::get_monitoring,
             weather::refresh_weather,
             settings::save_workspace_settings,
-            flight::list_flight_routes,
             flight::sync_flight_routes,
             flight::set_flight_route,
-            flight::set_flight_delay,
             flight::cancel_flight,
             flight::launch_flight,
             flight::refresh_flight_status,
             flight::prepare_flight,
-            flight::dismiss_flight,
             flight::resolve_flight,
             flight::clear_task_list,
             data_reset::clear_all_data,
@@ -265,10 +263,6 @@ pub fn run() {
             flight_report::list_flight_missions,
             flight_report::list_dji_report_tasks,
             flight_report::sync_dji_report_tasks,
-            flight_report::list_flight_reasons,
-            flight_report::set_flight_reason,
-            flight_weather::list_flight_weather,
-            flight_weather::enrich_flight_weather,
             flight_report::collect_flight_report,
             flight_report::save_flight_report,
             flight_report::list_flight_reports,
@@ -317,7 +311,6 @@ mod bridge_diagnostics;
 mod reports;
 mod updates;
 
-mod flight_weather;
 mod monitoring;
 mod settings;
 

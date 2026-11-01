@@ -109,29 +109,16 @@ describe('manual launch confirmation', () => {
     await act(async () => finish(false));
     expect(button('刷新状态').disabled).toBe(false);
   });
-  it.each(['windSpeed', 'windGusts'] as const)('allows manual force launch when DJI says unsafe (%s)', async field => {
+  it.each(['unsafe', 'caution', 'unknown', 'missing', 'stale'])('delegates %s weather to FlightHub without an override', async state => {
     const d = data(2);
-    d.weather!.allowed = false; d.weather!.level = 'unsafe'; d.weather!.current![field] = 0;
+    if (state === 'missing') d.weather = undefined;
+    else if (state === 'stale') d.weather!.current!.fetchedAt -= 1801;
+    else { d.weather!.allowed = false; d.weather!.level = state as 'unsafe' | 'caution' | 'unknown'; }
     const action = await render(d);
-    expect(button('手动强制起飞').disabled).toBe(false);
-    await click('手动强制起飞');
-    const checkbox = document.querySelector<HTMLInputElement>('.manual-launch-override input')!;
-    await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
-    await click('确认强制起飞');
-    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { weatherOverrideConfirmed: true });
-  });
-  it.each(['windSpeed', 'windGusts'] as const)('keeps a manual override available when DJI changes its verdict (%s)', async field => {
-    const d = data(2);
-    d.weather!.allowed = false; d.weather!.level = 'caution'; d.weather!.current![field] = 11.99;
-    const action = await render(d); await click('手动强制起飞');
-    const checkbox = document.querySelector<HTMLInputElement>('.manual-launch-override input')!;
-    await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
-    expect(button('确认强制起飞').disabled).toBe(false);
-    d.weather!.current![field] = 12; d.weather!.level = 'unsafe'; await render(d, action);
-    expect(button('确认强制起飞').disabled).toBe(false);
-    expect(document.querySelector('.manual-launch-override')).not.toBeNull();
-    await click('确认强制起飞');
-    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { weatherOverrideConfirmed: true });
+    expect(button('立即执行任务').disabled).toBe(false);
+    await click('立即执行任务');
+    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight');
+    expect(document.querySelector('.manual-launch-override')).toBeNull();
   });
   it('blocks a manual launch when its open confirmation crosses into a no-fly period', async () => {
     const at=Date.parse('2026-10-09T04:59:00+08:00'); vi.setSystemTime(at);
@@ -149,7 +136,7 @@ describe('manual launch confirmation', () => {
     const d=data();
     d.flight.event={id:'active-task',observedAt:'',potassium:2,name:'原任务',status:'flying',error:null,preview:false,source:'auto'};
     const action=await render(d);
-    expect(document.querySelector('.drone-status-copy')?.textContent).toContain('正在执飞');
+    expect(document.querySelector('.drone-status-copy')?.textContent).toContain('任务执行中');
     d.flight.event={...d.flight.event,status:'completed'};await render(d,action);
     expect(document.querySelector('.drone-status-copy')).toBeNull();
     expect(button('立即执行任务').disabled).toBe(false);
@@ -206,52 +193,35 @@ describe('manual launch confirmation', () => {
     expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight');
     expect(document.querySelector('dialog')).toBeNull();
   });
-  it('blocks confirmation when readiness, weather, or task state changes', async () => {
+  it('blocks confirmation when readiness or task state changes', async () => {
     const d = data(); const action = await render(d);
     await click('立即执行任务');
     await render(d, action, false);
     expect(button('确认执行任务').hasAttribute('disabled')).toBe(true);
     await click('确认执行任务');
-    d.weather!.allowed = false; await render(d, action);
-    expect(button('确认强制起飞').hasAttribute('disabled')).toBe(true);
-    await click('确认强制起飞');
-    d.weather!.allowed = true;
     d.flight.event = { id: 'another-task', observedAt: '', potassium: 2, name: '巡飞任务', status: 'preparing', error: null, preview: false };
     await render(d, action);
     expect(document.querySelector('dialog')).toBeNull();
     expect(action).not.toHaveBeenCalled();
   });
-  it('expires weather while the dialog is open', async () => {
+  it('does not block an open confirmation when weather expires', async () => {
     const action = await render(data());
     await click('立即执行任务');
-    await act(async () => vi.advanceTimersByTime(601000));
-    expect(button('确认强制起飞').hasAttribute('disabled')).toBe(true);
-    expect(document.querySelector('dialog')?.textContent).toContain('气象数据不可用');
-    await click('确认强制起飞');
-    expect(action).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTime(1801000));
+    expect(button('确认执行任务').disabled).toBe(false);
+    await click('确认执行任务');
+    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight');
   });
-  it('exposes a failed weather task and requires on-site confirmation before a single manual override', async () => {
+  it('keeps a failed task receipt and retries without a weather override', async () => {
     const d = data(2);
-    d.weather!.allowed = false; d.weather!.level = 'caution'; d.weather!.current!.windGusts = 7; d.weather!.reasons = ['阵风 7.0 m/s，需人工确认并现场复核'];
-    d.flight.event = { id: 'failed-auto', observedAt: '', potassium: 2, name: '原自动任务', status: 'failed', error: '天气条件未通过', preview: false, source: 'auto' };
+    d.weather!.allowed = false; d.weather!.level = 'unsafe';
+    d.flight.event = { id: 'failed-auto', observedAt: '', potassium: 2, name: '原自动任务', status: 'failed', error: '天气读取超时', preview: false, source: 'auto' };
     const action = await render(d);
-    expect(button('手动强制起飞').hasAttribute('disabled')).toBe(false);
-    await click('手动强制起飞');
-    expect(action).not.toHaveBeenCalled();
-    expect(document.querySelector('dialog')?.textContent).toContain('阵风 7.0 m/s');
-    expect(button('确认强制起飞').hasAttribute('disabled')).toBe(true);
-    await click('确认强制起飞');
-    expect(action).not.toHaveBeenCalled();
-    const checkbox = document.querySelector<HTMLInputElement>('.manual-launch-override input')!;
-    await act(async () => { checkbox.checked = true; checkbox.dispatchEvent(new window.Event('click', { bubbles: true })); });
-    expect(button('确认强制起飞').hasAttribute('disabled')).toBe(false);
-    await click('确认强制起飞');
-    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { retryEventId: 'failed-auto', weatherOverrideConfirmed: true });
-    expect(action).not.toHaveBeenCalledWith('dismiss_flight', expect.anything());
-    expect(document.querySelector('dialog')).toBeNull();
-    // The next attempt requires another confirmation, even with the same weather.
-    d.flight.event = null; await render(d, action); await click('手动强制起飞');
-    expect(button('确认强制起飞').hasAttribute('disabled')).toBe(true);
+    await click('重新发起任务');
+    expect(document.querySelector('dialog')?.textContent).toContain('天气读取超时');
+    expect(document.querySelector('dialog')?.textContent).toContain('是否允许起飞由大疆后台决定');
+    await click('确认执行任务');
+    expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight', { retryEventId: 'failed-auto' });
   });
   it('restarts a failed task without a weather override after the weather recovers', async () => {
     const d = data(2);
@@ -291,4 +261,27 @@ describe('manual launch confirmation', () => {
     expect(document.querySelector('dialog')).toBeNull();
     expect(action).not.toHaveBeenCalled();
   });
+});
+
+it('allows default-route launch with no rules regardless of the legacy mode', async () => {
+  const d = data();
+  d.settings.routeSelectionMode = 'wind';
+  d.settings.windRouteRules = [];
+  d.weather!.current!.windDirection = null;
+  const action = await render(d);
+  expect(button('立即执行任务').disabled).toBe(false);
+  await click('立即执行任务');
+  expect(action).not.toHaveBeenCalled();
+  await click('确认执行任务');
+  expect(action).toHaveBeenCalledExactlyOnceWith('launch_flight');
+});
+it('requires a default route even when wind rules exist', async () => {
+  const d = data();
+  d.settings.routeSelectionMode = 'fixed';
+  d.settings.windRouteRules = [{startDegrees:22.5,endDegrees:67.5,route:'测试航线'}];
+  d.flight.routes = [{routeId:'r1',name:'测试航线'}];
+  d.flight.selectedRoute = undefined;
+  const action = await render(d);
+  expect(button('立即执行任务').disabled).toBe(true);
+  expect(action).not.toHaveBeenCalled();
 });

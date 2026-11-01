@@ -93,6 +93,8 @@ pub struct Media {
     pub file_pages: HashMap<String, usize>,
     #[serde(default)]
     pub no_media: bool,
+    #[serde(default)]
+    pub root_folder_id: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +108,8 @@ pub struct Photo {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Collected {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_generation: Option<u64>,
     #[serde(default)]
     pub evidence: Option<Evidence>,
     #[serde(default)]
@@ -168,6 +172,7 @@ pub struct Summary {
     #[serde(default)]
     pub media_url: String,
 }
+#[cfg(test)]
 const REASONS: &[&str] = &[
     "dji_scheduled",
     "potassium_manual",
@@ -191,6 +196,7 @@ fn list_reasons(db: &rusqlite::Connection) -> Result<HashMap<String, String>, St
     .collect()
 }
 
+#[cfg(test)]
 fn set_reason(db: &rusqlite::Connection, mission_id: u64, reason: &str) -> Result<(), String> {
     if mission_id == 0
         || mission_id > i64::MAX as u64
@@ -214,19 +220,6 @@ fn set_reason(db: &rusqlite::Connection, mission_id: u64, reason: &str) -> Resul
     Ok(())
 }
 
-#[tauri::command]
-pub fn list_flight_reasons(app: tauri::AppHandle) -> Result<HashMap<String, String>, String> {
-    list_reasons(&database(&app)?)
-}
-
-#[tauri::command]
-pub fn set_flight_reason(
-    app: tauri::AppHandle,
-    mission_id: u64,
-    reason: String,
-) -> Result<(), String> {
-    set_reason(&database(&app)?, mission_id, &reason)
-}
 #[derive(Debug)]
 struct Stats {
     max: f64,
@@ -359,7 +352,8 @@ fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     {
         return Err("PM2.5 单位不符或采样数据不完整。".into());
     }
-    if (!data.media.no_media && !data.media.folder.trim_end().ends_with("Immediate-Media"))
+    if (!data.media.no_media && !data.media.folder.trim_end().ends_with("Immediate-Media")
+        && !data.media.root_folder_id.is_some_and(|id| id > 0 && data.media.url.split('?').nth(1).is_some_and(|q| q.split('&').any(|p| p == format!("pid={id}")))))
         || data.media.files.len() > 200
         || data.photos.len() != data.media.files.len()
     {
@@ -550,6 +544,7 @@ pub async fn list_flight_missions(
     cursor_id: Option<u64>,
     cursor_time: Option<i64>,
 ) -> Result<Value, String> {
+    let _access = crate::data_reset::access(&app)?;
     crate::readiness::require_report(&app)?;
     let v = bridge
         .request(
@@ -603,6 +598,7 @@ fn read_dji_tasks(db: &rusqlite::Connection) -> Result<Vec<DjiTask>, String> {
 }
 #[tauri::command]
 pub fn list_dji_report_tasks(app: tauri::AppHandle) -> Result<Vec<DjiTask>, String> {
+    let _access = crate::data_reset::access(&app)?;
     read_dji_tasks(&database(&app)?)
 }
 #[tauri::command]
@@ -611,7 +607,11 @@ pub async fn sync_dji_report_tasks(
     bridge: tauri::State<'_, Bridge>,
     session: String,
 ) -> Result<Value, String> {
+    let _access = crate::data_reset::access(&app)?;
     crate::readiness::require_report_media(&app)?;
+    // One cursor owner across UI requests, including while awaiting Chrome.
+    static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _sync = SYNC_LOCK.lock().await;
     let cursor: Value = crate::monitoring::setting(&database(&app)?, "dji_report_cursor")?
         .map(|raw| serde_json::from_str(&raw).map_err(|e| format!("司空同步进度损坏：{e}")))
         .transpose()?
@@ -648,6 +648,93 @@ pub async fn sync_dji_report_tasks(
 fn history_scan_due(cursor: &Value, completed: Option<i64>, now: i64) -> bool {
     !cursor.is_null() || completed.is_none_or(|at| !(0..21600).contains(&(now - at)))
 }
+// Persist the IDs seen across leases. Cursor continuity and a stable total
+// are required before absence from a finished scan can remove cached rows.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DjiHistoryScan {
+    total: u64,
+    next_page: u64,
+    keys: HashSet<String>,
+}
+fn scanned_task_keys(
+    db: &rusqlite::Connection,
+    result: &Value,
+    incoming: &HashSet<String>,
+) -> Result<Option<HashSet<String>>, String> {
+    const KEY: &str = "dji_report_scan";
+    let metadata = &result["historyScan"];
+    let complete = result["cursor"].is_null()
+        && result["historyComplete"] == true
+        && result["historyError"].is_null();
+    let total = result["total"].as_u64();
+    let full_batch = complete && total == Some(incoming.len() as u64);
+    if metadata.is_null() {
+        // An older adapter or an interrupted/restarted scan cannot prove
+        // continuity. A complete standalone snapshot remains sufficient.
+        db.execute("DELETE FROM monitor_settings WHERE key=?1", [KEY])
+            .map_err(|e| e.to_string())?;
+        return Ok(full_batch.then(|| incoming.clone()));
+    }
+    let total = total.ok_or("司空历史扫描缺少总数")?;
+    let start = metadata["startPage"]
+        .as_u64()
+        .ok_or("司空历史扫描起点无效")?;
+    let next = metadata["nextPage"]
+        .as_u64()
+        .ok_or("司空历史扫描终点无效")?;
+    let last = total.div_ceil(50).max(1);
+    if metadata["total"].as_u64() != Some(total)
+        || start < 2
+        || start > last + 1
+        || next < start
+        || next > last + 1
+        || next - start > 5
+        || (complete && next != last + 1)
+        || (!result["cursor"].is_null()
+            && (result["cursor"]["page"].as_u64() != Some(next)
+                || result["cursor"]["total"].as_u64() != Some(total)))
+    {
+        return Err("司空历史扫描进度不匹配，未更新缓存".into());
+    }
+    let previous: Option<DjiHistoryScan> =
+        crate::monitoring::setting(db, KEY)?.and_then(|raw| serde_json::from_str(&raw).ok());
+    let mut scan = if start == 2 {
+        Some(DjiHistoryScan {
+            total,
+            next_page: next,
+            keys: HashSet::new(),
+        })
+    } else {
+        previous.filter(|scan| scan.total == total && scan.next_page == start)
+    };
+    if let Some(scan) = &mut scan {
+        scan.keys.extend(incoming.iter().cloned());
+        scan.next_page = next;
+    }
+    // Missing/duplicate records or a changed total never authorize pruning.
+    let authoritative = if full_batch {
+        Some(incoming.clone())
+    } else {
+        scan.as_ref()
+            .filter(|scan| complete && scan.keys.len() as u64 == total)
+            .map(|scan| scan.keys.clone())
+    };
+    if !complete {
+        if let Some(scan) = scan {
+            crate::monitoring::put(
+                db,
+                KEY,
+                &serde_json::to_string(&scan).map_err(|e| e.to_string())?,
+            )?;
+            return Ok(authoritative);
+        }
+    }
+    db.execute("DELETE FROM monitor_settings WHERE key=?1", [KEY])
+        .map_err(|e| e.to_string())?;
+    Ok(authoritative)
+}
+
 fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Value, String> {
     if result["url"].as_str() != Some(&format!("https://fh.dji.com{PROJECT}#/plan")) {
         return Err("司空任务同步来源不匹配".into());
@@ -669,15 +756,6 @@ fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Va
     {
         return Err("司空历史同步进度无效".into());
     }
-    // For a complete single-page response, the platform's list is a full
-    // snapshot. Remove cached executions that 司空 no longer returns so a
-    // deleted/expired platform row cannot remain visible in the app forever.
-    // Larger history sweeps are committed page by page and are reconciled
-    // only when a later full snapshot can prove the complete key set.
-    let full_snapshot = cursor.is_null()
-        && result["historyComplete"] == true
-        && result["historyError"].is_null()
-        && result["total"].as_u64() == Some(incoming.len() as u64);
     let incoming_keys: HashSet<String> = incoming
         .iter()
         .map(|task| {
@@ -689,7 +767,7 @@ fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Va
         .collect();
     read_dji_tasks(db)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
-    if full_snapshot {
+    if let Some(authoritative) = scanned_task_keys(&tx, result, &incoming_keys)? {
         let mut statement = tx
             .prepare("SELECT task_key FROM dji_report_tasks")
             .map_err(|e| e.to_string())?;
@@ -700,7 +778,7 @@ fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Va
             .map_err(|e| e.to_string())?;
         drop(statement);
         for key in existing {
-            if !incoming_keys.contains(&key) {
+            if !authoritative.contains(&key) {
                 tx.execute("DELETE FROM dji_report_tasks WHERE task_key=?1", [key])
                     .map_err(|e| e.to_string())?;
             }
@@ -751,6 +829,7 @@ fn persist_dji_tasks(db: &mut rusqlite::Connection, result: &Value) -> Result<Va
         tx.execute("INSERT INTO dji_report_tasks(task_key,payload) VALUES (?1,?2) ON CONFLICT(task_key) DO UPDATE SET payload=excluded.payload",
             params![key, serde_json::to_string(&task).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
     }
+    crate::flight::reconcile_ended_tasks(&tx, &read_dji_tasks(&tx)?)?;
     // Commit the progress with the records; failed writes replay the same page.
     crate::monitoring::put(&tx, "dji_report_cursor", &cursor.to_string())?;
     if cursor.is_null() && result["historyComplete"] == true && result["historyError"].is_null() {
@@ -774,6 +853,7 @@ pub async fn collect_flight_report(
     bridge: tauri::State<'_, Bridge>,
     request: CollectRequest,
 ) -> Result<Collected, String> {
+    let access = crate::data_reset::access(&app)?;
     crate::runtime_log::record(
         &app,
         "info",
@@ -816,7 +896,7 @@ pub async fn collect_flight_report(
                 && task.mission.start_time == req.mission.start_time && task.mission.end_time == req.mission.end_time) {
                 return Err("司空尚未确认本航次无媒体文件".into());
             }
-            Media { url: format!("https://fh.dji.com{PROJECT}#/plan"), folder: "司空计划：无媒体文件".into(), files: vec![], file_pages: HashMap::new(), no_media: true }
+            Media { url: format!("https://fh.dji.com{PROJECT}#/plan"), folder: "司空计划：无媒体文件".into(), files: vec![], file_pages: HashMap::new(), no_media: true, root_folder_id: None }
         } else {
             let media_key = media_key(&req);
             let known = read_dji_tasks(&database(&app)?)?;
@@ -840,6 +920,9 @@ pub async fn collect_flight_report(
             let media: Media = serde_json::from_value(media_value)
                 .map_err(|e| format!("司空格式错误：{e}"))?;
             source(&media.url, true)?;
+            if media.root_folder_id.is_some() && media.root_folder_id != folder_id {
+                return Err("司空根目录照片回执与任务目录不匹配".into());
+            }
             media
         };
         if !req.without_air_data { source(&air.url, false)?; }
@@ -854,7 +937,7 @@ pub async fn collect_flight_report(
                 .request(
                     req.dji_session.clone(),
                     req.dji_tab_id,
-                    json!({"type":"flight-dji-image","name":name,"page":media.file_pages.get(name),"mediaKey":media_key,"closeAfter":index + 1 == media.files.len()}),
+                    json!({"type":"flight-dji-image","name":name,"page":media.file_pages.get(name),"mediaKey":media_key,"closeAfter":index + 1 == media.files.len(),"rootFolderId":media.root_folder_id}),
                 )
                 .await?;
             if !same_media_folder(v["url"].as_str().unwrap_or_default(), &media.url) || v["folder"] != media.folder || v["name"] != *name {
@@ -865,6 +948,7 @@ pub async fn collect_flight_report(
             photos.push(photo);
         }
         let data = Collected {
+            data_generation: Some(*access),
             evidence: None,
             without_air_data: req.without_air_data,
             local_event_id: req.local_event_id,
@@ -1028,18 +1112,6 @@ fn build_docx(
         ..Default::default()
     };
     let evidence = data.evidence.as_ref().unwrap_or(&fallback);
-    let reviewed = facts
-        .iter()
-        .filter(|f| evidence.reviews.contains_key(&f.hash))
-        .count();
-    let visible = facts
-        .iter()
-        .filter(|f| f.image_type.starts_with("可见光"))
-        .count();
-    let infrared = facts
-        .iter()
-        .filter(|f| f.image_type == "红外热成像")
-        .count();
     let count = photos.len().to_string();
     let blank = "【 】".to_owned();
     let mut fields = vec![
@@ -1058,55 +1130,32 @@ fn build_docx(
         ("PHOTO_COUNT", count.clone()),
         ("TOTAL0_1", "本航次".into()),
         ("TOTAL0_2", table_window.clone()),
-        ("TOTAL0_3", "范围待核实".into()),
+        ("TOTAL0_3", blank.clone()),
         ("TOTAL0_4", format!("{count}张")),
-        (
-            "TOTAL0_5",
-            if reviewed > 0 {
-                "见表2初判".into()
-            } else {
-                "待判读".into()
-            },
-        ),
-        (
-            "TOTAL1_1",
-            match (photos.first(), photos.last()) {
-                (Some(a), Some(b)) => format!(
-                    "{}～{}",
-                    date(photo_time(&a.name)?, "%m-%d %H:%M"),
-                    date(photo_time(&b.name)?, "%m-%d %H:%M")
-                ),
-                _ => blank.clone(),
-            },
-        ),
-        ("TOTAL1_2", "本航次抓拍点".into()),
-        ("TOTAL1_3", "—".into()),
-        ("TOTAL1_4", format!("可见光{visible}张，红外{infrared}张")),
-        ("TOTAL1_5", format!("共{count}张")),
-        ("TOTAL1_6", format!("已初判{reviewed}张，待复核")),
+        ("TOTAL0_5", blank.clone()),
+        ("TOTAL1_1", blank.clone()),
+        ("TOTAL1_2", blank.clone()),
+        ("TOTAL1_3", blank.clone()),
+        ("TOTAL1_4", blank.clone()),
+        ("TOTAL1_5", format!("{count}张")),
+        ("TOTAL1_6", blank.clone()),
     ];
     fields.extend(evidence.city_fields());
-    fields.push((
-        "TRIGGER",
-        if evidence.trigger.is_empty() {
-            "触发原因待核实".into()
-        } else {
-            evidence.trigger.clone()
-        },
-    ));
-    fields.push(("PHOTO_REVIEW_SUMMARY",format!("含可见光{visible}张、红外{infrared}张；{}异常事件数量尚未经现场核实。表中坐标为照片EXIF记录的WGS-84拍摄位置，不是污染源坐标",if reviewed>0 {format!("已完成{reviewed}张影像的AI辅助初判，结果需人工复核；")}else{"尚未完成影像判读；".into()})));
+    let editorial = |value: &str| if value.trim().is_empty() { blank.clone() } else { value.to_owned() };
+    fields.push(("TRIGGER", if evidence.trigger.starts_with("由司空平台执行") || evidence.trigger == "触发原因待核实" { blank.clone() } else { editorial(&evidence.trigger) }));
+    fields.push(("REVIEW_METHOD", editorial(&evidence.review_method)));
+    fields.push(("ANOMALY_COUNT", evidence.anomaly_count.map(|n|n.to_string()).unwrap_or_else(||blank.clone())));
     // A flight execution is a task/route, never one row per photograph.
     let execution = vec![vec![
         "1".into(),
         evidence.dji_task.as_ref().and_then(|t| t.route_name.clone())
-            .filter(|v| !v.is_empty()).unwrap_or_else(|| m.mission_name.clone()),
+            .filter(|v| !v.is_empty()).unwrap_or_else(|| blank.clone()),
         table_window.clone(),
-        evidence.dji_task.as_ref().map(|t| format!("{}；覆盖范围待轨迹核实", t.status))
-            .unwrap_or_else(|| "覆盖范围待核实".into()),
-        format!("照片{count}张"),
-        if reviewed > 0 { "见表2初判".into() } else { "待判读".into() },
+        blank.clone(),
+        format!("{count}张"),
+        blank.clone(),
     ]];
-    fill_table(&mut doc, 0, &execution)?;
+
     let rows: Vec<_> = photos
         .iter()
         .zip(&facts)
@@ -1115,7 +1164,7 @@ fn build_docx(
             Ok(vec![
                 (i + 1).to_string(),
                 date(photo_time(&p.name)?, "%m-%d %H:%M:%S"),
-                format!("抓拍点{}", i + 1),
+                evidence.reviews.get(&f.hash).map(|r|editorial(&r.location)).unwrap_or_else(||blank.clone()),
                 match (f.longitude, f.latitude) {
                     (Some(lon), Some(lat)) => format!(
                         "{:.6}°{} / {:.6}°{}",
@@ -1124,35 +1173,22 @@ fn build_docx(
                         lat.abs(),
                         if lat < 0.0 { "S" } else { "N" }
                     ),
-                    _ => "照片无有效GPS".into(),
+                    _ => blank.clone(),
                 },
-                f.image_type.clone(),
+                if f.image_type == "影像类型未取得" { blank.clone() } else { f.image_type.clone() },
                 evidence
                     .reviews
                     .get(&f.hash)
                     .map(|r| r.description.clone())
-                    .unwrap_or_else(|| {
-                        f.relative_height
-                            .map(|h| format!("相对高度{h:.2}米；场景待判读"))
-                            .unwrap_or_else(|| "场景待判读".into())
-                    }),
+                    .map(|v| editorial(&v)).unwrap_or_else(|| blank.clone()),
                 evidence
                     .reviews
                     .get(&f.hash)
                     .map(|r| r.result.clone())
-                    .unwrap_or_else(|| "未判读".into()),
+                    .map(|v| editorial(&v)).unwrap_or_else(|| blank.clone()),
             ])
         })
         .collect::<Result<_, String>>()?;
-    fill_table(
-        &mut doc,
-        1,
-        &if rows.is_empty() {
-            vec![vec!["未取得".into(); 7]]
-        } else {
-            rows
-        },
-    )?;
     // Summarize all valid values inside the actual flight window, including
     // low and zero readings. Full source arrays remain unchanged for audit.
     let air_rows = if let Some(s) = &stats {
@@ -1163,33 +1199,13 @@ fn build_docx(
                 s.count.to_string(),
                 format!("{:.1}", if maximum { s.max } else { s.mean }),
             ];
-            row.extend(["pm10", "so2", "no2", "co", "o3"].map(|name| channel_stat(data, name, maximum)));
+            row.extend(["pm10", "so2", "no2", "co", "o3"].map(|name| { let value = channel_stat(data, name, maximum); if value == "未取得" || value == "缺测" { blank.clone() } else { value } }));
             row
         }).collect()
     } else { vec![vec![blank.clone(); 9]; 2] };
-    fill_table(&mut doc, 2, &air_rows)?;
-    let warning = if stats.as_ref().is_some_and(|s| s.max == 0.0) {
-        "本航次 PM2.5 有效数值全部为 0，请核查传感器状态；不能据此判断空气质量良好。"
-    } else { "" };
-    fields.push(("AIR_INTRO", if data.without_air_data { String::new() } else {
-        let s = stats.as_ref().unwrap();
-        format!("统计时段为{flight_window}（北京时间，含起止时刻），共{}条记录，其中PM2.5有效{}条、缺测{}条。各参数分别计算最高值和算术平均值，包含零值，缺测不补0；各参数峰值未必同刻，有效点数可能不同。时段外数据不参与统计，完整采样另行归档。气体浓度按可飞平台口径换算。", s.count+s.missing, s.count, s.missing)
-    }));
-    let sampling_summary = stats.as_ref().map(|s| format!("实际执飞时段内PM2.5最高值{:.1} μg/m³，平均值{:.1} μg/m³；有效采样{}点、缺测{}点，最高值首次出现时间{}（北京时间）。{}", s.max, s.mean, s.count, s.missing, date(s.peak_time, "%m-%d %H:%M:%S"), warning)).unwrap_or_default();
-    fields.push(("CONCLUSION", if !evidence.conclusion.is_empty() {
-        format!("{}{}", evidence.conclusion, sampling_summary)
-    } else if stats.is_some() {
-        format!("本次巡航抓拍图片{count}张，影像异常及污染成因待判读、核实。{sampling_summary}")
-    } else { blank.clone() }));
-    // Use only explicit, flight-bound editorial input for recommendations.
-    fields.push((
-        "RECOMMENDATION",
-        if evidence.recommendation.is_empty() {
-            blank.clone()
-        } else {
-            evidence.recommendation.clone()
-        },
-    ));
+
+    fields.push(("CONCLUSION", editorial(&evidence.conclusion)));
+    fields.push(("RECOMMENDATION", editorial(&evidence.recommendation)));
     let mut rels = String::from_utf8(
         parts
             .remove("word/_rels/document.xml.rels")
@@ -1198,7 +1214,7 @@ fn build_docx(
     .map_err(|e| e.to_string())?;
     let mut types = String::from_utf8(parts.remove("[Content_Types].xml").ok_or("模板类型缺失")?)
         .map_err(|e| e.to_string())?;
-    let photo_xml = caption_for("现场照片按抓拍组列入附件1，区县、街道、火点数量及面积待现场核实。".into())?;
+    let mut photo_xml = String::new();
     let mut table_images = HashMap::new();
     let mut section_xml = String::new();
     for (i, p) in photos.iter().enumerate() {
@@ -1215,7 +1231,7 @@ fn build_docx(
             );
         }
         let scale = (5500000.0 / width as f64).min(3200000.0 / height as f64);
-        let cell_scale = (1000000.0 / width as f64).min(900000.0 / height as f64);
+        let cell_scale = (2400000.0 / width as f64).min(2000000.0 / height as f64);
         let cell_image = image_xml(
             id,
             (width as f64 * cell_scale) as i64,
@@ -1243,32 +1259,18 @@ fn build_docx(
         }
     }
     let groups = issue_groups(&data.media.files)?;
-    let mut finding_rows = Vec::new();
-    let mut finding_images = Vec::new();
     for (group_index, group) in groups.iter().enumerate() {
-        let mut descriptions = Vec::new();
-        let mut images = String::from("<w:p><w:pPr><w:jc w:val=\"center\"/><w:snapToGrid w:val=\"0\"/><w:spacing w:before=\"40\" w:after=\"40\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>");
-        let mut group_photos: Vec<_> = group.iter().collect();
-        group_photos.sort_by_key(|name| photos.iter().position(|p| &p.name == *name));
-        for (image_index, name) in group_photos.into_iter().enumerate() {
-            let i = photos.iter().position(|p| &p.name == name).ok_or("现场照片对应关系缺失")?;
-            let f = &facts[i];
-            let description = evidence.reviews.get(&f.hash)
-                .map(|r| r.description.clone())
-                .unwrap_or_else(|| "场景待判读".into());
-            descriptions.push(format!("表2序号{}（{}）：{}", i + 1, date(photo_time(name)?, "%H:%M:%S"), description));
-            if image_index > 0 {
-                images.push_str(if image_index % 2 == 0 { "<w:r><w:br/></w:r>" } else { "<w:r><w:rPr><w:sz w:val=\"8\"/></w:rPr><w:t xml:space=\"preserve\"> </w:t></w:r>" });
-            }
-            images.push_str(table_images.get(name.as_str()).ok_or("现场照片图形缺失")?);
+        let mut indices: Vec<_> = group.iter().filter_map(|name| photos.iter().position(|p| &p.name == name)).collect();
+        indices.sort_unstable();
+        photo_xml.push_str("<w:p><w:pPr><w:keepNext/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/><w:jc w:val=\"center\"/><w:snapToGrid w:val=\"0\"/><w:spacing w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>");
+        for (j, &i) in indices.iter().enumerate() {
+            if j > 0 { photo_xml.push_str(if j % 2 == 0 {"<w:r><w:br/></w:r>"} else {"<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>"}); }
+            photo_xml.push_str(table_images.get(photos[i].name.as_str()).ok_or("现场照片图形缺失")?);
         }
-        images.push_str("</w:p>");
-        let key = format!("FINDING_PHOTOS_{group_index}");
-        finding_rows.push(vec!["待核实".into(), "待核实".into(), "待核实".into(), descriptions.join("\n"), "待核实".into(), format!("{{{{{key}}}}}")]);
-        finding_images.push((key, images));
+        photo_xml.push_str("</w:p>");
+        photo_xml.push_str(&caption_for(format!("图{}　大疆司空平台抓拍图片（表2序号{}）", group_index+3, indices.iter().map(|i|(i+1).to_string()).collect::<Vec<_>>().join("、")))?);
     }
-    if finding_rows.is_empty() { finding_rows.push(vec![blank.clone(); 6]); }
-    fill_table(&mut doc, 3, &finding_rows)?;
+    if photo_xml.is_empty() { photo_xml = caption_for("【 】".into())?; }
     if let Some(map) = evidence::location_plot(&facts)? {
         parts.insert("word/media/capture-locations.png".into(), map);
         rels=rels.replace("</Relationships>","<Relationship Id=\"rIdFlight20000\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/capture-locations.png\"/></Relationships>");
@@ -1280,40 +1282,40 @@ fn build_docx(
         }
         section_xml.push_str(&image_xml(20000, 5500000, 3575000));
         section_xml.push_str(&caption_for(
-            "图2　抓拍位置分布（WGS-84；数字对应表2序号；离散拍摄点，非完整航迹或目标位置）".into(),
+            "图2　巡航抓拍位置图（编号对应表2序号）".into(),
         )?);
     } else if !photos.is_empty() {
-        section_xml.push_str(&caption_for("图2　位置图未取得（照片无有效GPS）".into())?);
+        section_xml.push_str(&caption_for("图2　巡航抓拍位置图【 】".into())?);
     }
     if photos.is_empty() {
-        section_xml = caption_for("巡航现场照片及对应位置图【待补】".into())?;
+        section_xml = caption_for("巡航现场照片及对应位置图【 】".into())?;
     }
     // Fill global fields before adding user-derived table/figure content; no
     // arbitrary strings are used as XML, and absent fields keep editable blanks.
     // Tables are already filled, so user data containing braces is protected by
     // limiting this pass to the named global slots.
-    for (key, value) in fields {
-        doc = doc.replace(&format!("{{{{{key}}}}}"), &xml(&value));
+    // Preserve structural slots for the later table/image passes. Single pass
+    // prevents an editorial value containing {{...}} from changing another slot.
+    let mut rest = doc.as_str();
+    let mut filled = String::new();
+    while let Some(start) = rest.find("{{") {
+        let end = rest[start+2..].find("}}").ok_or("模板字段未闭合")? + start+4;
+        filled.push_str(&rest[..start]);
+        let key = &rest[start+2..end-2];
+        if let Some((_, value)) = fields.iter().find(|(name,_)|*name==key) {
+            filled.push_str(&xml(value));
+        } else if key.starts_with("T0_") || key.starts_with("T1_") || key.starts_with("T2_") || key == "SECTION_PHOTOS" || key == "PHOTOS" {
+            filled.push_str(&rest[start..end]);
+        } else { return Err(format!("模板字段未填写：{key}")); }
+        rest = &rest[end..];
     }
+    filled.push_str(rest);
+    doc = filled;
+    fill_table(&mut doc, 0, &execution)?;
+    fill_table(&mut doc, 1, &if rows.is_empty() { vec![vec![blank.clone();7]] } else { rows })?;
+    fill_table(&mut doc, 2, &air_rows)?;
     block(&mut doc, "SECTION_PHOTOS", &section_xml)?;
     block(&mut doc, "PHOTOS", &photo_xml)?;
-    let mut air_chart_xml = String::new();
-    if let Some(chart) = &data.air.chart {
-        let (bytes, ext) = decode_image(&chart.data_url)?;
-        let name = format!("media/airins-pm25-chart.{ext}");
-        parts.insert(format!("word/{name}"), bytes);
-        rels = rels.replace("</Relationships>", &format!("<Relationship Id=\"rIdFlight21000\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{name}\"/></Relationships>"));
-        if !types.contains(&format!("Extension=\"{ext}\"")) {
-            types = types.replace("</Types>", &format!("<Default Extension=\"{ext}\" ContentType=\"image/{ext}\"/></Types>"));
-        }
-        let scale = (5500000.0 / chart.width as f64).min(3000000.0 / chart.height as f64);
-        air_chart_xml.push_str(&image_xml(21000, (chart.width as f64 * scale) as i64, (chart.height as f64 * scale) as i64));
-        air_chart_xml.push_str(&caption_for("图3　可飞平台 PM2.5 浓度时间曲线（平台原图截图）".into())?);
-        air_chart_xml.push_str(&caption_for(format!("图示为可飞完整采样时段 {}～{}（北京时间），可能包含实际执飞时段外的数据；表4及结论仍仅统计实际执飞时段。",
-            date(chart.start_time, "%Y-%m-%d %H:%M:%S"), date(chart.end_time, "%Y-%m-%d %H:%M:%S")))?);
-    }
-    block(&mut doc, "AIR_CHART", &air_chart_xml)?;
-    for (key, images) in finding_images { block(&mut doc, &key, &images)?; }
     parts.insert("word/document.xml".into(), doc.into_bytes());
     parts.insert("word/_rels/document.xml.rels".into(), rels.into_bytes());
     parts.insert("[Content_Types].xml".into(), types.into_bytes());
@@ -1423,8 +1425,10 @@ fn persist(
             "rule": "capture-time-span-at-most-3-seconds", "groups": issue_groups(&data.media.files)?
         })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&json!({
+            "templateVersion": "fill-v8",
+            "runtimeTemplateSha256": evidence::digest(TEMPLATE),
             "templateSha256": "e30bc73f8f720df2c150e36a41a10080a3ff871be0be7cd3e9466f09c16c0a32",
-            "generatorVersion": "flight-airins-chart-v7", "statistics": ["maximum", "arithmetic-mean"],
+            "generatorVersion": "flight-template-fill-v8", "statistics": ["maximum", "arithmetic-mean"],
             "airinsChartIncluded": data.air.chart.is_some(),
             "windowStart": data.mission.start_time, "windowEnd": data.mission.end_time,
             "windowInclusive": true, "rawPointCount": data.air.points.len(),
@@ -1486,6 +1490,8 @@ pub async fn save_flight_report(
     charts: [String; 2],
     regenerate: Option<bool>,
 ) -> Result<Summary, String> {
+    let access = crate::data_reset::access(&app)?;
+    crate::data_reset::require_generation(*access, data.data_generation)?;
     crate::runtime_log::record(
         &app,
         "info",
@@ -1509,6 +1515,9 @@ pub async fn save_flight_report(
             Utc::now().timestamp_millis(),
         )?);
         tauri::async_runtime::spawn_blocking(move || {
+            // Cancellation of the caller cannot release the guard while the
+            // blocking writer is still committing files.
+            let _access = access;
             persist(
                 &root,
                 &data,
@@ -1536,6 +1545,7 @@ pub async fn save_flight_report(
 }
 #[tauri::command]
 pub fn list_flight_reports(app: tauri::AppHandle) -> Result<Vec<Summary>, String> {
+    let _access = crate::data_reset::access(&app)?;
     read_summaries(&root(&app)?)
 }
 fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
@@ -1598,6 +1608,7 @@ fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
 }
 #[tauri::command]
 pub fn open_flight_report(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let path = saved_report_path(&root(&app)?, &id)?;
     app.opener()
         .open_path(path.to_str().ok_or("路径无效")?, None::<&str>)
@@ -1605,6 +1616,7 @@ pub fn open_flight_report(app: tauri::AppHandle, id: String) -> Result<(), Strin
 }
 #[tauri::command]
 pub fn open_flight_report_directory(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let path = saved_report_path(&root(&app)?, &id)?;
     if !path.is_file() {
         return Err("Word 报告文件不存在，可能已被移动或删除".into());
@@ -1630,6 +1642,122 @@ fn saved_report_path(root: &Path, id: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_large_sweep_prunes_deleted_tasks() {
+        let mut db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let task = |index: u128| {
+            json!({
+                "taskId": Uuid::from_u128(index).to_string(),
+                "mission":{"missionId":0,"missionName":format!("task-{index}"),"startTime":1790031600000_i64,"endTime":1790032800000_i64,"geoLocation":""},
+                "status":"执行成功","mediaReady":true
+            })
+        };
+        let batch = |rows: Vec<Value>, cursor: Value, complete: bool, total: usize| {
+            json!({
+                "url":format!("https://fh.dji.com{PROJECT}#/plan"),"tasks":rows,"cursor":cursor,"historyComplete":complete,"historyError":null,"total":total,"apiVersion":1,
+                "historyScan":{"total":total,"startPage":if total==301 && complete {7}else{2},"nextPage":if total==301 {if complete {8}else{7}}else{2}}
+            })
+        };
+        persist_dji_tasks(&mut db, &batch(vec![task(999)], Value::Null, true, 1)).unwrap();
+        // A completed 301-row sweep is delivered in two leases: pages 1..6,
+        // followed by refreshed page 1 plus the final page. Old row 999 is gone.
+        persist_dji_tasks(
+            &mut db,
+            &batch(
+                (1..=300).map(task).collect(),
+                json!({"apiVersion":1,"page":7,"total":301}),
+                false,
+                301,
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 301); // Old row retained until completion.
+        assert!(crate::monitoring::setting(&db, "dji_report_scan")
+            .unwrap()
+            .is_some());
+        let mut last: Vec<_> = (1..=50).map(task).collect();
+        last.push(task(301));
+        let progress_before = crate::monitoring::setting(&db, "dji_report_scan").unwrap();
+        let mut bad = last.clone();
+        bad.last_mut().unwrap()["mission"]["missionName"] = json!("");
+        assert!(persist_dji_tasks(&mut db, &batch(bad, Value::Null, true, 301)).is_err());
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 301);
+        assert_eq!(crate::monitoring::setting(&db, "dji_report_scan").unwrap(), progress_before);
+        persist_dji_tasks(&mut db, &batch(last, Value::Null, true, 301)).unwrap();
+        assert_eq!(read_dji_tasks(&db).unwrap().len(), 301);
+    }
+
+    #[test]
+    fn history_scan_retries_restart_and_missing_pages_never_prune_early() {
+        let db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let keys = |from: usize, through: usize| {
+            (from..=through)
+                .map(|n| format!("dji-{n}"))
+                .collect::<HashSet<_>>()
+        };
+        let batch = |start: u64, next: u64, total: u64, complete: bool, error: Value| {
+            json!({
+                "total":total, "historyScan":{"startPage":start,"nextPage":next,"total":total},
+                "cursor":if complete {Value::Null}else{json!({"apiVersion":1,"page":next,"total":total})},
+                "historyComplete":complete, "historyError":error
+            })
+        };
+        // A failed second lease preserves its progress and keys for retry.
+        assert!(
+            scanned_task_keys(&db, &batch(2, 7, 401, false, Value::Null), &keys(1, 300))
+                .unwrap()
+                .is_none()
+        );
+        assert!(scanned_task_keys(
+            &db,
+            &batch(7, 8, 401, false, json!("timeout")),
+            &keys(301, 350)
+        )
+        .unwrap()
+        .is_none());
+        let completed =
+            scanned_task_keys(&db, &batch(8, 10, 401, true, Value::Null), &keys(351, 401))
+                .unwrap()
+                .unwrap();
+        assert_eq!(completed.len(), 401);
+        // A changed total with a fresh start discards the prior scan's IDs.
+        scanned_task_keys(&db, &batch(2, 7, 401, false, Value::Null), &keys(1, 300)).unwrap();
+        let restarted =
+            scanned_task_keys(&db, &batch(2, 3, 51, true, Value::Null), &keys(1000, 1050))
+                .unwrap()
+                .unwrap();
+        assert!(!restarted.contains("dji-1"));
+        // Upgrading or losing an intermediate page cannot establish absence.
+        assert!(
+            scanned_task_keys(&db, &batch(7, 8, 301, true, Value::Null), &keys(301, 301))
+                .unwrap()
+                .is_none()
+        );
+        scanned_task_keys(&db, &batch(2, 7, 401, false, Value::Null), &keys(1, 300)).unwrap();
+        assert!(
+            scanned_task_keys(&db, &batch(8, 10, 401, true, Value::Null), &keys(301, 401))
+                .unwrap()
+                .is_none()
+        );
+        // Even continuous pages with duplicate/missing keys do not prove completeness.
+        scanned_task_keys(&db, &batch(2, 7, 301, false, Value::Null), &keys(1, 299)).unwrap();
+        assert!(
+            scanned_task_keys(&db, &batch(7, 8, 301, true, Value::Null), &keys(301, 301))
+                .unwrap()
+                .is_none()
+        );
+        // A count change mid-lease invalidates the persisted scan.
+        scanned_task_keys(&db, &batch(2, 7, 401, false, Value::Null), &keys(1, 300)).unwrap();
+        scanned_task_keys(
+            &db,
+            &json!({"historyError":"changed","total":401}),
+            &keys(1, 50),
+        )
+        .unwrap();
+        assert!(crate::monitoring::setting(&db, "dji_report_scan")
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn historical_sweep_is_throttled_only_after_a_committed_completion() {
         assert!(history_scan_due(&Value::Null, None, 30000));
@@ -1785,6 +1913,22 @@ mod tests {
         assert!(validate(&data, now).is_err());
     }
     #[test]
+    fn root_media_requires_matching_folder_id_and_flight_time() {
+        let mut data = sample();
+        data.media.folder = data.media.folder.replace(" Immediate-Media", "");
+        let now = data.mission.end_time + 60001;
+        assert!(validate(&data, now).is_err());
+        data.media.root_folder_id = Some(1);
+        assert!(validate(&data, now).is_ok());
+        data.media.root_folder_id = Some(2);
+        assert!(validate(&data, now).is_err());
+        data.media.root_folder_id = Some(0);
+        assert!(validate(&data, now).is_err());
+        data.media.root_folder_id = Some(1);
+        data.media.folder = data.media.folder.replace("2026-09-22", "2026-09-21");
+        assert!(validate(&data, now).is_err());
+    }
+    #[test]
     fn mission_reasons_are_validated_and_persisted_by_airins_id() {
         let db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
         assert!(list_reasons(&db).unwrap().is_empty());
@@ -1801,6 +1945,7 @@ mod tests {
     pub(super) fn sample() -> Collected {
         let start = 1790031680000;
         Collected {
+            data_generation: None,
             evidence: None,
             without_air_data: false,
             local_event_id: None,
@@ -1835,6 +1980,7 @@ mod tests {
             media: Media {
                 file_pages: HashMap::new(),
                 no_media: false,
+                root_folder_id: None,
                 url: format!("https://fh.dji.com{PROJECT}#/media?page=1&pid=1"),
                 folder: "媒体文件 每日7时南侧火点巡飞 2026-09-22 07:00:05 (UTC+08) Immediate-Media"
                     .into(),
@@ -1855,7 +2001,7 @@ mod tests {
             .unwrap()
             .read_to_string(&mut doc)
             .unwrap();
-        assert_eq!(doc.matches("<w:tbl>").count(), 4);
+        assert_eq!(doc.matches("<w:tbl>").count(), 3);
         assert!(doc.contains("2026年09月23日00:00至07:01"));
         let air_table = doc
             .split("<w:tbl>")
@@ -1870,7 +2016,7 @@ mod tests {
             "平均值",
             "65.0",
             "48.0",
-            "未取得",
+            "【 】",
         ] {
             assert!(air_table.contains(value), "missing observation: {value}");
         }
@@ -1881,6 +2027,23 @@ mod tests {
             fill_slots("{{VALUE}}", &[("VALUE", "<&> {{VALUE}}".into())]).unwrap(),
             "&lt;&amp;&gt; {{VALUE}}"
         );
+    }
+    #[test]
+    fn fixed_template_has_no_generated_narrative_and_keeps_editorial_text_exact() {
+        for without_air in [false, true] {
+            let mut data = if without_air { photo_only_sample() } else { sample() };
+            data.evidence = Some(Evidence { conclusion: "人工结论<&> {{CITY_PM_START}}".into(), recommendation: "人工建议".into(), ..Default::default() });
+            let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis()).unwrap();
+            let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut doc = String::new();
+            z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+            assert!(doc.contains("人工结论&lt;&amp;&gt; {{CITY_PM_START}}"));
+            assert!(doc.contains("人工建议"));
+            assert!(doc.contains("高精度气体传感器"));
+            for banned in ["缺测或未发布值不补0", "明显高值过程划分规则待确定", "实际执飞时段内PM2.5最高值", "场景待判读", "附件1", "范围待核实", "异常事件数量尚未经现场核实"] {
+                assert!(!doc.contains(banned), "unexpected prose: {banned}");
+            }
+        }
     }
     #[test]
     fn rejects_wrong_flight_and_units() {

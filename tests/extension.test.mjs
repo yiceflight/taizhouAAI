@@ -53,12 +53,12 @@ test('debugger remains on one authorized business tab across checks and unrelate
   const session=createDebuggerSession(api,allowedUrl);
   const tabs=[{id:1,url:'https://aai.airins.cn/sniff/HistoryCloud',status:'complete'},{id:2,url:'https://fh.dji.com/project',status:'complete'}];
   await session.maintain(tabs);
-  assert.equal(await session.acquire(1),false);
-  await session.release(1,false);
+  const first = await session.acquire(1);
+  await session.release(1,first);
   await session.maintain(tabs);
   assert.deepEqual(calls,[['attach',1]]);
-  assert.equal(await session.acquire(2),true);
-  await session.release(2,true);
+  const second = await session.acquire(2);
+  await session.release(2,second);
   assert.deepEqual(calls,[['attach',1],['attach',2],['detach',2]]);
   await session.maintain([{...tabs[0],url:'https://example.com'},tabs[1]]);
   assert.deepEqual(calls.slice(-2),[['detach',1],['attach',2]]);

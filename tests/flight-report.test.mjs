@@ -25,23 +25,24 @@ test('DJI requires exact project and Immediate-Media, refuses filtered or pagina
  const run=()=>vm.runInNewContext(`(${djiReport.toString()})({type:'flight-dji-list'})`,{document,location,URLSearchParams});
  const result=await run();assert.equal(result.files.length,1);document.querySelector('input').value='DJI';await assert.rejects(run(),/清空/);document.querySelector('input').value='';document.body.appendChild(document.createElement('div')).className='ant-pagination-next';await assert.rejects(run(),/超过一页/);location.pathname='/other';await assert.rejects(run(),/泰州项目/);
 });
-test('DJI opens the selected photo with click and downloads its full-size record, never a thumbnail',async()=>{
+for (const rootFolderId of [undefined, 123]) test(`DJI downloads full-size photos from ${rootFolderId ? 'task root' : 'Immediate-Media'}, never thumbnails`,async()=>{
  const name='DJI_20260922071701_0002_V.jpeg';
  const {document}=parseHTML(`<div id="disk-app"></div><div class="ant-breadcrumb">媒体文件 每日7时 2026-09-22 07:00:05 Immediate-Media</div><table><tbody><tr><td><span>${name}</span></td></tr></tbody></table>`);
  for(const e of document.querySelectorAll('*'))e.getClientRects=()=>[{}];
  let clicks=0,requests=0;
  document.querySelector('span').click=()=>{clicks++;document.querySelector('#disk-app')._vnode={component:{subTree:{children:[{component:{props:{previewItemProp:{name,url:'https://media.dji.example/original.jpeg',ext:{width:3840,height:2160}}}}}]}}};};
- const location={origin:'https://fh.dji.com',pathname:'/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49',hash:'#/media?page=1',href:'https://fh.dji.com/#/media?page=1'};
+ if (rootFolderId) document.querySelector('.ant-breadcrumb').textContent = '媒体文件 每日7时 2026-09-22 07:00:05';
+ const location={origin:'https://fh.dji.com',pathname:'/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49',hash:'#/media?page=1&pid=123',href:'https://fh.dji.com/#/media?page=1&pid=123'};
  let inspections=0;
  const inspectPresentation=async()=>{inspections++;return {signature:'stable',annotationCount:2};};
- const sandbox={document,location,inspectPresentation,AbortSignal,Blob,Uint8Array,setTimeout:fn=>fn(),fetch:async url=>{requests++;assert.equal(url,'https://media.dji.example/original.jpeg');return{ok:true,blob:async()=>new Blob([new Uint8Array([255,216,255,0])])};},createImageBitmap:async()=>({width:3840,height:2160,close(){}}),FileReader:class{readAsDataURL(){this.result='data:image/jpeg;base64,/9j/AA==';this.onload();}}};
- const result=await vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name})},inspectPresentation)`,sandbox);
+ const sandbox={document,location,URLSearchParams,inspectPresentation,AbortSignal,Blob,Uint8Array,setTimeout:fn=>fn(),fetch:async url=>{requests++;assert.equal(url,'https://media.dji.example/original.jpeg');return{ok:true,blob:async()=>new Blob([new Uint8Array([255,216,255,0])])};},createImageBitmap:async()=>({width:3840,height:2160,close(){}}),FileReader:class{readAsDataURL(){this.result='data:image/jpeg;base64,/9j/AA==';this.onload();}}};
+ const result=await vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name,rootFolderId})},inspectPresentation)`,sandbox);
  assert.equal(inspections,4);assert.equal(result.capturePlan.annotationCount,2);assert.equal(clicks,1);assert.equal(requests,1);assert.equal(result.kind,'司空原始照片');assert.equal(result.name,name);assert(!JSON.stringify(result).includes('media.dji.example'));
  sandbox.createImageBitmap=async()=>({width:200,height:113,close(){}});
- await assert.rejects(vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name})},inspectPresentation)`,sandbox),/缩略图/);
+ await assert.rejects(vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-image',name,rootFolderId})},inspectPresentation)`,sandbox),/缩略图/);
 });
 
-function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jpeg'], immediate = true, initialFolder = false, photoPages, folderId, normalizeRoute = false }) {
+function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jpeg'], immediate = true, initialFolder = false, photoPages, folderId, rootPages, rootTotal, normalizeRoute = false }) {
  const {document} = parseHTML('<html><body><div class="ant-breadcrumb"></div><table><thead><tr><th></th></tr></thead><tbody></tbody></table></body></html>');
  const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
  let hash = '', opened = [], taskName = '';
@@ -59,15 +60,23 @@ function autoMediaFixture({ pages, folderPhotos = ['DJI_20260922071701_0002_V.jp
   for(const e of document.querySelectorAll('*')) e.getClientRects = () => [{}];
   for(const e of document.querySelectorAll('tbody span')) e.click = () => onClick(e.textContent);
  };
- const openTask = name => {
+ const showRoot = (name, page) => {
+  show(`媒体文件 / ${name}`, rootPages[page - 1] || [], () => {});
+  document.querySelector('th').textContent = `名称 (0/${rootTotal ?? rootPages.flat().length})`;
+  let next = document.querySelector('.ant-pagination-next');
+  if (!next) { next = document.createElement('li'); next.className = 'ant-pagination-next'; document.body.appendChild(next); }
+  next.setAttribute('aria-disabled', String(page >= rootPages.length));
+ };
+ const openTask = (name, page = 1) => {
   opened.push(name); hash = '#/media?page=1&size=50&pid=task';
+  if (rootPages) { showRoot(name, page); return; }
   show(`媒体文件 / ${name}`, immediate ? ['Immediate-Media'] : ['video.mp4'], () => {
    hash = '#/media?page=1&size=50&pid=photos';
    taskName = name;
    if (photoPages) showPhotos(1); else show(`媒体文件 / ${name} / Immediate-Media`, folderPhotos, () => {});
   });
  };
- const location = {origin:'https://fh.dji.com',pathname:project, get href(){return this.origin+this.pathname+hash;},get hash(){return hash;},set hash(value){const params = new URLSearchParams(value.split('?')[1]); const normalized = normalizeRoute ? `#/media?${[...params.entries()].reverse().map(([key, item]) => `${key}=${item}`).join('&')}` : value; hash = normalized; const page = Number(params.get('page')); if (folderId && params.get('pid') === String(folderId)) { openTask('接口确认的航次'); hash = normalized; } else if (params.get('pid') === 'photos' && photoPages) showPhotos(page); else show('媒体文件',pages[page-1] || [],openTask);}};
+ const location = {origin:'https://fh.dji.com',pathname:project, get href(){return this.origin+this.pathname+hash;},get hash(){return hash;},set hash(value){const params = new URLSearchParams(value.split('?')[1]); const normalized = normalizeRoute ? `#/media?${[...params.entries()].reverse().map(([key, item]) => `${key}=${item}`).join('&')}` : value; hash = normalized; const page = Number(params.get('page')); if (folderId && params.get('pid') === String(folderId)) { openTask('接口确认的航次', page); hash = normalized; } else if (params.get('pid') === 'photos' && photoPages) showPhotos(page); else show('媒体文件',pages[page-1] || [],openTask);}};
  location.hash = '#/media?page=1&size=50';
  if(initialFolder){ hash='#/media?page=1&size=50&pid=wrong'; show('媒体文件 / 旧航次 / Immediate-Media',['DJI_20260921071701_0002_V.jpeg'],()=>{}); }
  const run = () => vm.runInNewContext(`(${djiReport.toString()})(${JSON.stringify({type:'flight-dji-list',startTime:start,endTime:end,folderId})})`,{document,location,URLSearchParams,setTimeout:fn=>fn()});
@@ -98,9 +107,8 @@ test('DJI does not choose the nearest flight outside the tolerance or infer time
 });
 test('DJI distinguishes missing photo folder from a confirmed empty photo folder', async()=>{
  const pages=[['每日7时 2026-09-22 07:00:05 (UTC+08)']];
- await assert.rejects(autoMediaFixture({pages,immediate:false}).run(),/尚无 Immediate-Media/);
- const result=await autoMediaFixture({pages,folderPhotos:[]}).run();
- assert.equal(result.files.length,0);assert.match(result.folder,/Immediate-Media$/);
+ await assert.rejects(autoMediaFixture({pages,immediate:false}).run(),/司空媒体解析失败：缺少航次目录编号/);
+ await assert.rejects(autoMediaFixture({pages,folderPhotos:[]}).run(), /司空媒体无照片：照片文件夹为空/);
 });
 
 test('DJI inventories every photo page and records the download page without truncation', async () => {
@@ -126,4 +134,30 @@ test('Airins rejects corrupt gas arrays and never substitutes Ox for ozone', asy
  const run=()=>vm.runInNewContext(`(${airinsReport.toString()})({missionId:123})`,sandbox);
  assert.equal((await run()).channels.o3.sourceChannel,'ad_80');
  for(const bad of [[1], [1,'2'], [1,-1], [1,Infinity]]) {data.missionData.ad_80=bad;await assert.rejects(run(),/通道数据/);}
+});
+
+const rootPhoto = 'DJI_20260922071701_0002_V.jpeg';
+const rootVideo = 'DJI_20260922071701_0001_V.mp4';
+const rootFixture = options => autoMediaFixture({pages: [[]], folderId: 359292376, immediate: false, ...options});
+test('DJI reads direct task-root photos mixed with videos and preserves folder identity', async () => {
+ const result = await rootFixture({rootPages: [[rootPhoto, rootVideo]]}).run();
+ assert.deepEqual([...result.files], [rootPhoto]);
+ assert.equal(result.rootFolderId, 359292376);
+ assert.equal(result.matchedTaskFolderId, 359292376);
+});
+test('DJI proves video-only only after a complete multipage inventory', async () => {
+ const videos = Array.from({length: 52}, (_, i) => `DJI_20260922071701_${String(i).padStart(4, '0')}_V.mp4`);
+ await assert.rejects(rootFixture({rootPages: [videos.slice(0, 50), videos.slice(50)]}).run(), /司空媒体无照片：已完整解析 52 个视频文件/);
+ const result = await rootFixture({rootPages: [videos.slice(0, 50), [rootPhoto]]}).run();
+ assert.deepEqual([...result.files], [rootPhoto]);
+ assert.equal(result.filePages[rootPhoto], 2);
+});
+test('DJI never treats missing, unknown, duplicated or incomplete root media as no photos', async () => {
+ for (const options of [
+  {rootPages: [[rootVideo]], rootTotal: 2},
+  {rootPages: [[rootVideo, 'Other-Photos']]},
+  {rootPages: [[rootVideo, 'picture.jpeg']]},
+  {rootPages: [[rootVideo], [rootVideo]]},
+  {rootPages: [[]]},
+ ]) await assert.rejects(rootFixture(options).run(), /司空媒体解析失败/);
 });

@@ -105,6 +105,7 @@ export async function readDjiTasks(expectedUrl, options = {}) {
     const data = result.data;
     if (!Array.isArray(data?.list) || data.list.length > 50 || data.pagination?.page !== page || data.pagination?.page_size !== 50
         || !Number.isSafeInteger(data.pagination?.total) || data.pagination.total < 0) throw new Error('司空任务分页响应格式已变化');
+    if (data.list.length !== Math.max(0, Math.min(50, data.pagination.total - (page - 1) * 50))) throw new Error('司空任务分页记录不完整，请稍后重试');
     if (location.href !== expectedUrl) throw new Error('任务读取期间页面已切换，请重试');
     return data;
   };
@@ -164,11 +165,17 @@ export async function readDjiTasks(expectedUrl, options = {}) {
   const savedPage = options.cursor?.apiVersion === 1 && options.cursor.total === first.pagination.total && Number.isInteger(options.cursor.page) && options.cursor.page >= 2 ? options.cursor.page : 2;
   let page = Math.min(savedPage, lastPage + 1), historyError = null;
   const includeHistory = options.includeHistory !== false;
+  const startPage = page;
+  let historyChanged = false;
   if (includeHistory) {
     // At most five history requests plus the fresh first page per lease.
     for (let batch = 0; page <= lastPage && batch < 5; batch++) {
       try {
         const data = await request(page);
+        if (data.pagination.total !== first.pagination.total) {
+          historyChanged = true; page = 2;
+          throw new Error('司空任务总数在同步期间变化，将重新读取历史任务');
+        }
         if (!data.list.length && page <= Math.ceil(data.pagination.total / 50)) throw new Error('司空历史分页暂未返回记录，请稍后重试');
         for (const row of data.list) { const task = normalize(row); tasks.set(task.taskId, task); }
         page++;
@@ -177,5 +184,6 @@ export async function readDjiTasks(expectedUrl, options = {}) {
   }
   return { apiVersion: 1, url: `https://fh.dji.com${projectPath}#/plan`, tasks: [...tasks.values()], skipped: 0, total: first.pagination.total,
     cursor: includeHistory ? page <= lastPage ? { apiVersion: 1, page, total: first.pagination.total } : null : options.cursor ?? null,
+    historyScan: includeHistory && !historyChanged ? { startPage, nextPage: page, total: first.pagination.total } : null,
     historyComplete: includeHistory && !historyError && page > lastPage, historyError };
 }

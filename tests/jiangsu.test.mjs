@@ -1,16 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
-import { JIANGSU_URL, normalizeHourly, queryJiangsuHourly, prepareJiangsuForHealth, findJiangsuApi } from '../extension/src/jiangsu.js';
+import { JIANGSU_URL, normalizeHourly, queryJiangsuHourly, prepareJiangsuForHealth, findJiangsuApi, enterJiangsuAnalysis } from '../extension/src/jiangsu.js';
 const raw = () => ({ url: JIANGSU_URL, city: '泰州市', cityCode: '321200', unit: 'μg/m³', dataSource: 'A_6', commonSiteType: '30', startTime: '2026-09-22 00:00:00', endTime: '2026-09-22 03:00:00', potassium: { times: ['2026-09-22 00:00:00','2026-09-22 01:00:00','2026-09-22 02:00:00','2026-09-22 03:00:00'], values: [0,null,1.2,null] }, normal: [{time:'2026-09-22 01:00:00',pm25:'35'},{time:'2026-09-22 02:00:00',pm25:20},{time:'2026-09-22 03:00:00',pm25:'--'}] });
 function browserFixture(initial = []) {
   const tabs = initial.map(tab => ({ status: 'complete', ...tab }));
   const created = [];
   let elapsed = 0;
+  const saved = {};
   return {
     tabs, created,
     timing: { now: () => elapsed, pause: async () => { elapsed += 250; } },
-    chrome: { tabs: {
+    chrome: { storage: { local: { get: async () => ({ ...saved }), set: async value => Object.assign(saved, value) } }, tabs: {
       query: async options => { assert.equal(options.url, 'http://61.155.4.60:18080/*'); return tabs; },
       get: async id => { const tab = tabs.find(tab => tab.id === id); assert.ok(tab); return tab; },
       create: async options => { created.push(options); const tab = {id:17,url:options.url,status:'complete'}; tabs.push(tab); return tab; },
@@ -135,4 +136,54 @@ test('page adapter uses verified API shape and fixed Taizhou hourly city mixed s
 });
 test('login redirect is rejected before querying DOM', async () => {
   await assert.rejects(runInNewContext(`(${queryJiangsuHourly.toString()})(undefined,undefined,(${findJiangsuApi.toString()}))`,{location:new URL('http://61.155.4.60:18080/#/login'),get document(){throw Error('must not read')}}),/登录.*重新验证/);
+});
+
+test('launcher enters analysis in the authenticated tab, even with a second stale login tab', async () => {
+  const portal = 'http://61.155.4.60:18080/#/login';
+  const f = browserFixture([{id:1,url:portal},{id:2,url:portal}]);
+  let entered = 0;
+  const enter = async id => { assert.equal(id,1); entered++; f.tabs[0].url = JIANGSU_URL; };
+  const capture = async id => ({url:f.tabs[id-1].url,state:id===2?'login_required':f.tabs[0].url===portal?'page_required':'ready',needsBusinessPage:id===1});
+  for (let i=0;i<2;i++) {
+    const result = await prepareJiangsuForHealth(f.chrome,capture,f.timing,enter);
+    assert.equal(result.state,'ready'); assert.equal(result.tabId,1);
+  }
+  assert.equal(entered,1); assert.equal(f.created.length,0);
+});
+test('launcher waits for same-tab navigation and preserves actual API failures', async () => {
+  const portal = 'http://61.155.4.60:18080/#/login';
+  for (const state of ['login_required','forbidden','error','ready']) {
+    const f=browserFixture([{id:1,url:portal}]);
+    let entered=0;
+    const pause=f.timing.pause;
+    f.timing.pause=async()=>{await pause(); if(entered) f.tabs[0].url=JIANGSU_URL;};
+    const result=await prepareJiangsuForHealth(f.chrome,async()=>({url:f.tabs[0].url,state:f.tabs[0].url===portal?'page_required':state,needsBusinessPage:true}),f.timing,async()=>{entered++;});
+    assert.equal(result.state,state);assert.equal(entered,1);assert.equal(f.created.length,0);
+  }
+});
+test('launcher navigation timeout or subsequent rechecks never create duplicate tabs', async () => {
+  const portal='http://61.155.4.60:18080/#/login';
+  const f=browserFixture([{id:1,url:portal}]);
+  let entered=0;
+  for(let i=0;i<3;i++) {
+    const result=await prepareJiangsuForHealth(f.chrome,async()=>({url:portal,state:'page_required',needsBusinessPage:true}),f.timing,async()=>{entered++;});
+    assert.equal(result.state,'error');
+  }
+  assert.equal(entered,3);assert.equal(f.created.length,0);
+});
+test('launcher entry clicks only the unique visible analysis control and rejects login forms', () => {
+  let clicks=0;
+  const entry={textContent:'综合分析',children:[],getClientRects:()=>[1],click:()=>clicks++};
+  const document={body:{innerText:'综合分析 离线分析 数据管理 运维中心 温室气体'},querySelectorAll:selector=>selector==='body *'?[entry]:[]};
+  const run=()=>runInNewContext(`(${enterJiangsuAnalysis.toString()})()`,{location:new URL('http://61.155.4.60:18080/#/login'),URL,document});
+  assert.equal(run().opened,true);assert.equal(clicks,1);
+  document.querySelectorAll=()=>[entry];
+  assert.throws(run,/完成登录/);assert.equal(clicks,1);
+});
+
+test('an expired business tab cannot hide a working launcher session', async () => {
+  const portal='http://61.155.4.60:18080/#/login';
+  const f=browserFixture([{id:1,url:JIANGSU_URL},{id:2,url:portal}]);
+  const result=await prepareJiangsuForHealth(f.chrome,async id=>({url:f.tabs[id-1].url,state:id===1?'login_required':f.tabs[1].url===portal?'page_required':'ready',needsBusinessPage:id===2}),f.timing,async id=>{assert.equal(id,2);f.tabs[1].url=JIANGSU_URL;});
+  assert.equal(result.state,'ready');assert.equal(result.tabId,2);assert.equal(f.created.length,0);
 });

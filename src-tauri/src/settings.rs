@@ -54,7 +54,8 @@ pub struct Settings {
     pub require_manual_confirmation: bool,
     #[serde(default = "default_no_fly_periods")]
     pub no_fly_periods: Vec<NoFlyPeriod>,
-    #[serde(default = "default_route_selection_mode")]
+    // Accept the legacy field when reading old settings, but never use or write it.
+    #[serde(default = "default_route_selection_mode", skip_serializing)]
     pub route_selection_mode: String,
     #[serde(default)]
     pub wind_route_rules: Vec<WindRouteRule>,
@@ -84,9 +85,6 @@ impl Settings {
         }
         if self.takeoff_delay_minutes > 1440 {
             return Err("起飞延迟须为 0 至 1440 之间的整数分钟。".into());
-        }
-        if !matches!(self.route_selection_mode.as_str(), "fixed" | "wind") {
-            return Err("航线选择模式无效，请选择固定航线或按风向选择。".into());
         }
         if self.wind_route_rules.len() > 16 {
             return Err("最多可配置 16 条风向航线规则。".into());
@@ -160,6 +158,7 @@ fn save(db: &Connection, settings: &Settings) -> Result<(), String> {
     )
 }
 
+#[cfg(test)]
 pub fn set_delay(db: &Connection, minutes: u32) -> Result<(), String> {
     let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut settings = read(&tx)?;
@@ -170,6 +169,7 @@ pub fn set_delay(db: &Connection, minutes: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn save_workspace_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let state = app.state::<crate::flight::Flight>();
     let _gate = state.gate.lock().unwrap();
     let result = save_and_reconcile(&database(&app)?, &settings, crate::monitoring::now());
@@ -276,6 +276,21 @@ mod tests {
         s.no_fly_periods.clear();
         save(&db, &s).unwrap();
         assert!(read(&db).unwrap().no_fly_periods.is_empty());
+    }
+    #[test]
+    fn legacy_route_mode_is_read_but_dropped_on_save_without_losing_rules() {
+        let db = crate::monitoring::connect(std::path::Path::new(":memory:")).unwrap();
+        for mode in ["fixed", "wind"] {
+            let mut raw = serde_json::to_value(Settings::default()).unwrap();
+            raw["routeSelectionMode"] = serde_json::json!(mode);
+            raw["windRouteRules"] = serde_json::json!([{ "startDegrees":22.5, "endDegrees":67.5, "route":"东北航线" }]);
+            put(&db, "workspace_settings", &raw.to_string()).unwrap();
+            let old = read(&db).unwrap();
+            save(&db, &old).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&setting(&db, "workspace_settings").unwrap().unwrap()).unwrap();
+            assert!(saved.get("routeSelectionMode").is_none());
+            assert_eq!(read(&db).unwrap().wind_route_rules, old.wind_route_rules);
+        }
     }
     #[test]
     fn periods_support_multiple_ranges_midnight_and_exact_boundaries() {

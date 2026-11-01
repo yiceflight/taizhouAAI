@@ -1,5 +1,5 @@
 {
-  "minimumExtensionVersion": "0.7.29",
+  "minimumExtensionVersion": "0.7.38",
   "production": {
     "address": "127.0.0.1:14520",
     "origin": "chrome-extension://knpgppgofegbnimjoahnifpmhgmgnicf"

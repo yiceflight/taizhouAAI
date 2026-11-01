@@ -6,7 +6,13 @@ export function CapturePanel({ tabs, ready }: { tabs: BrowserTab[]; ready: boole
   const [key, setKey] = useState(''), [busy, setBusy] = useState(false), [message, setMessage] = useState(''), [error, setError] = useState('');
   const lock = useRef(false);
   const selected = tabs.find(t => tabKey(t) === key);
-  useEffect(() => { if (isTauri()) void invoke<ReportSummary[]>('list_reports').then(setReports).catch(e => setError(String(e))); }, []);
+  useEffect(() => {
+    let current = true;
+    if (isTauri()) void invoke<ReportSummary[]>('list_reports')
+      .then(items => { if (current) setReports(items); })
+      .catch(e => { if (current) setError(String(e)); });
+    return () => { current = false; };
+  }, []);
   const generate = async () => {
     if (!selected || !ready || lock.current) return;
     lock.current = true; setBusy(true); setError(''); setMessage('正在采集当前页面…');

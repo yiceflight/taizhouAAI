@@ -42,6 +42,7 @@ export async function djiReport(job, inspectPresentation) {
   const project = '/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
   if (location.origin !== 'https://fh.dji.com' || location.pathname.replace(/\/$/,'') !== project || !location.hash.startsWith('#/media?')) throw new Error('请打开泰州项目的司空媒体库');
   const visible = e => e.getClientRects().length > 0;
+  let rootFolderId = job.type === "flight-dji-image" ? job.rootFolderId : null;
   // Navigate only rendered media folders. Never query application stores or credentials.
   if (job.type === 'flight-dji-list' && job.startTime !== undefined) {
     if (!Number.isSafeInteger(job.startTime) || !Number.isSafeInteger(job.endTime) || job.startTime <= 0 || job.endTime <= job.startTime || job.endTime - job.startTime > 86400000) throw new Error('自动匹配的飞行时间无效');
@@ -186,58 +187,87 @@ export async function djiReport(job, inspectPresentation) {
     await wait(() => (crumb()?.innerText || '').includes(match.name) && signature() !== rootRows, '航次打开');
     }
     const immediate = rows().map(row => leaf(row, 'Immediate-Media')).find(Boolean);
-    if (!immediate) throw new Error('已按时间找到司空航次，但尚无 Immediate-Media 照片文件夹，请等待照片上传后重试');
-    const taskRows = signature();
-    immediate.click();
-    await wait(() => (crumb()?.innerText || '').trim().endsWith('Immediate-Media') && signature() !== taskRows, '照片文件夹打开');
+    if (immediate) {
+      const taskRows = signature();
+      immediate.click();
+      await wait(() => (crumb()?.innerText || '').trim().endsWith('Immediate-Media') && signature() !== taskRows, '照片文件夹打开');
+    } else {
+      // Some flights store their files directly in the task folder.
+      // Missing Immediate-Media alone is never proof of pending upload or no photos.
+      if (!Number.isSafeInteger(job.folderId) || job.folderId <= 0) throw new Error('司空媒体解析失败：缺少航次目录编号，请刷新任务后重试');
+      rootFolderId = job.folderId;
+    }
   }
   const breadcrumb = document.querySelector('[aria-label="Breadcrumb"],.ant-breadcrumb');
   const folder = breadcrumb?.innerText?.trim() || '';
-  if (!folder.endsWith('Immediate-Media')) throw new Error('请进入本次任务的 Immediate-Media 文件夹');
+  const taskRoot = Number.isSafeInteger(rootFolderId) && rootFolderId > 0
+    && new URLSearchParams(location.hash.split('?')[1]).get('pid') === String(rootFolderId);
+  if (!folder.endsWith('Immediate-Media') && !taskRoot) throw new Error('请进入本次任务的 Immediate-Media 文件夹');
+  const rootInventory = () => [...document.querySelectorAll('table tbody tr')].filter(visible).flatMap(row => {
+    const value = row.innerText.trim();
+    if (/^(暂无数据|无文件|No data|No files)$/i.test(value)) return [];
+    const name = value.match(/(?:^|\s)(DJI_\d{14}_[A-Za-z0-9_]+\.(?:jpe?g|png|mp4|mov))(?=\s|$)/i)?.[1];
+    if (!name) throw new Error('司空媒体解析失败：航次目录包含未识别文件或子目录，请核查媒体库');
+    return [name];
+  });
+  const readRootTotal = () => Number([...document.querySelectorAll('table th')].map(e => e.innerText).join(' ').match(/名称\s*[（(]\d+\s*\/\s*(\d+)[）)]/)?.[1] ?? NaN);
+  const rootTotal = taskRoot ? readRootTotal() : null;
   if ([...document.querySelectorAll('input')].some(e => /文件名称/.test(e.placeholder) && e.value.trim())) throw new Error('请清空司空文件名搜索后重试');
   const pageNames = () => [...document.querySelectorAll('table tbody tr')].filter(visible).flatMap(row => {
     const value = row.innerText;
     const name = value.match(/DJI_\d{14}_[A-Za-z0-9_]+\.(?:jpe?g|png)/i)?.[0];
-    if (!name && /\.(?:jpe?g|png|tiff?|dng|webp)\b/i.test(value)) throw new Error('存在无法核对拍摄时间或不支持格式的图片，未生成不完整报告');
+    if (!name && /\.(?:jpe?g|png|tiff?|dng|webp)\b/i.test(value)) throw new Error('司空媒体解析失败：存在无法核对拍摄时间或不支持格式的图片，未生成不完整报告');
     return name ? [name] : [];
   });
   const goPage = async page => {
     const params = new URLSearchParams(location.hash.split('?')[1]);
     if (Number(params.get('page') || 1) === page) return;
-    const before = pageNames().join('|');
+    const before = [...document.querySelectorAll('table tbody tr')].filter(visible).map(e=>e.innerText).join('|');
     params.set('page', String(page)); location.hash = '#/media?' + params.toString();
     let stable = 0;
     for (let attempt = 0; attempt < 40; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 200));
-      if (pageNames().join('|') !== before && ![...document.querySelectorAll('.ant-spin-spinning,[aria-busy="true"]')].some(visible)) {
+      if ([...document.querySelectorAll('table tbody tr')].filter(visible).map(e=>e.innerText).join('|') !== before && ![...document.querySelectorAll('.ant-spin-spinning,[aria-busy="true"]')].some(visible)) {
         if (++stable >= 3) return;
       } else stable = 0;
     }
-    throw new Error('司空图片翻页未完成，未生成不完整报告');
+    throw new Error(`${taskRoot ? '司空媒体解析失败：' : ''}司空图片翻页未完成，未生成不完整报告`);
   };
   if (job.page != null) {
     if (!Number.isInteger(job.page) || job.page < 1 || job.page > 20) throw new Error('照片页码无效');
     await goPage(job.page);
   }
   const unique = [...new Set(pageNames())];
-  if (!unique.length && !/暂无数据|无文件|No data|No files/i.test([...document.querySelectorAll('table')].map(e=>e.innerText).join(' '))) throw new Error('未识别到图片列表，无法确认文件夹是否为空');
+  if (!taskRoot && !unique.length && !/暂无数据|无文件|No data|No files/i.test([...document.querySelectorAll('table')].map(e=>e.innerText).join(' '))) throw new Error('未识别到图片列表，无法确认文件夹是否为空');
   if (job.type === 'flight-dji-list') {
+    if (taskRoot && (!Number.isSafeInteger(rootTotal) || rootTotal <= 0)) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
     // Legacy manual probes cannot prove a complete multipage inventory.
     const initialNext = document.querySelector('.ant-pagination-next');
     if (job.startTime == null && initialNext && initialNext.getAttribute('aria-disabled') !== 'true' && !initialNext.classList.contains('ant-pagination-disabled')) throw new Error('图片超过一页，请按飞行时间自动匹配后重试');
     await goPage(1);
-    const files = [], filePages = {};
+    const files = [], filePages = {}, rootFiles = new Set();
     for (let page = 1; page <= 20; page++) {
+      if (taskRoot && (readRootTotal() !== rootTotal || new URLSearchParams(location.hash.split('?')[1]).get('pid') !== String(rootFolderId))) throw new Error('司空媒体解析失败：采集期间目录或文件数量已变化，请重新读取');
+      if (taskRoot) for (const name of rootInventory()) {
+        if (rootFiles.has(name)) throw new Error('司空媒体解析失败：文件跨页重复，请刷新后重试');
+        rootFiles.add(name);
+      }
       for (const name of pageNames()) {
         if (filePages[name]) throw new Error('司空照片跨页重复，列表可能正在变化，请重试');
         files.push(name); filePages[name] = page;
       }
       if (files.length > 200) throw new Error('单次报告超过 200 张照片，未截断或生成不完整报告');
       const next = document.querySelector('.ant-pagination-next');
-      if (!next || next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled')) {
+      if (taskRoot ? rootFiles.size >= rootTotal : (!next || next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled'))) {
         if ((document.querySelector('[aria-label="Breadcrumb"],.ant-breadcrumb')?.innerText?.trim() || '') !== folder) throw new Error('采集期间照片文件夹已变化');
-        return { url: location.href, folder, files, filePages, matchedStartTime: job.startTime, matchedTaskFolderId: job.folderId ?? null };
+        if (taskRoot) {
+          if (!Number.isSafeInteger(rootTotal) || rootTotal <= 0 || rootFiles.size !== rootTotal) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
+          if (!files.length) throw new Error(`司空媒体无照片：已完整解析 ${rootFiles.size} 个视频文件，本航次未发现照片`);
+        }
+        if (!files.length) throw new Error('司空媒体无照片：照片文件夹为空，本航次未发现照片');
+        return { url: location.href, folder, files, filePages, rootFolderId: taskRoot ? rootFolderId : null, matchedStartTime: job.startTime, matchedTaskFolderId: job.folderId ?? null };
       }
+      if (taskRoot && next && (next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled'))) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
       await goPage(page + 1);
     }
     throw new Error('照片列表超过 20 页，未生成不完整报告');

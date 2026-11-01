@@ -11,7 +11,7 @@
 | 本机桥接诊断 | [bridge-diagnostics.md](bridge-diagnostics.md) |
 | 小时监测 | [hourly-monitoring.md](hourly-monitoring.md) |
 | 巡查计划和提交 | [flight-plan-preparation.md](flight-plan-preparation.md)、[drone-dispatch.md](drone-dispatch.md) |
-| 天气门控 | [flight-weather.md](flight-weather.md) |
+| 天气记录与风向选线 | [flight-weather.md](flight-weather.md) |
 | 巡飞 Word 快报 | [flight-report.md](flight-report.md) |
 | 设置和更新 | [monitoring-settings.md](monitoring-settings.md)、[updater.md](updater.md) |
 | 发布记录 | [releases/](releases/) |

@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { parseHTML } from 'linkedom';
 import { describe, it, expect } from 'vitest';
 import type { MonitorView, Readiness } from '../src/lib/workspace';
-import { dataQuality, defaultSettings, flightSummary, latestValidRow, potassiumReading, triggerReading } from '../src/lib/workspace';
+import { dataQuality, defaultSettings, flightSummary, latestValidRow, triggerReading } from '../src/lib/workspace';
 import { SetupPanel } from '../src/components/SetupPanel';
 import { MonitoringPanel } from '../src/components/MonitoringPanel';
 import { DroneStatus } from '../src/components/DroneStatus';
@@ -46,7 +46,7 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.querySelector('#takeoff-delay')).toBeNull();
     const automatic = dom(<SettingsDialog settings={{...defaultSettings,noFlyPeriods:[], requireManualConfirmation:false}} onClose={noop} onSaved={async()=>{}}/>);
     expect(automatic.querySelector('#takeoff-delay')?.getAttribute('value')).toBe('5');
-    expect(d.querySelector('#pm25-threshold')?.closest('fieldset')?.querySelector('legend')?.textContent).toBe('PM2.5 阈值设置');
+    expect(d.querySelector('#pm25-threshold')?.closest('fieldset')?.querySelector('legend')?.textContent).toBe('监测阈值');
     expect(d.documentElement.textContent).not.toContain('保存到本机');
     expect(d.documentElement.textContent).not.toContain('暂未开放');
     expect(d.documentElement.textContent).toContain('AI 巡查分析');
@@ -66,20 +66,20 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.querySelectorAll('button')).toHaveLength(2);
     expect(dom(<PluginUpdateAlert state={readiness(true)} onSetup={noop}/>).querySelector('[role="alert"]')).toBeNull();
   });
-  it('shows browser and website checks without a data startup step',()=>{
+  it('shows environment checks inside the dialog without a standalone status page',()=>{
     for (const ready of [false, true]) {
       const d=dom(<SetupPanel state={readiness(ready)} busy={false} onCheck={noop} openSite={noop}/>);
-      expect(d.querySelectorAll('.setup-steps > li')).toHaveLength(2);
+      expect(d.querySelector('.setup-steps')).toBeNull();
+      expect(d.querySelectorAll('.health-row')).toHaveLength(4);
       expect(d.querySelector('.start-card')).toBeNull();
       expect(d.documentElement.textContent).not.toContain('读取数据并开始');
-      expect(d.querySelectorAll('.setup-steps > li.done')).toHaveLength(ready ? 2 : 1);
-      expect(d.querySelector('h2')?.textContent).toBe(ready ? '运行正常' : '运行状态待处理');
+      expect(d.querySelector('h2')).toBeNull();
     }
   });
   it('labels an incomplete site row as verifying while the serial readiness pass is running',()=>{
     const r={...readiness(false),checking:true,sites:readiness(false).sites.map((site,i)=>i===1?{...site,state:'unchecked' as const,message:'等待验证登录与业务访问',checkedAt:null}:site)};
     const d=dom(<SetupPanel state={r} busy={false} onCheck={noop} openSite={noop}/>);
-    const row=d.querySelectorAll('.health-row')[1];
+    const row=d.querySelectorAll('.health-row')[2];
     expect(row?.textContent).toContain('正在验证登录与业务访问');
     expect(row?.textContent).toContain('验证中');
     expect(row?.textContent).not.toContain('待验证');
@@ -87,7 +87,7 @@ describe('workspace readiness and data truthfulness',()=>{
   it('keeps a previously verified site stable while the next readiness pass is running',()=>{
     const r={...readiness(true),checking:true};
     const d=dom(<SetupPanel state={r} busy={false} onCheck={noop} openSite={noop}/>);
-    const row=d.querySelectorAll('.health-row')[0];
+    const row=d.querySelectorAll('.health-row')[1];
     expect(row?.textContent).toContain('已验证');
     expect(row?.textContent).not.toContain('验证中');
   });
@@ -128,8 +128,8 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.documentElement.textContent).not.toContain('数据已过期');
     expect(d.querySelectorAll('.potassium-bar')).toHaveLength(1);
     expect(d.querySelector('svg[aria-labelledby="monitor-chart-title monitor-chart-desc"]')?.textContent).toContain(data.rows[0].time.slice(5,13));
-    expect(potassiumReading(data).valid).toBe(true);
-    expect(potassiumReading(data).exceeded).toBe(true);
+    expect(triggerReading(data).valid).toBe(true);
+    expect(triggerReading(data).exceeded).toBe(true);
   });
   it('anchors the summary cards and source time to K+ when PM2.5 is newer',()=>{
     const data = monitor(2, 0.23);
@@ -161,7 +161,7 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(refresh?.hasAttribute('disabled')).toBe(false);
     expect(refresh?.getAttribute('title')).toBe('补齐当前时间范围');
   });
-  it('shows the selected route in the monitoring patrol rules table with one settings action',()=>{
+  it('shows the selected route with one settings action in the patrol card heading',()=>{
     const data = monitor();
     data.flight.selectedRoute = '东南火点巡查航线-改-副本(6)';
     const d = dom(<MonitoringPanel data={data} busy={false} ready started action={action} onPrepare={noop} onFlight={noop} onSettings={noop}/>);
@@ -169,7 +169,9 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.querySelector('.task-policy-grid')?.textContent).toContain('东南火点巡查航线-改-副本(6)');
     expect(route?.textContent).toContain('去设置');
     expect(route?.getAttribute('aria-label')).toContain('去设置');
-    expect(d.querySelectorAll('.task-policy-grid .monitoring-route-summary')).toHaveLength(1);
+    expect(d.querySelectorAll('.task-panel-heading .monitoring-route-summary')).toHaveLength(1);
+    expect(d.querySelectorAll('.task-policy-grid button')).toHaveLength(0);
+    expect(d.querySelector('.task-panel-heading')?.textContent).not.toContain('查看任务');
     expect(d.querySelectorAll('.task-policy-note .text-button')).toHaveLength(0);
   });
   it('shows the selected execution mode and confirmation rules in the patrol card',()=>{
@@ -194,7 +196,7 @@ describe('workspace readiness and data truthfulness',()=>{
   });
   it('preserves report history access but requires preparation before creation',()=>{
     const d=dom(<FlightReportPanel tabs={[]} ready={false} onPrepare={noop} openMedia={noop} openAir={noop}/>);
-    expect(button(d,'完成工作准备')).toBeDefined();
+    expect(button(d,'重新检查环境')).toBeDefined();
     expect(d.documentElement.textContent).toContain('任务列表');
     expect(d.documentElement.textContent).not.toContain('读取并核对资料');
   });

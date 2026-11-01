@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 
 const REFRESH_SECS: u64 = 300;
-const MAX_OBSERVATION_AGE: i64 = 600;
-const MAX_FETCH_AGE: i64 = 600;
+// A newly accepted observation may already be up to two minutes old.
+const MAX_OBSERVATION_AGE: i64 = 1920;
+const MAX_FETCH_AGE: i64 = 1800;
 const PROJECT: &str = "c7ea6bbc-110d-4dc9-ac75-4653ebbbca49";
 const DOCK: &str = "AHRXNBN00A029A";
 
@@ -188,13 +189,26 @@ pub fn view(app: &tauri::AppHandle) -> View {
     }
 }
 
-/// Returns the current airport wind direction in normalized meteorological
-/// degrees. The source reports the direction the wind comes from.
+/// DJI hourly forecast direction (where wind comes from), not Dock OSD wind.
+/// A manual override of the weather verdict must not revive a failed/stale read.
 pub fn current_wind_direction(app: &tauri::AppHandle) -> Option<f64> {
-    view(app)
-        .current
-        .as_ref()
-        .and_then(|sample| sample.wind_direction)
+    let state = app.state::<Weather>();
+    let cache = state.cache.lock().unwrap();
+    forecast_wind_direction(&cache, Utc::now().timestamp())
+}
+fn forecast_wind_direction(cache: &Cache, now: i64) -> Option<f64> {
+    if cache.error.is_some() {
+        return None;
+    }
+    let sample = cache.sample.as_ref()?;
+    let forecast = sample.forecast.as_ref()?;
+    if !(0..=120).contains(&(now - sample.fetched_at))
+        || !(-60..=MAX_OBSERVATION_AGE).contains(&(now - sample.observed_at))
+        || !(0..=3600).contains(&(now - forecast.observed_at))
+    {
+        return None;
+    }
+    sample.wind_direction
         .filter(|value| value.is_finite() && (0.0..=360.0).contains(value))
         .map(|value| value.rem_euclid(360.0))
 }
@@ -255,7 +269,9 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
         },
         match &result {
             Ok(sample) => {
-                json!({"observedAt":sample.observed_at,"verdict":sample.platform_label,"airworthy":sample.airworthy})
+                json!({"observedAt":sample.observed_at,"verdict":sample.platform_label,"airworthy":sample.airworthy,
+                    "forecastWindDirection":sample.wind_direction,
+                    "forecastObservedAt":sample.forecast.as_ref().map(|forecast| forecast.observed_at)})
             }
             Err(error) => json!({"error":error}),
         },
@@ -270,12 +286,9 @@ pub async fn refresh(app: &tauri::AppHandle, force: bool) {
         Err(error) => cache.error = Some(error),
     }
 }
-pub async fn check_launch(
-    app: &tauri::AppHandle,
-    manual_override: bool,
-) -> (View, Result<(), String>) {
-    // Creation and preparation run back-to-back. Reuse only a just-validated
-    // successful receipt, never an error or the ordinary five-minute cache.
+// Refresh only to select a route. A missing/failed read falls back to the default
+// route; the platform verdict is recorded/displayed, never a local launch gate.
+pub async fn refresh_for_route(app: &tauri::AppHandle) {
     let recent = {
         let state = app.state::<Weather>();
         let cache = state.cache.lock().unwrap();
@@ -284,22 +297,6 @@ pub async fn check_launch(
     if !recent {
         refresh(app, true).await;
     }
-    let weather = view(app);
-    // An explicit manual override is the operator's acknowledgement that the
-    // current weather may fail the platform's normal takeoff gate. Keep the
-    // live receipt for audit, but let FlightHub show its own blocking reminder;
-    // the operator can then decide on that platform page.
-    let result = if manual_override {
-        manual_override_result(&weather)
-    } else if weather.allowed {
-        Ok(())
-    } else {
-        Err(format!("天气条件未通过：{}", weather.reasons.join(" ")))
-    };
-    (weather, result)
-}
-fn manual_override_result(_weather: &View) -> Result<(), String> {
-    Ok(())
 }
 fn recent_launch_sample(cache: &Cache, now: i64) -> bool {
     cache.error.is_none()
@@ -329,6 +326,35 @@ pub fn start(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forecast_wind_direction_preserves_north_and_rejects_missing_stale_or_failed_reads() {
+        let mut raw = receipt(10000);
+        raw["windDirection"] = json!(66.0);
+        let mut cache = Cache {
+            sample: Some(parse_response(&raw, 10000).unwrap()),
+            error: None,
+            attempt: Some(Instant::now()),
+        };
+        assert_eq!(forecast_wind_direction(&cache, 10000), Some(66.0));
+        for verdict in [1, 2, 3] {
+            cache.sample.as_mut().unwrap().airworthy = Some(verdict);
+            assert_eq!(forecast_wind_direction(&cache, 10000), Some(66.0));
+        }
+        for (value, expected) in [(Some(0.0), Some(0.0)), (Some(360.0), Some(0.0)), (None, None), (Some(-1.0), None), (Some(361.0), None), (Some(f64::NAN), None)] {
+            cache.sample.as_mut().unwrap().wind_direction = value;
+            assert_eq!(forecast_wind_direction(&cache, 10000), expected);
+        }
+        cache.sample.as_mut().unwrap().wind_direction = Some(66.0);
+        assert_eq!(forecast_wind_direction(&cache, 9999), None);
+        assert_eq!(forecast_wind_direction(&cache, 10121), None);
+        cache.sample.as_mut().unwrap().forecast.as_mut().unwrap().observed_at = 6399;
+        assert_eq!(forecast_wind_direction(&cache, 10000), None);
+        cache.sample.as_mut().unwrap().forecast.as_mut().unwrap().observed_at = 10001;
+        assert_eq!(forecast_wind_direction(&cache, 10000), None);
+        cache.sample.as_mut().unwrap().forecast.as_mut().unwrap().observed_at = 10000;
+        cache.error = Some("weather refresh failed".into());
+        assert_eq!(forecast_wind_direction(&cache, 10000), None);
+    }
     fn receipt(now: i64) -> Value {
         json!({"url":format!("https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/{PROJECT}#/team"),
             "projectId":PROJECT,"dockSn":DOCK,"adapterVersion":1,"observedAt":now,"fetchedAt":now,
@@ -345,6 +371,7 @@ mod tests {
         };
         assert!(recent_launch_sample(&cache, 10001));
         assert!(!recent_launch_sample(&cache, 10016));
+        assert!(!recent_launch_sample(&cache, 11799)); // Display cache cannot bypass launch refresh.
         assert!(!recent_launch_sample(&cache, 9999));
         cache.error = Some("component unavailable".into());
         assert!(!recent_launch_sample(&cache, 10001));
@@ -360,13 +387,14 @@ mod tests {
         let mut raw = receipt(10000);
         let sample = parse_response(&raw, 10000).unwrap();
         assert_eq!(assess(Some(&sample), None, 10000).0, "ok");
+        assert_eq!(assess(Some(&sample), None, 11799).0, "ok");
         raw["windSpeed"] = json!(0.);
         for (verdict, level) in [(1, "ok"), (2, "caution"), (3, "unsafe")] {
             raw["airworthy"] = json!(verdict);
             let sample = parse_response(&raw, 10000).unwrap();
             assert_eq!(assess(Some(&sample), None, 10000).0, level);
         }
-        assert_eq!(assess(Some(&sample), None, 10601).0, "unknown");
+        assert_eq!(assess(Some(&sample), None, 11801).0, "unknown");
         assert_eq!(assess(Some(&sample), Some("离线"), 10000).0, "unknown");
     }
     #[test]
@@ -386,14 +414,6 @@ mod tests {
             let mut raw = receipt(10000);
             raw[key] = value;
             assert!(parse_response(&raw, 10000).is_err(), "{key}");
-        }
-    }
-    #[test]
-    fn manual_confirmation_overrides_platform_prohibition_or_missing_data() {
-        for level in ["ok", "caution", "unsafe", "unknown"] {
-            let view: View = serde_json::from_value(json!({"location":"机场","latitude":0.,"longitude":0.,"source":"DJI FlightHub 2",
-                "refreshing":false,"allowed":level=="ok","level":level,"label":"司空结论","reasons":[],"current":null})).unwrap();
-            assert!(manual_override_result(&view).is_ok());
         }
     }
     #[test]

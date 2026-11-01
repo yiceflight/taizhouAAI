@@ -1,0 +1,63 @@
+--- a/src-tauri/src/flight.rs
++++ b/src-tauri/src/flight.rs
+@@ -1422,6 +1422,15 @@
+ }
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn review_20261028_manual_binds_latest_valid_source_hour() {
++        let db = db();
++        reading(&db, "2026-10-11 10:00:00", Some(0.1));
++        reading_pm25(&db, "2026-10-11 11:00:00", Some(80.0));
++        let event = begin_manual(&db, false).unwrap();
++        assert_eq!(event.source_hour.as_deref(), Some("2026-10-11 11:00:00"));
++    }
++
+     use super::*;
+     #[test]
+     fn route_matching_prefers_the_smallest_difference_and_keeps_copy_names() {
+--- a/src-tauri/src/flight_report.rs
++++ b/src-tauri/src/flight_report.rs
+@@ -1646,6 +1646,26 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn review_20261028_completed_large_sweep_prunes_deleted_tasks() {
++        let mut db = crate::monitoring::connect(Path::new(":memory:")).unwrap();
++        let task = |index: u128| json!({
++            "taskId": Uuid::from_u128(index).to_string(),
++            "mission":{"missionId":0,"missionName":format!("task-{index}"),"startTime":1790031600000_i64,"endTime":1790032800000_i64,"geoLocation":""},
++            "status":"执行成功","mediaReady":true
++        });
++        let batch = |rows: Vec<Value>, cursor: Value, complete: bool, total: usize| json!({
++            "url":format!("https://fh.dji.com{PROJECT}#/plan"),"tasks":rows,"cursor":cursor,"historyComplete":complete,"historyError":null,"total":total,"apiVersion":1
++        });
++        persist_dji_tasks(&mut db, &batch(vec![task(999)], Value::Null, true, 1)).unwrap();
++        // A completed 301-row sweep is delivered in two leases: pages 1..6,
++        // followed by refreshed page 1 plus the final page. Old row 999 is gone.
++        persist_dji_tasks(&mut db, &batch((1..=300).map(task).collect(), json!({"apiVersion":1,"page":7,"total":301}), false, 301)).unwrap();
++        let mut last:Vec<_>=(1..=50).map(task).collect(); last.push(task(301));
++        persist_dji_tasks(&mut db, &batch(last, Value::Null, true, 301)).unwrap();
++        assert_eq!(read_dji_tasks(&db).unwrap().len(), 301);
++    }
++
+     use super::*;
+     #[test]
+     fn historical_sweep_is_throttled_only_after_a_committed_completion() {
+--- a/tests/settings-flight.test.tsx
++++ b/tests/settings-flight.test.tsx
+@@ -223,3 +223,13 @@
+   expect(ipc.invoke.mock.calls[1][1].settings.windRouteRules).toEqual([]);
+   expect(document.body.textContent).toContain('将直接使用默认航线');
+ });
++
++it('review_20261028 clears deleted route catalog after a successful data reset', async () => {
++  const show = (cleared: boolean) => <SettingsDialog settings={defaultSettings}
++    routes={cleared ? [] : [{routeId:'old',name:'已删除航线'}]} selectedRoute={cleared ? '' : '已删除航线'}
++    onClose={onClose} onSaved={onSaved} onDataCleared={async () => {root.render(show(true));}} />;
++  await act(async () => root.render(show(false)));
++  await clickText('清空数据'); await clickText('确认清空数据');
++  expect(document.body.textContent).toContain('本地数据已清空');
++  expect(document.querySelector('#flight-route')?.textContent).not.toContain('已删除航线');
++});

@@ -1,3 +1,4 @@
+import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
@@ -52,7 +53,7 @@ test('wrong project and login redirects fail before reading or changing the page
   }
 });
 function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, baseRoute=false, submit=false, name=job.name,
-  libraryRoute=TEST_ROUTE, selectedRoute=`${TEST_ROUTE}-副本(2)`, previewRoute=null, submissionDialog=null, dialogDelay=0,
+  libraryRoute=TEST_ROUTE, libraryRoutes=null, selectedRoute=`${TEST_ROUTE}-副本(2)`, previewRoute=null, submissionDialog=null, dialogDelay=0,
   receiptRows=1, deviceCard=false, fastClock=false }={}) {
   const buttons = ['普通任务','高精度 RTK','立即','返航'].map(s=>`<button>${s}</button>`).join('');
   const switches = ['多模态识别','自动断点续飞','智能规划最佳返航路线'].map(s=>`<div><span>${s}</span><button role="switch" aria-checked="true"></button></div>`).join('');
@@ -61,7 +62,7 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   window.HTMLElement.prototype.scrollIntoView = function(){};
   window.HTMLElement.prototype.focus = function(){};
   window.HTMLElement.prototype.blur = function(){};
-  let submissions=0; let followupExecutions=0;
+  let submissions=0; let followupExecutions=0; let chosenRoute=null;
   const location = {href:PLAN_URL+'/create-plan'};
   const btn = s => [...document.querySelectorAll('button')].find(e=>e.textContent===s);
   document.querySelector('#confirm').onclick=()=>{
@@ -81,9 +82,10 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   for(const label of ['普通任务','高精度 RTK','立即','返航']) btn(label).onclick=e=>e.currentTarget.className='button-primary';
   for(const el of document.querySelectorAll('[role="switch"]')) el.onclick=()=>el.setAttribute('aria-checked',el.getAttribute('aria-checked')==='true'?'false':'true');
   btn('选择航线').onclick=()=>{
-    const library=document.createElement('aside'); library.innerHTML=`<h2>航线库</h2><section><div class="route"><span>${libraryRoute}</span></div>${ambiguous?`<div class="route"><span>${TEST_ROUTE}-副本(99)</span></div>`:''}</section>`;document.body.append(library);
+    const names=libraryRoutes || (ambiguous ? [TEST_ROUTE+'-副本(98)',TEST_ROUTE+'-副本(99)'] : [libraryRoute]);
+    const library=document.createElement('aside'); library.innerHTML=`<h2>航线库</h2><section>${names.map(name=>`<div class="route"><span>${name}</span></div>`).join('')}</section>`;document.body.append(library);
     if (previewRoute) { const preview=document.createElement('aside'); preview.textContent=previewRoute; preview.onclick=()=>{throw Error('must not click a preview title')}; document.body.append(preview); }
-    library.querySelector('.route span').onclick=()=>{document.querySelector('input[placeholder]').value='新建计划30';document.querySelector('#selected-route').textContent=baseRoute?TEST_ROUTE:selectedRoute;library.remove()};
+    for (const item of library.querySelectorAll('.route span')) item.onclick=()=>{chosenRoute=item.textContent;document.querySelector('input[placeholder]').value='新建计划30';document.querySelector('#selected-route').textContent=baseRoute?TEST_ROUTE:selectedRoute;library.remove()};
   };
   btn('选择设备').onclick=()=>{
     const devices=document.createElement('aside');devices.innerHTML=`<div><span>Dock 3</span><span>泰州环境监测</span><span>Matrice 4TD</span></div>`;document.body.append(devices);
@@ -98,7 +100,7 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   let clock=0;
   const run=(commit)=>runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(name)},${JSON.stringify(PLAN_URL)},${commit},(${readFlightSubmissionIssue.toString()}))`, { document, location, HTMLInputElement:window.HTMLInputElement, Event:window.Event, Date:fastClock?{now:()=>clock}:Date, setTimeout:fastClock?(fn,ms)=>{clock+=ms;fn()}:setTimeout, getComputedStyle:()=>({visibility:'visible'}) });
   const execute=async()=>{const draft=await run(false); return submit?run(true):draft;};
-  return {execute,prepare:()=>run(false),commit:()=>run(true),document,submissions:()=>submissions,followupExecutions:()=>followupExecutions};
+  return {execute,prepare:()=>run(false),commit:()=>run(true),document,chosenRoute:()=>chosenRoute,submissions:()=>submissions,followupExecutions:()=>followupExecutions};
 }
 test('video recipe fills and verifies the form without ever clicking final confirmation', async()=>{
   const f=fixture();const result=await f.execute();assert.equal(result.submitted,false);assert.equal(result.status,'ready');assert.equal(f.submissions(),0);assert.equal(f.document.querySelector('#height').value,'110');assert.equal(f.document.querySelector('input[placeholder]').value,job.name);
@@ -193,12 +195,13 @@ test('status polling recovers a matching draft weather reason without submitting
     const stored={[`flight-${job.eventId}`]:42,['flight-monitor-tab']:43};
     const calls=[];
     const chrome={storage:{local:{get:async key=>({[key]:stored[key]})}},tabs:{get:async id=>({id,status:'complete',url:id===42?PLAN_URL+'/create-plan':PLAN_URL})},debugger:{sendCommand:async(target,method,args)=>{
+      if (method !== "Runtime.evaluate") return;
       calls.push(target.tabId);
       return {result:{value:target.tabId===42?runInNewContext(args.expression,{document,location:{href:PLAN_URL+'/create-plan'},getComputedStyle:()=>({visibility:'visible'})}):{url:PLAN_URL,name:job.name,status:'执行中'}}};
     }}};
     const released=[];
     const debuggerSession={acquire:async()=>true,release:async id=>released.push(id)};
-    const execute=runInNewContext(`${source}; watchFlight`,{chrome,debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue});
+    const execute=runInNewContext(`${source}; watchFlight`,{chrome,debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue,evaluateBackgroundRead});
     if(name===job.name) {await assert.rejects(execute(job),/在线天气风速： 12\.75m\/s/);assert.deepEqual(calls,[42]);}
     else {assert.equal((await execute(job)).status,'执行中');assert.deepEqual(calls,[42,43]);}
     assert.deepEqual(released,calls);
@@ -338,11 +341,47 @@ test('status lookup refuses duplicate names across pages instead of releasing th
   await assert.rejects(runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, setTimeout: fn => fn() }), /不唯一/);
 });
 
-test('status search replaces a stale search term with the exact target plan', async () => {
-  const { window, document } = parseHTML('<button role="tab">已结束</button><input placeholder="按航线或计划名搜索" value="旧计划"><table><tbody></tbody></table>');
+for (const placeholder of ['按航线或计划名搜索', '航线名称/计划名称']) test(`status search replaces stale term using ${placeholder}`, async () => {
+  const { window, document } = parseHTML(`<button role="tab">已结束</button><input placeholder="${placeholder}" value="旧计划"><table><tbody></tbody></table>`);
   window.HTMLElement.prototype.getClientRects = () => [1];
   const input = document.querySelector('input');
   input.addEventListener('keydown', () => { document.querySelector('tbody').innerHTML = `<tr><td><span>${input.value}</span></td><td><span>执行成功</span></td></tr>`; });
   const result = await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, { document, location: { href: PLAN_URL }, HTMLInputElement: window.HTMLInputElement, Event: window.Event, KeyboardEvent: window.Event, setTimeout: fn => fn() });
   assert.equal(input.value, job.name); assert.equal(result.status, '执行成功');
+});
+
+test('PM2.5-only automatic tasks prepare, submit once and remain readable', async()=>{
+  const name='PM2.5超标巡查-20261027-10';
+  validatePlanJob({...job,name});validateSubmitJob({...job,type:'dji-submit',submit:true,name});
+  const f=fixture({submit:true,name,fastClock:true});
+  assert.equal((await f.execute()).status,'submitted'); assert.equal(f.submissions(),1);
+  const {window,document}=parseHTML(`<button role="tab">已结束</button><table><tr><td>${name}</td><td>执行成功</td></tr></table>`);
+  window.HTMLElement.prototype.getClientRects=()=>[1];
+  const value=await runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(name)},${JSON.stringify(PLAN_URL)})`,{document,location:{href:PLAN_URL},setTimeout:fn=>fn()});
+  assert.equal(value.status,'执行成功');
+  for(const invalid of ['PM2x5超标巡查-20261027-10','PM2.5超标巡查-20261027-10-extra','司空填写演练-20261027-10']) {
+    assert.throws(()=>validateSubmitJob({...job,type:'dji-submit',submit:true,name:invalid}));
+  }
+});
+test('route library chooses smallest normalized prefix difference and rejects equal minima',async()=>{
+  for(const candidates of [[TEST_ROUTE+'-副本(123)',TEST_ROUTE],[TEST_ROUTE+'-副本(123)',TEST_ROUTE+'-副本(1)']]) {
+    const f=fixture({libraryRoutes:candidates,fastClock:true});
+    assert.equal((await f.execute()).status,'ready');assert.equal(f.chosenRoute(),candidates[1]);assert.equal(f.submissions(),0);
+  }
+  for(const candidates of [[TEST_ROUTE+'-副本(1)',TEST_ROUTE+'-副本(2)'],[TEST_ROUTE,TEST_ROUTE]]) {
+    const f=fixture({libraryRoutes:candidates,fastClock:true});
+    await assert.rejects(f.execute(),/差异最小/);assert.equal(f.submissions(),0);
+  }
+});
+
+// A blocked list must release the serial reader before the worker watchdog.
+test('status lookup stops waiting before the background read watchdog', async () => {
+  const { window, document } = parseHTML('<button role="tab">未完成</button><div aria-busy="true"></div>');
+  window.HTMLElement.prototype.getClientRects = () => [1];
+  let elapsed = 0;
+  await assert.rejects(runInNewContext(`(${readFlightStatus.toString()})(${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, {
+    document, location: { href: PLAN_URL }, Date: { now: () => elapsed },
+    setTimeout: (fn, ms) => { elapsed += ms; fn(); },
+  }), /状态查询未完成/);
+  assert.ok(elapsed > 0 && elapsed < 25000);
 });

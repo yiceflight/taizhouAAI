@@ -72,6 +72,8 @@ struct Heartbeat {
     single_job: bool,
     #[serde(default, rename = "parallelReports")]
     parallel_reports: bool,
+    #[serde(default, rename = "parallelReads")]
+    parallel_reads: bool,
 }
 struct Client {
     version: String,
@@ -83,6 +85,8 @@ struct Pending {
     tab_id: i64,
     sent: bool,
     queued_at: Instant,
+    dispatched: Option<oneshot::Sender<()>>,
+    execution_timeout: u64,
     job: Value,
     result: oneshot::Sender<Result<Value, String>>,
 }
@@ -227,12 +231,16 @@ async fn heartbeat(
     }
     // A worker executing a batch still renews its lease and tab inventory,
     // without claiming more work that it cannot execute yet.
-    if input.busy {
+    if input.busy && !input.parallel_reads {
         return Ok(Json(
             json!({ "ok": true, "jobs": [], "keepAliveSupported": true }),
         ));
     }
-    let jobs = claim_jobs(&mut inner, &input.session, input.single_job, input.parallel_reports);
+    let jobs = if input.parallel_reads {
+        claim_parallel_reads(&mut inner, &input.session, input.busy)
+    } else {
+        claim_jobs(&mut inner, &input.session, input.single_job, input.parallel_reports)
+    };
     if let Some(log) = &inner.logger {
         for job in &jobs {
             log.record(
@@ -249,7 +257,7 @@ async fn heartbeat(
         }
     }
     Ok(Json(
-        json!({ "ok": true, "jobs": jobs, "keepAliveSupported": true, "singleJobSupported": true }),
+        json!({ "ok": true, "jobs": jobs, "keepAliveSupported": true, "singleJobSupported": true, "parallelReadsSupported": true }),
     ))
 }
 
@@ -306,6 +314,39 @@ fn browser_job_message(event: &str, kind: &str, success: Option<bool>) -> String
     }
 }
 
+// Only operations which do not manipulate shared page UI may bypass the serial lane.
+fn read_job(job: &Value) -> bool {
+    matches!(job["type"].as_str(), Some("site-health" | "jiangsu-health" | "airins-health-open" | "dji-health-open" | "jiangsu-hourly" | "dji-routes" | "capture"))
+}
+fn claim_parallel_reads(inner: &mut Inner, session: &str, worker_busy: bool) -> Vec<Value> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let serial_busy = worker_busy || inner.pending.values().any(|p| p.session == session && p.sent && !read_job(&p.job));
+    let mut candidates: Vec<_> = inner.pending.iter()
+        .filter(|(_, p)| p.session == session && !p.sent && p.job["expiresAt"].as_i64().is_none_or(|at| at > now))
+        .map(|(id, p)| (id.clone(), job_priority(&p.job), p.queued_at, read_job(&p.job), report_job(&p.job)))
+        .collect();
+    candidates.sort_by_key(|(_, priority, queued, _, _)| (*priority, *queued));
+    let mut selected: Vec<_> = candidates.iter().filter(|c| c.3).map(|c| c.0.clone()).collect();
+    if !serial_busy {
+        let serial: Vec<_> = candidates.iter().filter(|c| !c.3).collect();
+        if let Some(first) = serial.first() {
+            if first.4 { selected.extend(serial.iter().filter(|c| c.4).take(3).map(|c| c.0.clone())); }
+            else { selected.push(first.0.clone()); }
+        }
+    }
+    selected.into_iter().filter_map(|id| dispatch(inner, id)).collect()
+}
+fn dispatch(inner: &mut Inner, id: String) -> Option<Value> {
+    let p = inner.pending.get_mut(&id)?;
+    p.sent = true;
+    p.job["expiresAt"] = json!(chrono::Utc::now().timestamp_millis() + p.execution_timeout as i64 * 1000);
+    if let Some(started) = p.dispatched.take() { let _ = started.send(()); }
+    let mut job = p.job.clone();
+    job["id"] = json!(id);
+    job["tabId"] = json!(p.tab_id);
+    Some(job)
+}
+
 fn claim_jobs(inner: &mut Inner, session: &str, single: bool, parallel_reports: bool) -> Vec<Value> {
     // A worker reload must not claim another job while the preceding operation
     // has an outstanding receipt. Busy heartbeats likewise never claim work.
@@ -338,14 +379,7 @@ fn claim_jobs(inner: &mut Inner, session: &str, single: bool, parallel_reports: 
     } else {
         selected_ids = candidates.into_iter().take(if single { 1 } else { usize::MAX }).map(|(id, _, _, _)| id).collect();
     }
-    selected_ids.into_iter().filter_map(|id| {
-        let p = inner.pending.get_mut(&id)?;
-        p.sent = true;
-        let mut job = p.job.clone();
-        job["id"] = json!(id);
-        job["tabId"] = json!(p.tab_id);
-        Some(job)
-    }).collect()
+    selected_ids.into_iter().filter_map(|id| dispatch(inner, id)).collect()
 }
 
 fn report_job(job: &Value) -> bool {
@@ -657,23 +691,25 @@ impl Bridge {
         result
     }
     async fn request_inner(&self, session: String, tab_id: i64, job: Value, id: String) -> Result<Value, String> {
-        let timeout = if ["dji-tasks", "dji-routes", "dji-weather", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
+        let timeout = if job["type"] == "dji-weather" {
+            // 25s navigation + 50s page read + focus cleanup and bridge delivery.
+            85
+        } else if ["dji-tasks", "dji-routes", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
             .iter()
             .any(|kind| job["type"] == *kind)
         {
-            // Health checks share one heartbeat and execute serially. The
-            // extension bounds page preparation and API probes to 15–20
-            // seconds, so a missing completion receipt should release the UI
-            // within a bounded window instead of appearing stuck for 120s.
+            // This budget starts at delivery, separately from queue waiting.
+            // Read-only checks run independently of the serial browser lane.
             HEALTH_REQUEST_TIMEOUT_SECS
         } else {
             100
         };
         let (tx, rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
         {
             let mut inner = self.0.lock().unwrap();
             prune(&mut inner);
-            if inner.pending.len() >= 8 {
+            if !read_job(&job) && inner.pending.values().filter(|p| !read_job(&p.job)).count() >= 8 {
                 return Err("采集任务过多，请稍后重试。".into());
             }
             let client = inner
@@ -738,7 +774,7 @@ impl Bridge {
                 return Err("司空任务类型与提交标记不匹配。".into());
             }
             let mut job = job;
-            job["expiresAt"] = json!(chrono::Utc::now().timestamp_millis() + timeout as i64 * 1000);
+            job["expiresAt"] = json!(chrono::Utc::now().timestamp_millis() + 120_000);
             inner.pending.insert(
                 id.clone(),
                 Pending {
@@ -746,10 +782,20 @@ impl Bridge {
                     tab_id,
                     sent: false,
                     queued_at: Instant::now(),
+                    dispatched: Some(started_tx),
+                    execution_timeout: timeout,
                     job,
                     result: tx,
                 },
             );
+        }
+        // Queue waiting and actual execution have separate deadlines.
+        match tokio::time::timeout(Duration::from_secs(120), started_rx).await {
+            Ok(Ok(())) => {},
+            other => {
+                self.0.lock().unwrap().pending.remove(&id);
+                return Err(if other.is_err() { "浏览器任务排队超时，尚未执行网站检查，请稍后重试。" } else { "采集连接已中断。" }.into());
+            }
         }
         let result = tokio::time::timeout(Duration::from_secs(timeout), rx).await;
         self.0.lock().unwrap().pending.remove(&id);
@@ -769,6 +815,30 @@ pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
 mod tests {
     use super::*;
     #[test]
+    fn reads_bypass_busy_serial_work_without_a_batch_limit_and_get_fresh_deadlines() {
+        let mut inner = Inner::default();
+        let mut receivers = Vec::new();
+        for i in 0..42 {
+            let (tx, _rx) = oneshot::channel();
+            let (started, receiver) = oneshot::channel();
+            receivers.push(receiver);
+            inner.pending.insert(i.to_string(), Pending {
+                session: "a".into(), tab_id: i, sent: i == 0,
+                queued_at: Instant::now(), dispatched: Some(started), execution_timeout: 35,
+                job: json!({"type": if i < 2 { "dji-submit" } else { "site-health" }, "expiresAt": chrono::Utc::now().timestamp_millis() + 1_000}), result: tx,
+            });
+        }
+        let reads = claim_parallel_reads(&mut inner, "a", true);
+        assert_eq!(reads.len(), 40);
+        assert!(reads.iter().all(|job| read_job(job) && job["expiresAt"].as_i64().unwrap() > chrono::Utc::now().timestamp_millis() + 30_000));
+        assert!(!inner.pending["1"].sent, "a second submit must wait");
+        assert!(receivers[2].try_recv().is_ok(), "execution timer starts on delivery");
+        assert!(claim_parallel_reads(&mut inner, "a", false).is_empty());
+        inner.pending.remove("0");
+        assert_eq!(claim_parallel_reads(&mut inner, "a", false)[0]["type"], "dji-submit");
+    }
+
+    #[test]
     fn single_job_dispatch_prioritizes_new_weather_between_background_jobs() {
         let mut inner = Inner::default();
         let mut insert = |id: &str, kind: &str, session: &str, expires: i64| {
@@ -779,7 +849,7 @@ mod tests {
                     session: session.into(),
                     tab_id: -1,
                     sent: false,
-                    queued_at: Instant::now(),
+                    queued_at: Instant::now(), dispatched: None, execution_timeout: 35,
                     job: json!({"type":kind,"expiresAt":expires}),
                     result: tx,
                 },
@@ -802,7 +872,7 @@ mod tests {
                 session: "a".into(),
                 tab_id: -1,
                 sent: false,
-                queued_at: Instant::now(),
+                queued_at: Instant::now(), dispatched: None, execution_timeout: 35,
                 job: json!({"type":"dji-weather","expiresAt":future}),
                 result: tx,
             },
@@ -820,7 +890,7 @@ mod tests {
         for (id, kind) in [("one", "flight-dji-list"), ("two", "flight-dji-image"), ("three", "flight-dji-image"), ("four", "flight-dji-image"), ("history", "dji-tasks")] {
             let (tx, _) = oneshot::channel();
             inner.pending.insert(id.into(), Pending {
-                session: "a".into(), tab_id: 2, sent: false, queued_at: Instant::now(),
+                session: "a".into(), tab_id: 2, sent: false, queued_at: Instant::now(), dispatched: None, execution_timeout: 35,
                 job: json!({"type": kind, "expiresAt": future}), result: tx,
             });
         }
@@ -987,6 +1057,7 @@ mod tests {
                 let pending = bridge.0.lock().unwrap().pending.drain().next().unwrap().1;
                 assert_eq!(pending.tab_id, -1);
                 assert_eq!(pending.job["type"], kind);
+                pending.dispatched.unwrap().send(()).unwrap();
                 pending.result.send(Ok(json!({"state":"ready"}))).unwrap();
                 assert_eq!(task.await.unwrap().unwrap()["state"], "ready");
             }
@@ -1020,6 +1091,7 @@ mod tests {
                 assert_eq!(pending.tab_id, -1);
                 assert_eq!(pending.job["cursor"], job["cursor"]);
                 assert_eq!(pending.job["includeHistory"], job["includeHistory"]);
+                pending.dispatched.unwrap().send(()).unwrap();
                 pending.result.send(Ok(json!({"tasks":[]}))).unwrap();
                 assert_eq!(request.await.unwrap(), json!({"tasks":[]}));
             }
@@ -1051,7 +1123,7 @@ mod tests {
             let input = |version: &str| Heartbeat {
                 busy: false,
                 single_job: false,
-                parallel_reports: false,
+                parallel_reports: false, parallel_reads: false,
                 session: session.clone(),
                 version: version.into(),
                 tabs: vec![BrowserTab {
@@ -1121,7 +1193,7 @@ mod tests {
             let input = || Heartbeat {
                 busy: false,
                 single_job: false,
-                parallel_reports: false,
+                parallel_reports: false, parallel_reads: false,
                 session: session.clone(),
                 version: crate::readiness::MIN_VERSION.into(),
                 tabs: ["http://61.155.4.60:18080/", "https://fh.dji.com/", "https://aai.airins.cn/sniff"]
@@ -1186,7 +1258,7 @@ mod tests {
                 Json(Heartbeat {
                     busy: false,
                     single_job: false,
-                    parallel_reports: false,
+                    parallel_reports: false, parallel_reads: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![BrowserTab {
@@ -1241,7 +1313,7 @@ mod tests {
                 Json(Heartbeat {
                     busy: false,
                     single_job: false,
-                    parallel_reports: false,
+                    parallel_reports: false, parallel_reads: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],
@@ -1256,7 +1328,7 @@ mod tests {
                 Json(Heartbeat {
                     busy: false,
                     single_job: false,
-                    parallel_reports: false,
+                    parallel_reports: false, parallel_reads: false,
                     session: session.clone(),
                     version: crate::readiness::MIN_VERSION.into(),
                     tabs: vec![],

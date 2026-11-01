@@ -2,6 +2,9 @@ import React, { act, StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { minimumExtensionVersion } from '../bridge-config.json';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { SetupPanel } from '../src/components/SetupPanel';
 import { useWorkspace } from '../src/lib/useWorkspace';
 import type { Readiness } from '../src/lib/workspace';
 
@@ -64,12 +67,15 @@ describe('automatic workspace startup', () => {
     expect(start).toHaveBeenCalledTimes(1);
   });
 
-  it('starts hourly monitoring while other platforms are offline', async () => {
+  it('waits for all platforms before starting hourly monitoring', async () => {
     state = { ...state, monitoringReady: true, flightReady: false, reportReady: false, ready: false };
     await mount();
+    expect(start).not.toHaveBeenCalled();
+    expect(current.readiness?.started).toBe(false);
+    state = { ...state, ready: true, flightReady: true, reportReady: true };
+    await tick();
     expect(start).toHaveBeenCalledTimes(1);
     expect(current.readiness?.started).toBe(true);
-    expect(current.readiness?.ready).toBe(false);
   });
 
   it('does not duplicate a slow initial sync across status polls', async () => {
@@ -122,4 +128,71 @@ describe('automatic workspace startup', () => {
     await tick();
     expect(start).toHaveBeenCalledTimes(2);
   });
+});
+
+it('flags an old running plugin even when the native process still reports its old requirement as passed', async () => {
+  let version = '0.7.32';
+  state = { ...state, minimumExtensionVersion: '0.7.32', ready: true };
+  ipc.invoke.mockImplementation(async (command: string) => {
+    if (command === 'get_bridge_status') return { connected: true, clients: 1, versions: [version], tabs: [], error: null };
+    if (command === 'get_readiness') return state;
+    if (command === 'start_workspace') return start();
+    return null;
+  });
+  await mount();
+  expect(current.readiness?.pluginUpdateRequired).toBe(true);
+  expect(current.readiness?.minimumExtensionVersion).toBe(minimumExtensionVersion);
+  expect(current.readiness?.pluginReady).toBe(false);
+  expect(start).not.toHaveBeenCalled();
+  const html = renderToStaticMarkup(<SetupPanel bridge={current.bridge} state={current.readiness} busy={false} onCheck={() => {}} openSite={() => {}} />);
+  expect(html).toContain(`当前插件 v0.7.32 · 需更新至 v${minimumExtensionVersion} 或以上`);
+  expect(html).toContain('需更新');
+  expect(html).toContain('更新插件');
+  version = minimumExtensionVersion;
+  await tick();
+  expect(current.readiness?.pluginUpdateRequired).toBe(false);
+  expect(start).toHaveBeenCalledTimes(1);
+});
+
+
+it('clears a failed flight refresh only after a newer successful observation of the same task', async () => {
+  state = { ...state, started: true };
+  let event = { id: 'flight-a', status: 'submitted', statusCheckedAt: Date.now() - 1000, statusCheckError: null };
+  let archived = false;
+  ipc.invoke.mockImplementation(async (command: string) => {
+    if (command === 'get_readiness') return state;
+    if (command === 'get_monitoring') return { flight: { event: archived ? null : event, records: archived ? [event] : [] } };
+    if (command === 'refresh_flight_status') throw '后台页面读取超时';
+    return null;
+  });
+  await mount();
+  await act(async () => { await current.action('refresh_flight_status', { eventId: 'flight-a' }); });
+  await tick();
+  expect(current.error).toBe('后台页面读取超时'); // old success is not recovery
+  event = { ...event, id: 'flight-b', statusCheckedAt: Date.now() };
+  await tick();
+  expect(current.error).toBe('后台页面读取超时'); // another task is not recovery
+  event = { ...event, id: 'flight-a', statusCheckedAt: Date.now(), statusCheckError: '仍然超时' as any };
+  await tick();
+  expect(current.error).toBe('后台页面读取超时');
+  event = { ...event, status: 'completed', statusCheckedAt: Date.now(), statusCheckError: null };
+  archived = true;
+  await tick();
+  expect(current.error).toBe('');
+});
+
+it('keeps unrelated action failures until dismissed and does not dismiss connection failures', async () => {
+  state = { ...state, started: true };
+  await mount();
+  ipc.invoke.mockRejectedValueOnce('保存设置失败');
+  await act(async () => { await current.action('save_settings'); });
+  await tick();
+  expect(current.error).toBe('保存设置失败');
+  expect(current.canDismissError).toBe(true);
+  await act(async () => current.dismissError());
+  expect(current.error).toBe('');
+  ipc.invoke.mockRejectedValueOnce('连接失败');
+  await act(async () => { await current.refresh(); });
+  expect(current.error).toContain('无法读取客户端状态');
+  expect(current.canDismissError).toBe(false);
 });

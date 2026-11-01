@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 
 export type BridgeDiagnosticReport = {
@@ -31,6 +31,7 @@ export function DiagnosticResults({ report }: { report: BridgeDiagnosticReport }
   </>;
 }
 export function BridgeDiagnostics({ active = true }: { active?: boolean }) {
+  const titleId = useId();
   const [report, setReport] = useState<BridgeDiagnosticReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
@@ -61,8 +62,8 @@ export function BridgeDiagnostics({ active = true }: { active?: boolean }) {
     try { await navigator.clipboard.writeText(diagnosticText(report)); setMessage('诊断结果已复制，可发给技术支持。'); }
     catch { setMessage('复制失败，请截图保存诊断结果。'); }
   };
-  return <section className="setup-card bridge-diagnostics" aria-labelledby="bridge-diagnostics-title" aria-busy={busy}>
-    <div className="section-heading"><div><h3 id="bridge-diagnostics-title">本机连接诊断</h3><p>检查插件文件、本机端口、客户端服务和插件心跳。</p></div><div className="button-row">
+  return <section className="setup-card bridge-diagnostics" aria-labelledby={titleId} aria-busy={busy}>
+    <div className="section-heading"><div><h3 id={titleId}>本机连接诊断</h3><p>检查插件文件、本机端口、客户端服务和插件心跳。</p></div><div className="button-row">
       <button className="secondary-button" disabled={busy} onClick={() => void run()}>{busy ? '正在诊断…' : '重新诊断'}</button>
       <button className="secondary-button" disabled={!report || busy} onClick={() => void copy()}>复制诊断结果</button>
     </div></div>

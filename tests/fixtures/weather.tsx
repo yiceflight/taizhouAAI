@@ -5,7 +5,7 @@ import { WeatherStatus } from '../../src/components/WeatherPanel';
 import type { WeatherView } from '../../src/lib/weather';
 import '../../src/App.css';
 if (!import.meta.env.DEV) throw Error('Development only');
-const sample = (): WeatherView => ({location:'泰州环境监测 Dock 3',latitude:32.434525,longitude:119.92992,source:'DJI FlightHub 2',refreshing:false,allowed:true,level:'ok',label:'适合飞行',reasons:['司空判定：适合飞行'],current:{observedAt:Date.now()/1000,fetchedAt:Date.now()/1000,temperature:26.2,weatherCode:0,windSpeed:0,windGusts:null,windDirection:null,precipitation:0,forecast:{observedAt:Date.now()/1000,condition:'晴',temperature:22,humidity:48,precipitation:0},items:[{key:'windSpeed',label:'机场实测风速',value:'0 m/s',level:1},{key:'rainfall',label:'机场实测降雨',value:'无降雨',level:1},{key:'windSpeedOnline',label:'预测飞行风速',value:'3.1 m/s',level:1},{key:'rainfallOnline',label:'短时雨量',value:'无降雨',level:1}]}});
+const sample = (): WeatherView => ({location:'泰州环境监测 Dock 3',latitude:32.434525,longitude:119.92992,source:'DJI FlightHub 2',refreshing:false,allowed:true,level:'ok',label:'适合飞行',reasons:['司空判定：适合飞行'],current:{observedAt:Date.now()/1000,fetchedAt:Date.now()/1000,temperature:26.2,weatherCode:0,windSpeed:0,windGusts:null,windDirection:66,precipitation:0,forecast:{observedAt:Date.now()/1000,condition:'晴',temperature:22,humidity:48,precipitation:0},items:[{key:'windSpeed',label:'机场实测风速',value:'0 m/s',level:1},{key:'rainfall',label:'机场实测降雨',value:'无降雨',level:1},{key:'windSpeedOnline',label:'预测飞行风速',value:'3.1 m/s',level:1},{key:'rainfallOnline',label:'短时雨量',value:'无降雨',level:1}]}});
 function Fixture() {
  const [mode,setMode]=useState('wind');
  let weather: WeatherView | undefined = sample();

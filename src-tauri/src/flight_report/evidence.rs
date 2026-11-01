@@ -13,6 +13,10 @@ pub struct Evidence {
     pub reviews: HashMap<String, PhotoReview>,
     #[serde(default)]
     pub review_method: String,
+    #[serde(default)]
+    pub anomaly_count: Option<u32>,
+    #[serde(default)]
+    pub combustion_confirmed: bool,
     pub conclusion: String,
     pub recommendation: String,
     #[serde(default)]
@@ -30,6 +34,8 @@ pub struct CityHour {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct PhotoReview {
+    #[serde(default)]
+    pub location: String,
     pub description: String,
     pub result: String,
 }
@@ -42,6 +48,10 @@ struct ReviewFile {
     photos: HashMap<String, PhotoReview>,
     #[serde(default)]
     review_method: String,
+    #[serde(default)]
+    anomaly_count: Option<u32>,
+    #[serde(default)]
+    combustion_confirmed: bool,
     conclusion: String,
     recommendation: String,
 }
@@ -64,7 +74,7 @@ pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path,
             if let Some(raw) = crate::monitoring::setting(db, &key)? {
                 let event: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
                 if event["id"].as_str() == Some(id) && event["flightTime"]["startTime"].as_i64() == Some(data.mission.start_time) && event["flightTime"]["endTime"].as_i64() == Some(data.mission.end_time) {
-                    e.trigger = match event["source"].as_str() { Some("manual") => "由人工手动发起", Some("auto") => "由K⁺监测触发流程发起", _ => "触发原因待核实" }.into();
+                    e.trigger = match event["source"].as_str() { Some("manual") => "由人工手动发起", Some("auto") if event["name"].as_str().is_some_and(|name| name.starts_with("PM2.5超标巡查-")) => "由PM2.5监测触发流程发起", Some("auto") => "由K⁺/PM2.5监测触发流程发起", _ => "触发原因待核实" }.into();
                     e.event = Some(event);
                     break;
                 }
@@ -73,11 +83,6 @@ pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path,
     } else if let Some(reason) = list_reasons(db)?.get(&data.mission.mission_id.to_string()) {
         e.trigger = match reason.as_str() { "manual_immediate" => "由人工手动发起", "dji_scheduled" => "由司空定时任务发起", "potassium_manual" => "由K⁺/PM2.5巡查经人工确认发起", "potassium_auto" => "由K⁺或PM2.5监测自动触发", _ => "触发原因待核实" }.into();
     }
-    if e.trigger.is_empty() {
-        if let Some(t) = &e.dji_task {
-            e.trigger = format!("由司空平台执行（{}）", t.task_type.as_deref().unwrap_or("任务类型待核实"));
-        }
-    }
     // Reviews are explicit local editorial inputs, bound to exact image bytes and flight.
     // A different/partial flight never inherits a conclusion or a pollution finding.
     if review_path.is_file() {
@@ -85,17 +90,20 @@ pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path,
         let review: ReviewFile = serde_json::from_slice(&raw).map_err(|e| format!("影像判读文件损坏：{e}"))?;
         if review.local_event_id == data.local_event_id && review.mission_start == data.mission.start_time && review.mission_end == data.mission.end_time {
             if review.review_method.chars().count() > 500 { return Err("影像判读来源说明过长".into()); }
-            e.review_method = review.review_method.clone();
+
             for p in &data.photos {
                 let (bytes, _) = decode_image(&p.data_url)?;
                 let hash = digest(&bytes);
                 if let Some(r) = review.photos.get(&hash) {
-                    if r.description.chars().count() > 200 || r.result.chars().count() > 200 { return Err("单张影像判读文字过长".into()); }
+                    if r.location.chars().count() > 200 || r.description.chars().count() > 200 || r.result.chars().count() > 200 { return Err("单张影像判读文字过长".into()); }
                     e.reviews.insert(hash, r.clone());
                 }
             }
             if !data.photos.is_empty() && e.reviews.len() == data.photos.len() && review.photos.len() == data.photos.len() {
                 if review.conclusion.chars().count() > 1500 || review.recommendation.chars().count() > 1500 { return Err("影像结论文字过长".into()); }
+                e.review_method = review.review_method;
+                e.anomaly_count = review.anomaly_count;
+                e.combustion_confirmed = review.combustion_confirmed;
                 e.conclusion = review.conclusion;
                 e.recommendation = review.recommendation;
             }
@@ -178,45 +186,45 @@ pub fn photo_facts(bytes: &[u8]) -> PhotoFacts {
 
 fn hour(time: &str) -> &str { time.get(11..16).unwrap_or("时刻未取得") }
 fn valid_value(value: Option<f64>) -> Option<f64> { value.filter(|v| v.is_finite() && *v >= 0.0) }
-fn trend(values: &[(&CityHour, f64)], unit: &str, change: bool) -> String {
-    match (values.first(), values.last()) {
-        (Some((a, x)), Some((b, y))) if a.time != b.time => {
-            let mut text = format!("由{}的{x:.2}{unit}{}{}的{y:.2}{unit}", hour(&a.time), if y>x {"升至"} else if y<x {"降至"} else {"持平至"}, hour(&b.time));
-            if change {
-                if *x > 0.0 { text.push_str(&format!("，{}幅{:.1}%", if y>=x {"升"}else{"降"}, (y-x).abs()/x*100.0)); }
-                else { text.push_str("，起点为0，变化率无法计算"); }
-            }
-            text
-        },
-        (Some((a, x)), _) => format!("在{}为{x:.2}{unit}，仅1个有效小时，不能计算变化", hour(&a.time)),
-        _ => "未取得，无法计算变化".into(),
-    }
+fn number(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.2}")).unwrap_or_else(|| "【 】".into())
 }
 impl Evidence {
-    pub fn city_fields(&self) -> Vec<(&'static str,String)> {
-        let k: Vec<_> = self.city_hours.iter().filter_map(|h| valid_value(h.potassium).map(|v|(h,v))).collect();
-        let pm: Vec<_> = self.city_hours.iter().filter_map(|h| valid_value(h.pm25).map(|v|(h,v))).collect();
-        let ratios: Vec<_> = self.city_hours.iter().filter_map(|h| {
+    pub fn city_fields(&self) -> Vec<(&'static str, String)> {
+        let mut hours: Vec<_> = self.city_hours.iter().collect();
+        hours.sort_by(|a,b| a.time.cmp(&b.time));
+        let k: Vec<_> = hours.iter().filter_map(|h| valid_value(h.potassium).map(|v|(*h,v))).collect();
+        let pm: Vec<_> = hours.iter().filter_map(|h| valid_value(h.pm25).map(|v|(*h,v))).collect();
+        let ratios: Vec<_> = hours.iter().filter_map(|h| {
             let p=valid_value(h.pm25).filter(|v|*v>0.0)?;
-            Some((h,valid_value(h.potassium)?/p*100.0))
+            Some((*h, valid_value(h.potassium)?/p*100.0))
         }).collect();
-        let high: Vec<_> = k.iter().filter(|(_,v)|*v>1.0).collect();
+        let mut fields = Vec::new();
+        for (values, start, end, direction) in [
+            (&pm, "CITY_PM_START", "CITY_PM_END", "CITY_PM_DIRECTION"),
+            (&k, "CITY_K_START", "CITY_K_END", "CITY_K_DIRECTION"),
+            (&ratios, "CITY_RATIO_START", "CITY_RATIO_END", "CITY_RATIO_DIRECTION"),
+        ] {
+            fields.push((start, number(values.first().map(|(_,v)|*v))));
+            let pair = values.first().zip(values.last()).filter(|(a,b)| a.0.time != b.0.time);
+            fields.push((end, number(pair.map(|(_,b)|b.1))));
+            fields.push((direction, pair.map(|(a,b)| if b.1>a.1 {"升至"} else if b.1<a.1 {"降至"} else {"持平于"}).unwrap_or("【 】").into()));
+        }
+        let pair = pm.first().zip(pm.last()).filter(|(a,b)|a.0.time!=b.0.time);
+        fields.push(("CITY_PM_CHANGE", pair.filter(|(a,_)|a.1>0.0).map(|(a,b)|format!("{:.1}",(b.1-a.1).abs()/a.1*100.0)).unwrap_or_else(||"【 】".into())));
+        fields.push(("CITY_PM_CHANGE_LABEL", pair.map(|(a,b)|if b.1<a.1 {"降幅"} else {"升幅"}).unwrap_or("【 】").into()));
+        let high:Vec<_> = k.iter().filter(|(_,v)|*v>1.0).collect();
+        fields.push(("CITY_HIGH_HOURS", if k.is_empty() {"【 】".into()} else {high.len().to_string()}));
+        fields.push(("CITY_HIGH_WINDOW", if high.is_empty() {"【 】".into()} else {high.iter().map(|(h,_)|hour(&h.time)).collect::<Vec<_>>().join("、")}));
+        // Process segmentation and combustion attribution require approved evidence.
+        fields.push(("CITY_PROCESS_COUNT", "【 】".into()));
+        fields.push(("CITY_PROCESS_TIME", "【 】".into()));
+        fields.push(("COMBUSTION_FINDING", if self.combustion_confirmed {"生物质燃烧特征明显"} else {"【 】"}.into()));
         let peak = k.iter().max_by(|a,b|a.1.total_cmp(&b.1));
-        let high_text = if k.is_empty() { "的高值小时数无法统计；".into() } else {
-            format!("的高值在{}个有效观测小时中共{}小时，{}；", k.len(), high.len(), if high.is_empty() {"未见高值时段（仅限有效小时）".into()} else {format!("对应时刻为{}",high.iter().map(|(h,_)|hour(&h.time)).collect::<Vec<_>>().join("、"))})
-        };
-        let peak_text = peak.map(|(h,v)|format!("明显高值过程划分规则待确定；全窗有效观测K⁺峰值为{v:.2}微克/立方米，发生于{}，该小时对应PM",hour(&h.time)))
-            .unwrap_or_else(||"K⁺峰值无法判断，对应PM".into());
-        let peak_pm = peak.and_then(|(h,_)|valid_value(h.pm25)).map(|v|format!("浓度为{v:.2}微克/立方米，全分析窗口K⁺/PM"))
-            .unwrap_or_else(||"浓度未取得，全分析窗口K⁺/PM".into());
-        let max_ratio = ratios.iter().max_by(|a,b|a.1.total_cmp(&b.1)).map(|(h,v)|format!("比值最高为{v:.2}%（{}）",hour(&h.time)))
-            .unwrap_or_else(||"最高比值无法计算".into());
-        let expected=((self.captured_at+8*3600000).rem_euclid(86400000)/3600000+1) as usize;
-        let note=format!("。采用泰州市城市小时数据，截至生成时刻共{}个整点，K⁺有效{}个、PM2.5有效{}个、可配对比值{}个；缺测或未发布值不补0。当前资料不足以确认生物质燃烧；巡飞时间和启动原因见第二章。", expected,k.len(),pm.len(),ratios.len());
-        vec![("CITY_PM",format!("浓度{}",trend(&pm,"微克/立方米",true))),
-             ("CITY_K",format!("浓度{}",trend(&k,"微克/立方米",false))),
-             ("CITY_RATIO",format!("比值{}；高于",trend(&ratios,"%",false))),
-             ("CITY_HIGH",high_text+&peak_text),("CITY_PEAK_PM",peak_pm),("CITY_MAX_RATIO",max_ratio),("CITY_NOTE",note)]
+        fields.push(("CITY_K_PEAK", number(peak.map(|(_,v)|*v))));
+        fields.push(("CITY_PEAK_PM", number(peak.and_then(|(h,_)|valid_value(h.pm25)))));
+        fields.push(("CITY_MAX_RATIO", number(ratios.iter().map(|(_,v)|*v).max_by(f64::total_cmp))));
+        fields
     }
 }
 
@@ -289,13 +297,12 @@ mod tests {
             CityHour{time:"2026-10-12 01:00:00".into(),potassium:Some(1.0),pm25:None,source_url:String::new(),synced_at:String::new()},
             CityHour{time:"2026-10-12 02:00:00".into(),potassium:None,pm25:None,source_url:String::new(),synced_at:String::new()},
         ],..Default::default()};
-        let fields=e.city_fields();
-        let text=fields.iter().map(|(_,s)|s.as_str()).collect::<Vec<_>>().join("");
-        assert!(text.contains("2个有效观测小时中共0小时"));
-        assert!(text.contains("00:00的0.00"));
-        assert!(text.contains("01:00的1.00"));
-        assert!(!text.contains("02:00的1.00"));
-        assert!(text.contains("最高比值无法计算"));
+        let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
+        assert_eq!(fields["CITY_HIGH_HOURS"], "0");
+        assert_eq!(fields["CITY_K_START"], "0.00");
+        assert_eq!(fields["CITY_K_END"], "1.00");
+        assert_eq!(fields["CITY_MAX_RATIO"], "【 】");
+        assert_eq!(fields["CITY_PM_END"], "【 】");
     }
     #[test]
     fn snapshot_uses_verified_city_hours_and_matching_event() {
@@ -311,7 +318,7 @@ mod tests {
         assert_eq!(e.city_hours[0].potassium,Some(0.39));
         assert!(e.trigger.is_empty());
         assert_eq!(e.city_hours[0].pm25,Some(99.0));
-        assert!(e.city_fields().iter().any(|(k,v)|*k=="CITY_PM"&&v.contains("99.00")));
+        assert!(e.city_fields().iter().any(|(k,v)|*k=="CITY_PM_START"&&v.contains("99.00")));
     }
     #[test]
     fn city_ratios_pair_same_hour_and_k_peak_uses_corresponding_pm() {
@@ -320,11 +327,28 @@ mod tests {
             e.city_hours.push(CityHour{time:format!("2026-10-25 {hour}:00"),potassium:k,pm25:pm,source_url:String::new(),synced_at:String::new()});
         }
         let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
-        assert!(fields["CITY_PM"].contains("起点为0"));
+        assert_eq!(fields["CITY_PM_CHANGE"], "【 】");
         assert!(fields["CITY_PEAK_PM"].contains("10.00"));
-        assert!(fields["CITY_MAX_RATIO"].contains("50.00%（03:00）"));
-        assert!(fields["CITY_NOTE"].contains("可配对比值2个"));
-        assert!(fields["CITY_HIGH"].contains("共1小时"));
+        assert_eq!(fields["CITY_MAX_RATIO"], "50.00");
+        assert_eq!(fields["COMBUSTION_FINDING"], "【 】");
+        assert_eq!(fields["CITY_HIGH_HOURS"], "1");
+    }
+    #[test]
+    fn declining_city_values_and_absent_evidence_remain_field_values() {
+        let empty:HashMap<_,_> = Evidence::default().city_fields().into_iter().collect();
+        assert!(empty.values().all(|v|v=="【 】"));
+        let mut e = Evidence::default();
+        for (time, value) in [("2026-10-31 11:00:00",43.0),("2026-10-31 00:00:00",48.0)] {
+            e.city_hours.push(CityHour {time:time.into(),pm25:Some(value),potassium:None,source_url:String::new(),synced_at:String::new()});
+        }
+        let fields:HashMap<_,_> = e.city_fields().into_iter().collect();
+        assert_eq!(fields["CITY_PM_DIRECTION"], "降至");
+        assert_eq!(fields["CITY_PM_CHANGE_LABEL"], "降幅");
+        assert_eq!(fields["CITY_PM_CHANGE"], "10.4");
+        assert_eq!(fields["CITY_PM_START"], "48.00");
+        assert_eq!(fields["CITY_K_PEAK"], "【 】");
+        e.combustion_confirmed = true;
+        assert!(e.city_fields().iter().any(|(k,v)|*k=="COMBUSTION_FINDING" && v=="生物质燃烧特征明显"));
     }
     #[test]
     fn image_type_requires_metadata_and_missing_gps_never_becomes_zero() {
@@ -344,13 +368,17 @@ mod tests {
         let (bytes,_)=decode_image(super::super::tests::PNG).unwrap();
         data.photos=vec![Photo{name:"x".into(),kind:"x".into(),data_url:super::super::tests::PNG.into(),presentation:None}];
         let path=std::env::temp_dir().join(format!("{}.json",Uuid::new_v4()));
-        let write=|hash:String,start:i64|fs::write(&path,json!({"localEventId":null,"missionStart":start,"missionEnd":data.mission.end_time,"photos":{hash:{"description":"test scene","result":"unverified"}},"conclusion":"reviewed","recommendation":"check"}).to_string()).unwrap();
+        let write=|hash:String,start:i64|fs::write(&path,json!({"localEventId":null,"missionStart":start,"missionEnd":data.mission.end_time,"photos":{hash:{"description":"test scene","result":"unverified"}},"conclusion":"reviewed","recommendation":"check","anomalyCount":0,"combustionConfirmed":true,"reviewMethod":"经人工复核"}).to_string()).unwrap();
         write(digest(&bytes),data.mission.start_time+1);
         assert!(snapshot(&db,&data,&path,1791736491228).unwrap().reviews.is_empty());
         write("wrong hash".into(),data.mission.start_time);
         assert!(snapshot(&db,&data,&path,1791736491228).unwrap().conclusion.is_empty());
         write(digest(&bytes),data.mission.start_time);
-        assert_eq!(snapshot(&db,&data,&path,1791736491228).unwrap().conclusion,"reviewed");
+        let complete = snapshot(&db,&data,&path,1791736491228).unwrap();
+        assert_eq!(complete.conclusion,"reviewed");
+        assert_eq!(complete.anomaly_count,Some(0));
+        assert!(complete.combustion_confirmed);
+        assert_eq!(complete.review_method,"经人工复核");
         fs::remove_file(path).unwrap();
     }
 }

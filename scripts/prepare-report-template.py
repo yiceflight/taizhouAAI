@@ -47,9 +47,6 @@ body = doc.find(w('body'))
 paragraphs = body.findall(w('p'))
 tables = body.findall(w('tbl'))
 section = deepcopy(doc.xpath('.//w:sectPr', namespaces=NS)[0])
-landscape = deepcopy(next(s for s in doc.xpath('.//w:sectPr', namespaces=NS)
-                          if s.find(w('pgSz')).get(w('orient')) == 'landscape'))
-findings = deepcopy(tables[3])
 # The authored template ends at the two conclusion slots. Everything after
 # that is historical guidance, approvals and photographs, not current facts.
 last = list(body).index(paragraphs[30])
@@ -60,28 +57,25 @@ replace(paragraphs[7], '第1期', '第{{ISSUE}}期')
 replace(paragraphs[7], '第1期', '第{{SERIES_ISSUE}}期')
 replace(paragraphs[8], '2026年X月X日', '{{ISSUED}}')
 replace(paragraphs[13], '2026-06-01 【 】时', '{{ANALYSIS_WINDOW}}')
-replace(paragraphs[13], '浓度由【 】微克/立方米升至【 】微克/立方米，升幅【 】%', '{{CITY_PM}}')
-replace(paragraphs[13], '浓度由【 】微克/立方米升至【 】微克/立方米', '{{CITY_K}}')
-replace(paragraphs[13], '由【 】%升至【 】%；高于', '{{CITY_RATIO}}')
-replace(paragraphs[13], '微克/立方米的高值共【 】小时，主要集中在【 】时段；期间共出现【 】次明显高值过程，其中【 】前后高值过程最为突出，K⁺峰值浓度达【 】微克/立方米，对应PM', '微克/立方米{{CITY_HIGH}}')
-replace(paragraphs[13], '浓度达【 】微克/立方米，时段内K⁺/PM', '{{CITY_PEAK_PM}}')
-replace(paragraphs[13], '比值最高达【 】%', '{{CITY_MAX_RATIO}}')
-replace(paragraphs[13], '，生物质燃烧特征明显。为核实高值点位、锁定污染源头，依托无人机机库启动自动巡飞。', '{{CITY_NOTE}}')
+# Preserve fixed prose: each slot is one value or an explicit condition.
+for key in ['PM_START', 'PM_END', 'PM_CHANGE', 'K_START', 'K_END',
+            'RATIO_START', 'RATIO_END', 'HIGH_HOURS', 'HIGH_WINDOW',
+            'PROCESS_COUNT', 'PROCESS_TIME', 'K_PEAK', 'PEAK_PM', 'MAX_RATIO']:
+    replace(paragraphs[13], '【 】', '{{CITY_' + key + '}}')
+for key in ['PM', 'K', 'RATIO']:
+    replace(paragraphs[13], '升至', '{{CITY_' + key + '_DIRECTION}}')
+replace(paragraphs[13], '升幅', '{{CITY_PM_CHANGE_LABEL}}')
+replace(paragraphs[13], '生物质燃烧特征明显', '{{COMBUSTION_FINDING}}')
 replace(paragraphs[15], '由钾离子（K⁺）异常高值触发', '{{TRIGGER}}')
 replace(paragraphs[15], '【XXXX年XX月XX日XX时～XX时】', '{{FLIGHT_WINDOW}}')
+# Authoring instructions are not report prose.
 replace(paragraphs[15], '各巡航区段执行情况如下，每个区段填写一行，并在对应位置插入该区段的现场照片与位置图（照片与位置图一一对应，图注连续编号）。', '各巡航区段执行情况如下。')
 replace(paragraphs[20], '【】张', '{{PHOTO_COUNT}}张')
-replace(paragraphs[20], '经AI智能识别，发现异常情况【】处', '{{PHOTO_REVIEW_SUMMARY}}')
+replace(paragraphs[20], '经AI智能识别', '{{REVIEW_METHOD}}')
+replace(paragraphs[20], '【】处', '{{ANOMALY_COUNT}}处')
 slot(paragraphs[29], '{{CONCLUSION}}')
 slot(paragraphs[30], '{{RECOMMENDATION}}')
-# Keep the no-Airins paragraph as an editable blank in its original style.
-slot(paragraphs[25], '{{AIR_INTRO}}')
-chart_slot = deepcopy(paragraphs[27])
-chart_slot.attrib.clear()
-for child in list(chart_slot):
-    if child.tag != w('pPr'): chart_slot.remove(child)
-slot(chart_slot, '{{AIR_CHART}}')
-body.insert(list(body).index(paragraphs[28]), chart_slot)
+# Keep the sensor/data-source introduction verbatim even when values are blank.
 
 # Retain the exact caption paragraph for repeated figures. Blank picture slots
 # in the reference use 10pt fixed line height: do not apply that to real images.
@@ -122,69 +116,6 @@ for para in tables[2].findall('.//' + w('p')):
     if ppr.find(w('keepNext')) is None: ET.SubElement(ppr, w('keepNext'))
 note_pr = paragraphs[27].find(w('pPr'))
 if note_pr.find(w('keepLines')) is None: ET.SubElement(note_pr, w('keepLines'))
-
-# Restore the screenshot's six-column layout from the reference appendix,
-# retaining its black cell borders, headings and column proportions. Remove
-# every historical value/image before creating the current-flight row slots.
-body.remove(section)
-section_break = ET.SubElement(body, w('p'))
-ET.SubElement(section_break, w('pPr')).append(section)
-title = deepcopy(paragraphs[21])
-slot(title, '附件1　巡查现场情况及照片')
-body.append(title)
-rows = findings.findall(w('tr'))
-for extra in rows[2:]: findings.remove(extra)
-for col, cell in enumerate(rows[1].findall(w('tc'))):
-    para = deepcopy(cell.find(w('p')))
-    for child in list(para):
-        if child.tag != w('pPr'): para.remove(child)
-    run = ET.SubElement(para, w('r'))
-    rpr = ET.SubElement(run, w('rPr'))
-    ET.SubElement(rpr, w('rFonts'), {w('ascii'): '宋体', w('eastAsia'): '宋体', w('hAnsi'): '宋体'})
-    ET.SubElement(rpr, w('sz'), {w('val'): '24'})
-    ET.SubElement(run, w('t')).text = '{{T3_%d}}' % col
-    for child in list(cell):
-        if child.tag != w('tcPr'): cell.remove(child)
-    cell.append(para)
-    tcpr = cell.find(w('tcPr'))
-    for merge in tcpr.findall(w('vMerge')): tcpr.remove(merge)
-    valign = tcpr.find(w('vAlign'))
-    if valign is None: valign = ET.SubElement(tcpr, w('vAlign'))
-    valign.set(w('val'), 'center')
-for row in findings.findall(w('tr')):
-    trpr = row.find(w('trPr'))
-    if trpr is None: trpr = ET.SubElement(row, w('trPr'))
-    for height in trpr.findall(w('trHeight')): trpr.remove(height)
-    if trpr.find(w('cantSplit')) is None: ET.SubElement(trpr, w('cantSplit'))
-header_pr = findings.find('w:tr/w:trPr', NS)
-if header_pr.find(w('tblHeader')) is None: ET.SubElement(header_pr, w('tblHeader'))
-pr = findings.find(w('tblPr'))
-pr.find(w('tblW')).attrib.update({w('w'): '13040', w('type'): 'dxa'})
-pr.find(w('tblLayout')).set(w('type'), 'fixed')
-for margin in pr.find(w('tblCellMar')): margin.set(w('w'), '80')
-widths = [875, 1464, 1448, 4335, 1433, 3485]
-for col, width in zip(findings.find(w('tblGrid')), widths): col.set(w('w'), str(width))
-for row in findings.findall(w('tr')):
-    for cell, width in zip(row.findall(w('tc')), widths):
-        cell.find('w:tcPr/w:tcW', NS).attrib.update({w('w'): str(width), w('type'): 'dxa'})
-        for margin in cell.findall('w:tcPr/w:tcMar/*', NS): margin.set(w('w'), '80')
-for run in findings.find(w('tr')).findall('.//' + w('r')):
-    rpr = run.find(w('rPr'))
-    if rpr is None: rpr = ET.SubElement(run, w('rPr'))
-    if rpr.find(w('b')) is None: ET.SubElement(rpr, w('b'))
-for para in findings.findall('.//' + w('p')):
-    ppr = para.find(w('pPr'))
-    if ppr is None: ppr = ET.SubElement(para, w('pPr'))
-    for tag in ['keepNext', 'keepLines', 'pageBreakBefore', 'spacing', 'snapToGrid']:
-        for el in ppr.findall(w(tag)): ppr.remove(el)
-    ET.SubElement(ppr, w('snapToGrid'), {w('val'): '0'})
-    ET.SubElement(ppr, w('spacing'), {w('before'): '60', w('after'): '60', w('line'): '300', w('lineRule'): 'atLeast'})
-    for size in para.findall('.//' + w('sz')): size.set(w('val'), '24')
-body.append(findings)
-body.append(ET.Element(w('p')))
-# Continue page numbers across the landscape appendix.
-for num in landscape.findall(w('pgNumType')): landscape.remove(num)
-body.append(landscape)
 
 # The reference's empty narrow cells inherit the 26pt document grid. With
 # real coordinates this breaks numbers across lines and creates hundreds of

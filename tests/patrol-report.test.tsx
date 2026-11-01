@@ -497,7 +497,7 @@ describe('task-owned reports', () => {
     await click('打开文件夹');
     expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report_directory', { id: 'report-11' });
     expect(ipc.invoke).not.toHaveBeenCalledWith('list_flight_missions', expect.anything());
-    await click('完成工作准备'); expect(prepare).toHaveBeenCalledOnce();
+    await click('重新检查环境'); expect(prepare).toHaveBeenCalledOnce();
   });
   it('blocks report generation until the mission has ended and uploaded for at least a minute', async () => {
     reports = []; missions = [{ ...second, endTime: 0 }, { ...first, endTime: Date.now() }];
@@ -604,7 +604,7 @@ describe('DJI scheduled flight automation', () => {
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
       if (command === 'sync_dji_report_tasks') return { tasks: [external(), { ...external(86400000), mediaReady: false }], skipped: 0, mediaTabId: 2 };
-      if (command === 'collect_flight_report' && fail) { fail = false; throw new Error('照片尚未上传'); }
+      if (command === 'collect_flight_report' && fail) { fail = false; throw new Error('网络暂时中断'); }
       const result = await original(command, args);
       if (command === 'save_flight_report') reports = [result];
       return result;
@@ -612,10 +612,49 @@ describe('DJI scheduled flight automation', () => {
     await act(async () => root.render(<FlightReportPanel tabs={tabs} ready={false} mediaReady onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
     await act(async () => vi.advanceTimersByTimeAsync(5000));
     expect(document.querySelector('tbody')?.textContent).toContain('下轮重试');
-    expect(document.querySelector('tbody')?.textContent).toContain('等待媒体上传结束');
+    expect(document.body.textContent).toContain('等待媒体上传结束');
     await act(async () => vi.advanceTimersByTimeAsync(60000));
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(1);
+  });
+  it.each(['司空媒体无照片：已完整解析 2 个视频文件，本航次未发现照片', '司空媒体解析失败：文件数量未核对完整', '照片尚未上传'])(
+    'stops automatic retries after completed-upload media outcome: %s', async failure => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    let task = { ...external(), mediaFolderId: 123, mediaUploadedCount: 2, mediaExpectedCount: 2 };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [task], skipped: 0, mediaTabId: 2 };
+      if (command === 'collect_flight_report') throw new Error(failure);
+      return original(command, args);
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={tabs} ready={false} mediaReady onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(document.querySelector('tbody')?.textContent).toContain('媒体上传已结束');
+    expect(document.querySelector('tbody')?.textContent).not.toContain('等待媒体上传结束');
+    expect(document.querySelector('tbody')?.textContent).not.toContain('照片尚未上传');
+    if (failure.startsWith('司空媒体无照片')) expect(document.querySelector('tbody')?.textContent).toContain('无照片');
+    await act(async () => vi.advanceTimersByTimeAsync(120000));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(1);
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(0);
+    const retry = [...document.querySelectorAll('button')].find(button => button.textContent === '重新读取媒体')!;
+    expect(retry).toBeTruthy();
+    await act(async () => retry.click());
+    expect(document.querySelector('dialog')).not.toBeNull();
+    await click('自动匹配并读取资料');
+    if (failure.startsWith('司空媒体无照片')) {
+      expect(document.querySelector('dialog [role="alert"]')).toBeNull();
+      expect(document.querySelector('dialog [role="status"]')?.textContent).toContain('媒体上传已结束，无照片');
+      expect(document.querySelector('dialog')?.textContent).not.toContain('Error:');
+    } else {
+      expect(document.querySelector('dialog [role="alert"]')?.textContent).toContain('媒体上传已结束');
+    }
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
+    await act(async () => (document.querySelector('[aria-label="关闭生成报告弹窗"]') as HTMLButtonElement).click());
+    await act(async () => vi.advanceTimersByTimeAsync(60000));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
+    task = { ...task, mediaUploadedCount: 3, mediaExpectedCount: 3 };
+    await act(async () => vi.advanceTimersByTimeAsync(60000));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(3);
   });
   it('explains a media-ready partial execution retry as a media-page switch issue', async () => {
     vi.useFakeTimers(); reports = []; missions = [];
@@ -971,4 +1010,41 @@ describe('distinct nearby DJI executions', () => {
     expect(tasks).toHaveLength(3);
     expect(tasks.find(t => t.report === report)?.mission?.missionId).toBe(0);
   });
+});
+
+it('review preserves local event evidence when collecting a report with Airins data', async () => {
+  const event: LocalFlightEvent = { ...completedWithoutAir, name: first.missionName, route: '历史实际航线', flightTime: {startTime:first.startTime,endTime:first.endTime,durationMs:first.endTime-first.startTime,source:'dji-plan',precision:'minute'} };
+  await act(async () => root.render(<FlightReportPanel tabs={tabs} ready flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+  await click('重新生成报告');
+  await click('自动匹配并读取资料');
+  const call = ipc.invoke.mock.calls.find(call => call[0] === 'collect_flight_report');
+  expect(call?.[1].request.localEventId).toBe(event.id);
+});
+it('review displays historical route instead of current default', async () => {
+  const event: LocalFlightEvent = { ...completedWithoutAir, name: first.missionName, route: '历史实际航线', flightTime: {startTime:first.startTime,endTime:first.endTime,durationMs:first.endTime-first.startTime,source:'dji-plan',precision:'minute'} };
+  await act(async () => root.render(<FlightReportPanel tabs={tabs} ready flightEvent={event} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+  const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes(first.missionName));
+  expect(row?.textContent).toContain('历史实际航线');
+});
+
+
+it('ignores pre-reset mission, DJI and report list responses that arrive after reset', async () => {
+  const pending = new Map<string, (value: unknown) => void>();
+  const original = ipc.invoke.getMockImplementation()!;
+  ipc.invoke.mockImplementation((command, args) => {
+    if (['list_flight_missions', 'list_dji_report_tasks', 'list_flight_reports'].includes(command)) {
+      return new Promise(resolve => pending.set(command, resolve));
+    }
+    return original(command, args);
+  });
+  await render();
+  expect(pending.size).toBe(3);
+  await act(async () => root.render(<FlightReportPanel dataResetKey={1} tabs={tabs} ready={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+  await act(async () => {
+    pending.get('list_flight_missions')!({ missions: [first], total: 1 });
+    pending.get('list_dji_report_tasks')!([{ taskId: 'old-task', mission: { ...second, missionId: 0 }, status: '执行成功', mediaReady: true }]);
+    pending.get('list_flight_reports')!([saved()]);
+  });
+  expect(document.querySelectorAll('tbody tr')).toHaveLength(0);
+  expect(document.querySelector('.history-card')?.textContent).toContain('0 个任务');
 });

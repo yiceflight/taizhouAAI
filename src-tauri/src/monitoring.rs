@@ -33,10 +33,6 @@ pub struct Monitor {
     error: Mutex<Option<String>>,
 }
 impl Monitor {
-    pub(crate) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
-    }
-
     pub(crate) fn reset(&self) {
         *self.last_attempt.lock().unwrap() = None;
         *self.error.lock().unwrap() = None;
@@ -167,7 +163,7 @@ fn requested_window(range: &str) -> Result<(String, String), String> {
         end.format(FORMAT).to_string(),
     ))
 }
-fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<(), String> {
+fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str, advance_cursor: bool) -> Result<(), String> {
     if !source_page(&batch.url)
         || batch.city != "泰州市"
         || batch.city_code != "321200"
@@ -207,7 +203,9 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str) -> Result<
             potassium=COALESCE(excluded.potassium,hourly_observations.potassium),pm25=COALESCE(excluded.pm25,hourly_observations.pm25),source_url=excluded.source_url,synced_at=excluded.synced_at",
             params![row.time, row.potassium, row.pm25, batch.unit, batch.url, synced]).map_err(|e| e.to_string())?;
     }
-    put(&tx, "query_through", end)?;
+    if advance_cursor {
+        put(&tx, "query_through", end)?;
+    }
     put(&tx, "last_success", &synced)?;
     tx.commit().map_err(|e| e.to_string())
 }
@@ -246,6 +244,7 @@ async fn sync_inner(
     trigger_flight: bool,
     requested_range: Option<&str>,
 ) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     crate::readiness::require_monitoring(app, false)?;
     let monitor = app.state::<Monitor>();
     if monitor.busy.swap(true, Ordering::SeqCst) {
@@ -284,7 +283,7 @@ async fn sync_inner(
         let batch: Batch =
             serde_json::from_value(raw).map_err(|_| "小时采集数据格式不正确".to_string())?;
         let count = batch.rows.len();
-        persist(&mut database(app)?, batch, &start, &end)?;
+        persist(&mut database(app)?, batch, &start, &end, requested_range.is_none())?;
         crate::runtime_log::record(
             app,
             "info",
@@ -378,6 +377,7 @@ pub fn get_monitoring(
     app: tauri::AppHandle,
     monitor: tauri::State<'_, Monitor>,
 ) -> Result<MonitorView, String> {
+    let _access = crate::data_reset::access(&app)?;
     let db = database(&app)?;
     let mut stmt = db.prepare("SELECT observed_at,potassium,pm25 FROM hourly_observations WHERE city_code='321200' ORDER BY observed_at DESC LIMIT 168").map_err(|e| e.to_string())?;
     let rows = stmt
@@ -444,6 +444,7 @@ pub async fn sync_monitoring(
 }
 #[tauri::command]
 pub fn set_monitoring_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     if enabled {
         crate::readiness::require_monitoring(&app, false)?;
     }
@@ -461,7 +462,7 @@ mod tests {
         serde_json::from_value(json!({"url":SOURCE_URL,"city":"泰州市","cityCode":"321200","unit":"μg/m³","dataSource":"A_6","commonSiteType":"30","startTime":"2026-09-16 00:00:00","endTime":"2026-09-17 00:00:00","rows":rows})).unwrap()
     }
     fn save(db: &mut Connection, data: Batch) -> Result<(), String> {
-        persist(db, data, "2026-09-16 00:00:00", "2026-09-17 00:00:00")
+        persist(db, data, "2026-09-16 00:00:00", "2026-09-17 00:00:00", true)
     }
     #[test]
     fn api_batches_accept_map_and_reject_login_and_foreign_origins() {
@@ -637,4 +638,29 @@ mod tests {
         assert!(end >= start);
         assert!(requested_window("12").is_err());
     }
+
+    #[test]
+    fn manual_ranges_preserve_backfill_cursor_and_initial_seven_day_window() {
+        for range in ["today","24","72","168"] {
+            let mut db=connect(Path::new(":memory:")).unwrap();
+            let old=(current_hour()-Duration::days(20)).format(FORMAT).to_string();
+            let (start,end)=requested_window(range).unwrap();
+            let make=|| Batch {url:SOURCE_URL.into(),city:"泰州市".into(),city_code:"321200".into(),unit:"μg/m³".into(),data_source:"A_6".into(),common_site_type:"30".into(),start_time:start.clone(),end_time:end.clone(),rows:vec![HourRow{time:end.clone(),potassium:Some(1.5),pm25:None}]};
+            persist(&mut db,make(),&start,&end,false).unwrap();
+            assert_eq!(setting(&db,"query_through").unwrap(),None);
+            assert_eq!(parse(&window(&db).unwrap().1).unwrap()-parse(&window(&db).unwrap().0).unwrap(),Duration::days(7));
+            put(&db,"query_through",&old).unwrap();
+            let before=window(&db).unwrap();
+            persist(&mut db,make(),&start,&end,false).unwrap();
+            assert_eq!(setting(&db,"query_through").unwrap().as_deref(),Some(old.as_str()));
+            assert_eq!(window(&db).unwrap(),before);
+            assert!(setting(&db,"last_success").unwrap().is_some());
+            assert_eq!(db.query_row("SELECT COUNT(*) FROM hourly_observations",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            let (a,b)=before;
+            let mut automatic=make(); automatic.start_time=a.clone();automatic.end_time=b.clone();automatic.rows.clear();
+            persist(&mut db,automatic,&a,&b,true).unwrap();
+            assert_eq!(setting(&db,"query_through").unwrap().as_deref(),Some(b.as_str()));
+        }
+    }
+
 }

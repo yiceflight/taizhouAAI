@@ -124,21 +124,25 @@ it('shows the synced route choice and persists a changed route prefix', async ()
   await act(async () => { select.options[1].selected = true; select.dispatchEvent(new window.Event('change', { bubbles: true })); });
   expect(ipc.invoke).toHaveBeenCalledWith('set_flight_route', { route: '东南火点巡查航线-改-副本(6)' });
 });
-it('configures wind based route selection with direction ranges', async () => {
+it('configures eight Chinese wind choices and persists the matching sector', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南航线' }, { routeId: 'r2', name: '西北航线' }]} selectedRoute="东南航线" onClose={onClose} onSaved={onSaved} />));
-  await act(async () => document.querySelector<HTMLInputElement>('input[name="route-selection-mode"][value="wind"]')!.click());
   await act(async () => [...document.querySelectorAll('button')].find(button => button.textContent === '＋ 添加风向规则')!.click());
-  expect(document.querySelector('[aria-label="第 1 条风向规则开始角度"]')).not.toBeNull();
+  expect(document.querySelector('[aria-label="第 1 条风向规则开始角度"]')).toBeNull();
+  const direction = document.querySelector<HTMLSelectElement>('[aria-label="第 1 条风向规则风向"]')!;
+  expect([...direction.options].map(option => option.textContent)).toEqual(['北风', '东北风', '东风', '东南风', '南风', '西南风', '西风', '西北风']);
+  await act(async () => { direction.options[1].selected = true; direction.dispatchEvent(new window.Event('change', { bubbles: true })); });
   expect(document.querySelector('[aria-label="第 1 条风向规则航线"]')?.value).toBe('东南航线');
   await submit();
-  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', { settings: expect.objectContaining({ routeSelectionMode: 'wind', windRouteRules: [{ startDegrees: 0, endDegrees: 45, route: '东南航线' }] }) });
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', { settings: expect.objectContaining({ windRouteRules: [{ startDegrees: 22.5, endDegrees: 67.5, route: '东南航线' }] }) });
 });
-it('requires at least one wind rule before enabling advanced mode', async () => {
+it('allows no wind rules when a synced default route is selected', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南航线' }]} selectedRoute="东南航线" onClose={onClose} onSaved={onSaved} />));
-  await act(async () => document.querySelector<HTMLInputElement>('input[name="route-selection-mode"][value="wind"]')!.click());
   await submit();
-  expect(ipc.invoke).not.toHaveBeenCalled();
-  expect(document.querySelector('[role="alert"]')?.textContent).toContain('至少配置一条风向规则');
+  expect(document.querySelector('label[for="flight-route"]')?.textContent).toContain('默认航线');
+  expect(document.querySelector('input[name="route-selection-mode"]')).toBeNull();
+  expect(ipc.invoke.mock.calls[0][1].settings).not.toHaveProperty('routeSelectionMode');
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', { settings: expect.objectContaining({windRouteRules:[]}) });
+  expect(document.querySelector('[role="alert"]')).toBeNull();
 });
 it('keeps the sync prompt only before the first route sync', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} />));
@@ -163,4 +167,86 @@ it('uses a matching-height refresh icon and shows its spinning state while synci
   await act(async () => { refresh.click(); await Promise.resolve(); });
   expect(document.querySelector('[aria-label="正在同步航线"] svg.refresh-icon')?.classList.contains('is-spinning')).toBe(true);
   await act(async () => resolveSync({ routes: [], selected: '东南火点巡查航线-改' }));
+});
+
+it('requires explicit reselection of legacy angle rules without silently changing them', async () => {
+  const legacy = { ...defaultSettings, routeSelectionMode: 'wind' as const, windRouteRules: [{startDegrees:0,endDegrees:45,route:'东南航线'}] };
+  await act(async () => root.render(<SettingsDialog settings={legacy} selectedRoute="东南航线" routes={[{routeId:'r1',name:'东南航线'}]} onClose={onClose} onSaved={onSaved} />));
+  const direction = document.querySelector<HTMLSelectElement>('[aria-label="第 1 条风向规则风向"]')!;
+  expect(direction.value).toBe('');
+  expect(document.body.textContent).toContain('存在旧版自定义角度规则');
+  await submit();
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  await act(async () => { direction.options[1].selected = true; direction.dispatchEvent(new window.Event('change', { bubbles: true })); });
+  await submit();
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', {settings:expect.objectContaining({windRouteRules:[{startDegrees:337.5,endDegrees:22.5,route:'东南航线'}]})});
+  expect(legacy.windRouteRules[0]).toEqual({startDegrees:0,endDegrees:45,route:'东南航线'});
+});
+it('offers each direction once and limits the list to eight rules', async () => {
+  await act(async () => root.render(<SettingsDialog settings={{...defaultSettings,routeSelectionMode:'wind'}} selectedRoute="测试航线" routes={[{routeId:'r1',name:'测试航线'}]} onClose={onClose} onSaved={onSaved} />));
+  for (let i=0;i<8;i++) await clickText('＋ 添加风向规则');
+  expect([...document.querySelectorAll<HTMLSelectElement>('.wind-route-rule > label:first-child select')].map(select=>select.value)).toEqual(['N','NE','E','SE','S','SW','W','NW']);
+  expect([...document.querySelectorAll('button')].find(button=>button.textContent==='＋ 添加风向规则')?.disabled).toBe(true);
+  expect(document.querySelector<HTMLSelectElement>('[aria-label="第 1 条风向规则风向"]')!.options[1].hasAttribute('disabled')).toBe(true);
+  await submit();
+  expect(ipc.invoke.mock.calls[0][1].settings.windRouteRules).toHaveLength(8);
+});
+it('rejects duplicate saved sectors and routes no longer in the synced list', async () => {
+  for (const rules of [
+    [{startDegrees:22.5,endDegrees:67.5,route:'测试航线'},{startDegrees:22.5,endDegrees:67.5,route:'测试航线'}],
+    [{startDegrees:22.5,endDegrees:67.5,route:'已删除航线'}],
+  ]) {
+    await act(async () => root.render(<SettingsDialog key={rules.length} settings={{...defaultSettings,routeSelectionMode:'wind',windRouteRules:rules}} selectedRoute="测试航线" routes={[{routeId:'r1',name:'测试航线'}]} onClose={onClose} onSaved={onSaved} />));
+    await submit();
+    expect(ipc.invoke).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
+  }
+});
+
+it('requires a synced default route in wind mode, even with matching rules', async () => {
+  for (const selectedRoute of ['', '已删除航线']) {
+    await act(async () => root.render(<SettingsDialog key={selectedRoute} settings={{...defaultSettings,routeSelectionMode:'wind',windRouteRules:[{startDegrees:337.5,endDegrees:22.5,route:'测试航线'}]}} routes={[{routeId:'r1',name:'测试航线'}]} selectedRoute={selectedRoute} onClose={onClose} onSaved={onSaved} />));
+    await submit();
+    expect(ipc.invoke).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('选择默认航线');
+  }
+});
+
+it('shows and saves existing rules even for legacy fixed mode and allows removing the last rule', async () => {
+  await act(async () => root.render(<SettingsDialog settings={{...defaultSettings,routeSelectionMode:'fixed',windRouteRules:[{startDegrees:22.5,endDegrees:67.5,route:'测试航线'}]}} routes={[{routeId:'r1',name:'测试航线'}]} selectedRoute="测试航线" onClose={onClose} onSaved={onSaved} />));
+  expect(document.querySelector<HTMLSelectElement>('[aria-label="第 1 条风向规则风向"]')?.value).toBe('NE');
+  await submit();
+  expect(ipc.invoke.mock.calls[0][1].settings.windRouteRules).toHaveLength(1);
+  expect(ipc.invoke.mock.calls[0][1].settings).not.toHaveProperty('routeSelectionMode');
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="删除第 1 条风向规则"]')!.click());
+  await submit();
+  expect(ipc.invoke.mock.calls[1][1].settings.windRouteRules).toEqual([]);
+  expect(document.body.textContent).toContain('将直接使用默认航线');
+});
+
+it('clears deleted route catalog after a successful data reset', async () => {
+  const show = (cleared: boolean) => <SettingsDialog settings={defaultSettings}
+    routes={cleared ? [] : [{routeId:'old',name:'已删除航线'}]} selectedRoute={cleared ? '' : '已删除航线'}
+    onClose={onClose} onSaved={onSaved} onDataCleared={async () => {root.render(show(true));}} />;
+  await act(async () => root.render(show(false)));
+  await clickText('清空数据'); await clickText('确认清空数据');
+  expect(document.body.textContent).toContain('本地数据已清空');
+  expect(document.querySelector('#flight-route')?.textContent).not.toContain('已删除航线');
+});
+
+it('serializes route selection with clearing so a late selection cannot restore deleted routes', async () => {
+  const routes=[{routeId:'a',name:'航线甲'},{routeId:'b',name:'航线乙'}];
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={routes} selectedRoute="航线甲" onClose={onClose} onSaved={onSaved} />));
+  await clickText('清空数据');
+  let finish!: (value: unknown) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise(resolve => {finish=resolve;}));
+  const select=document.querySelector<HTMLSelectElement>('#flight-route')!;
+  await act(async () => { select.options[1].selected=true; select.dispatchEvent(new window.Event('change',{bubbles:true})); });
+  // Programmatic clicks can bypass disabled fieldsets in a DOM fixture. The shared lock still rejects them.
+  await clickText('确认清空数据');
+  expect(ipc.invoke.mock.calls.map(call=>call[0])).toEqual(['set_flight_route']);
+  await act(async () => finish({routes,selected:'航线乙'}));
+  await clickText('确认清空数据');
+  expect(ipc.invoke.mock.calls.map(call=>call[0])).toEqual(['set_flight_route','clear_all_data']);
+  expect(document.querySelector('#flight-route')?.textContent).not.toContain('航线乙');
 });

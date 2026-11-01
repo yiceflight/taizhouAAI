@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { collectDjiWeather, openDjiWeather, WEATHER_URL } from '../extension/src/dji-weather.js';
+import { collectDjiWeather, openDjiWeather, WEATHER_URL, WEATHER_READ_TIMEOUT_MS } from '../extension/src/dji-weather.js';
 const now = Date.now();
 function fixture(change = {}) {
   const sn = 'AHRXNBN00A029A';
@@ -14,6 +14,7 @@ function fixture(change = {}) {
     ...change,
   };
   const calls = [];
+  const forecast = { hourly: [{ time: new Date(now-60000).toISOString(), text: '阴', temp: 19, humidity: 80, precip: 0, wind360: 66, windDir: '东北偏东风' }] };
   let clock = now;
   class TestDate extends Date { static now() { return clock; } }
   const context = {
@@ -25,11 +26,31 @@ function fixture(change = {}) {
       calls.push({url,options});
       return {ok:true,json:async () => ({code:0,data:url.endsWith('/topologies')
         ? {list:[{parents:[{device_sn:sn,device_model:{key:'3-3-0'},device_online_status:true}]}]}
-        : {hourly:[{time:new Date(now-60000).toISOString(),text:'阴',temp:19,humidity:80,precip:0}]}})};
+        : forecast})};
     },
   };
-  return {component,context,calls,run:()=>vm.runInNewContext(`(${collectDjiWeather})()`,context)};
+  return {component,context,calls,forecast,run:()=>vm.runInNewContext(`(${collectDjiWeather})()`,context)};
 }
+test('returns numeric forecast direction independently of OSD wind speed and text direction', async () => {
+  const f = fixture();
+  f.component.currentDeviceThingProperties.wind_direction = 180;
+  assert.equal((await f.run()).windDirection, 66);
+  assert.equal((await f.run()).forecast.observedAt, Math.floor((now-60000)/1000));
+  for (const [value, expected] of [[0,0],[360,0],[22.5,22.5],[337.5,337.5],[null,null],[undefined,null],['66',null],[-1,null],[361,null],[NaN,null],[Infinity,null]]) {
+    f.forecast.hourly[0].wind360 = value;
+    const result = await f.run();
+    assert.equal(result.windDirection, expected, String(value));
+    assert.equal(result.airworthy, 1); // Missing direction does not change the platform weather verdict.
+  }
+});
+test('uses the latest current forecast without falling back to older or future wind', async () => {
+  const f = fixture();
+  const h = f.forecast.hourly[0];
+  f.forecast.hourly = [{...h,time:new Date(now-7200000).toISOString(),wind360:180}, {...h,time:new Date(now+60000).toISOString(),wind360:270}, {...h,wind360:undefined}, {...h,time:new Date(now-1800000).toISOString(),wind360:90}];
+  assert.equal((await f.run()).windDirection, null);
+  f.forecast.hourly = f.forecast.hourly.filter(h => Date.parse(h.time) < now-3600000 || Date.parse(h.time) > now);
+  await assert.rejects(f.run(), /当前时段数据/);
+});
 test('reads API data and DJI verdict independently of wind thresholds; credentials never leave the page', async () => {
   const f=fixture(); const result=await f.run();
   assert.equal(result.airworthy,1); assert.equal(result.windSpeed,20); assert.equal(result.forecast.temperature,19);
@@ -122,4 +143,37 @@ test('reports the specific missing weather item or component instead of suggesti
   await assert.rejects(component.run(), /机场设备卡片尚未加载/);
   const osd = fixture(); delete osd.component.currentDeviceThingProperties.osd_timestamp;
   await assert.rejects(osd.run(), /尚未收到机场实时遥测/);
+});
+
+// Exercise the worker watchdog without spending real time waiting on Chrome.
+test('weather read survives the former 20s cutoff and restores focus on completion', async t => {
+  const { evaluateBackgroundRead } = await import('../extension/src/background-read.js');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let finish;
+  const focus = [];
+  const api = { sendCommand: async (_, method, args) => {
+    if (method === 'Runtime.evaluate') return new Promise(resolve => { finish = resolve; });
+    focus.push(args.enabled);
+  } };
+  const pending = evaluateBackgroundRead(api, 7, {}, WEATHER_READ_TIMEOUT_MS);
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(44000); // 12s topology + 20s component + 12s forecast.
+  finish({ result: { value: 'fresh-weather' } });
+  assert.deepEqual(await pending, { result: { value: 'fresh-weather' } });
+  assert.deepEqual(focus, [true, false]);
+});
+test('a stalled weather page still times out and restores focus', async t => {
+  const { evaluateBackgroundRead } = await import('../extension/src/background-read.js');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const focus = [];
+  const api = { sendCommand: async (_, method, args) => {
+    if (method === 'Runtime.evaluate') return new Promise(() => {});
+    focus.push(args.enabled);
+  } };
+  const pending = evaluateBackgroundRead(api, 7, {}, WEATHER_READ_TIMEOUT_MS);
+  const rejected = assert.rejects(pending, /后台页面读取超时/);
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(WEATHER_READ_TIMEOUT_MS);
+  await rejected;
+  assert.deepEqual(focus, [true, false]);
 });

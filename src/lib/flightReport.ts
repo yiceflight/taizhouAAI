@@ -1,7 +1,7 @@
 import type { WeatherCheck } from './weather';
 export type Mission = { missionId:number; missionName:string; startTime:number; endTime:number; geoLocation:string };
 export type Point = { time:number; pm25:number|null; longitude:number|null; latitude:number|null };
-export type CollectedFlight = { withoutAirData?:boolean; localEventId?:string|null; mission:Mission; air:{ url:string;missionId:number;unit:string;points:Point[];chart?:{method:string;sourceChannel:string;missionId:number;startTime:number;endTime:number;pointCount:number;maximum:number;minimum:number;capturedAt:number;width:number;height:number;dataUrl:string}|null;channels?:Record<string,{sourceChannel:string;unit:string;values:(number|null)[]}> }; media:{url:string;folder:string;files:string[]};photos:{name:string;dataUrl:string;kind:string;presentation?:{method:string;width:number;height:number;imageRect?:{x:number;y:number;width:number;height:number};annotationCount:number;labels:string[];capturedAt:number;dataUrl:string|null}|null}[] };
+export type CollectedFlight = { dataGeneration?: number; withoutAirData?:boolean; localEventId?:string|null; mission:Mission; air:{ url:string;missionId:number;unit:string;points:Point[];chart?:{method:string;sourceChannel:string;missionId:number;startTime:number;endTime:number;pointCount:number;maximum:number;minimum:number;capturedAt:number;width:number;height:number;dataUrl:string}|null;channels?:Record<string,{sourceChannel:string;unit:string;values:(number|null)[]}> }; media:{url:string;folder:string;files:string[]};photos:{name:string;dataUrl:string;kind:string;presentation?:{method:string;width:number;height:number;imageRect?:{x:number;y:number;width:number;height:number};annotationCount:number;labels:string[];capturedAt:number;dataUrl:string|null}|null}[] };
 export type FlightSummary = { withoutAirData?:boolean; localEventId?:string|null; id:string;createdAt:number;title:string;path:string;photoCount:number;issueCount?:number|null;pointCount:number;warning:string;mission?:Mission|null;airUrl?:string;mediaUrl?:string };
 export type FlightTime = { startTime: number; endTime: number; durationMs: number; source: 'dji-plan'; precision: 'minute' };
 export type LocalFlightEvent = { id:string; observedAt:string; name:string; status:string; source?:string; potassium?:number|null; pm25?:number|null; route?:string|null; error?:string|null; launchAt?:number|null; statusCheckError?:string|null; statusCheckedAt?:number|null; weatherOverrideConfirmedAt?:number|null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
@@ -45,7 +45,7 @@ export function airinsMissionUrl(mission: Mission): string {
   return `${AIRINS_HISTORY_URL}?missionId=${encodeURIComponent(mission.missionId)}`;
 }
 export function missionOriginLabel(mission: Pick<Mission, 'missionName'>): string {
-  if (/^钾离子超标巡查-\d{8}-\d{2}$/.test(mission.missionName)) return '本应用 · 自动巡查';
+  if (/^(?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}$/.test(mission.missionName)) return '本应用 · 自动巡查';
   if (/^手动巡查-\d{8}-\d{2}-[a-f0-9]{8}$/.test(mission.missionName)) return '本应用 · 手动起飞';
   if (/^司空填写演练-\d{8}-\d{2}$/.test(mission.missionName)) return '本应用 · 填写演练';
   return '司空平台任务';

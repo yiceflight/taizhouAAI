@@ -132,6 +132,7 @@ pub async fn generate_report(
     session: String,
     tab_id: i64,
 ) -> Result<ReportSummary, String> {
+    let _access = crate::data_reset::access(&app)?;
     crate::runtime_log::record(
         &app,
         "info",
@@ -185,6 +186,7 @@ fn summary(report: Report) -> ReportSummary {
 }
 #[tauri::command]
 pub fn list_reports(app: tauri::AppHandle) -> Result<Vec<ReportSummary>, String> {
+    let _access = crate::data_reset::access(&app)?;
     let mut reports = vec![];
     for item in fs::read_dir(directory(&app)?).map_err(|e| e.to_string())? {
         let path = item.map_err(|e| e.to_string())?.path();
@@ -205,6 +207,7 @@ pub fn list_reports(app: tauri::AppHandle) -> Result<Vec<ReportSummary>, String>
 }
 #[tauri::command]
 pub fn open_report(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     let path = report_path(&directory(&app)?, &id)?;
     let report: Report =
         serde_json::from_slice(&fs::read(&path).map_err(|e| format!("无法读取报告：{e}"))?)
@@ -217,6 +220,7 @@ pub fn open_report(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 #[tauri::command]
 pub fn open_reports_directory(app: tauri::AppHandle) -> Result<(), String> {
+    let _access = crate::data_reset::access(&app)?;
     app.opener()
         .open_path(
             directory(&app)?.to_str().ok_or("报告路径无效")?,

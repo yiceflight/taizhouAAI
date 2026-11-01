@@ -51,7 +51,16 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
   const origin = location.origin;
   if (!['http://61.155.4.60:18080', 'https://fh.dji.com', 'https://aai.airins.cn'].includes(origin)) throw new Error('非授权网站');
   const visible = el => el.getClientRects().length > 0;
-  if (/[/#](login|signin)([/?#]|$)/i.test(url) || [...document.querySelectorAll('input[type="password"]')].some(visible)) return result('login_required', '请在 Chrome 中完成登录');
+  if ([...document.querySelectorAll('input[type="password"]')].some(visible)) return result('login_required', '请在 Chrome 中完成登录');
+  if (/[/#](login|signin)([/?#]|$)/i.test(url)) {
+    // Jiangsu keeps #/login for its module launcher after sign-in. The launcher
+    // is only a cue to open a business page; its appearance never proves API access.
+    const text = document.body?.innerText || '';
+    if (origin === 'http://61.155.4.60:18080' && ['综合分析', '离线分析', '数据管理', '运维中心', '温室气体'].every(label => text.includes(label))) {
+      return { ...result('page_required', '已进入平台入口，正在验证业务访问'), needsBusinessPage: true };
+    }
+    return result('login_required', '请在 Chrome 中完成登录');
+  }
   const classify = response => {
     const code = response?.code;
     if ([401, 44001, 200401, '401', '44001', '200401'].includes(code)) return 'login_required';

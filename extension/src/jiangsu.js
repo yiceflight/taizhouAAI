@@ -16,9 +16,22 @@ export function findJiangsuApi() {
   return null;
 }
 
+// Use the site's launcher handler in this tab: its authenticated context is
+// not necessarily available to a newly created tab or a direct business URL.
+export function enterJiangsuAnalysis() {
+  if (location.origin !== new URL("http://61.155.4.60:18080").origin || location.hash !== '#/login') throw new Error('江苏大气站入口已变化，请重新验证');
+  const labels = ['综合分析', '离线分析', '数据管理', '运维中心', '温室气体'];
+  const text = document.body?.innerText || '';
+  if (!labels.every(label => text.includes(label)) || [...document.querySelectorAll('input[type="password"]')].some(el => el.getClientRects().length)) throw new Error('请先在江苏大气站完成登录');
+  const entries = [...document.querySelectorAll('body *')].filter(el => el.textContent.trim() === '综合分析' && el.children.length === 0 && el.getClientRects().length > 0);
+  if (entries.length !== 1) throw new Error('无法唯一识别综合分析入口，请手动进入后重新验证');
+  entries[0].click();
+  return { opened: true };
+}
+
 // Verify all existing source tabs before concluding that login is required.
 // A stale login tab must not hide the user's authenticated map tab.
-export async function prepareJiangsuForHealth(chrome, capture, timing = {}) {
+export async function prepareJiangsuForHealth(chrome, capture, timing = {}, enterBusiness) {
   const now = timing.now || Date.now;
   const pause = timing.pause || (() => new Promise(resolve => setTimeout(resolve, 250)));
   const origin = new URL(JIANGSU_URL).origin;
@@ -27,6 +40,7 @@ export async function prepareJiangsuForHealth(chrome, capture, timing = {}) {
     .filter(tab => new URL(tab.url).origin === origin)
     .sort((a, b) => Number(loginPage(a.url)) - Number(loginPage(b.url)) || a.id - b.id);
   if (!tabs.length) tabs.push(await chrome.tabs.create({ url: JIANGSU_URL, active: false }));
+  const entered = new Set();
   const deadline = now() + 20000;
   const pending = new Set(tabs.map(tab => tab.id));
   let failure;
@@ -37,12 +51,24 @@ export async function prepareJiangsuForHealth(chrome, capture, timing = {}) {
       if (tab.status !== 'complete') continue;
       const health = await capture(id, { type: 'site-health' }).catch(() => ({ url: tab.url, state: 'error', message: '此标签页验证失败，请检查页面或网络后重试' }));
       if (new URL(health.url).origin !== origin) throw new Error('江苏大气站验证页面来源不匹配');
+      if (health.state === 'page_required' && health.needsBusinessPage === true && loginPage(health.url)) {
+        if (!entered.size && enterBusiness) {
+          entered.add(id);
+          await enterBusiness(id);
+          // Recheck this same tab after the website's asynchronous navigation.
+          continue;
+        }
+        if (entered.has(id)) continue;
+        pending.delete(id);
+        failure ||= { url: health.url, tabId: id, state: 'page_required', message: '请进入综合分析后重新验证业务访问' };
+        continue;
+      }
       if (health.state === 'ready') return { ...health, tabId: id };
       // An unmounted app may become usable; login/error results are final for
       // this tab, but do not prevent checking other open source pages.
       if (health.state === 'page_required') continue;
       pending.delete(id);
-      if (!failure || failure.state === 'login_required') failure = { ...health, tabId: id };
+      if (!failure || ['login_required', 'page_required'].includes(failure.state)) failure = { ...health, tabId: id };
     }
     if (pending.size) await pause();
   }

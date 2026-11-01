@@ -230,3 +230,37 @@ it('fetches missing weather immediately after plugin checks pass without retryin
   expect(requests()).toHaveLength(2);
   await act(async () => finish());
 });
+
+it('refreshes expired cached weather on focus once, and rearms after recovery', async () => {
+  state = { ...state, started: true };
+  let weather = { current: { fetchedAt: Date.now() / 1000 }, refreshing: false, level: 'ok' };
+  let finish!: () => void;
+  ipc.invoke.mockImplementation(async (command: string) => {
+    if (command === 'get_readiness') return state;
+    if (command === 'get_monitoring') return { weather, flight: {} };
+    if (command === 'refresh_weather') return new Promise<void>(resolve => { finish = resolve; });
+    return null;
+  });
+  const requests = () => ipc.invoke.mock.calls.filter(([command]) => command === 'refresh_weather');
+  await mount();
+  expect(requests()).toHaveLength(0);
+  weather = { ...weather, level: 'unknown', current: { fetchedAt: Date.now() / 1000 - 1801 } };
+  await act(async () => { window.dispatchEvent(new window.Event('focus')); });
+  expect(requests()).toHaveLength(1);
+  expect(current.acting).toBe(false);
+  await tick();
+  expect(requests()).toHaveLength(1);
+  await act(async () => finish());
+  await tick();
+  expect(requests()).toHaveLength(1); // Failed recovery leaves retries to the native timer.
+  weather = { ...weather, level: 'unsafe' };
+  await tick();
+  expect(requests()).toHaveLength(1); // A valid unfavorable verdict is not unavailable data.
+  weather = { ...weather, level: 'unknown', refreshing: true };
+  await tick();
+  expect(requests()).toHaveLength(1);
+  weather = { ...weather, refreshing: false };
+  await tick();
+  expect(requests()).toHaveLength(2);
+  await act(async () => finish());
+});

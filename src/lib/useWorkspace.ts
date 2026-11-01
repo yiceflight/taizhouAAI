@@ -13,7 +13,7 @@ export function useWorkspace() {
   const lock = useRef(false);
   const pendingActions = useRef(0);
   const autoStartAttempted = useRef(false);
-  const missingWeatherRequested = useRef(false);
+  const unavailableWeatherRequested = useRef(false);
   const [startupReset, setStartupReset] = useState(0);
   const refresh = useCallback(async () => {
     if (!isTauri()) { setPollError('请使用桌面客户端完成插件配置和监测。'); return; }
@@ -46,14 +46,15 @@ export function useWorkspace() {
   }, [refresh]);
   useEffect(() => {
     const weather = monitor?.weather;
-    if (!readiness?.pluginReady || weather?.current) {
-      missingWeatherRequested.current = false;
+    if (!readiness?.pluginReady || (weather?.current && weather.level !== 'unknown')) {
+      unavailableWeatherRequested.current = false;
       return;
     }
-    if (!monitor || weather?.refreshing || missingWeatherRequested.current) return;
-    // Recover immediately from a weather read made before the plugin connected.
+    if (!monitor || weather?.refreshing || unavailableWeatherRequested.current) return;
+    // Recover immediately when weather is missing or the native verdict becomes
+    // unavailable (including expired data after sleep or a clock change).
     // Leave subsequent retries to the native timer, without locking other actions.
-    missingWeatherRequested.current = true;
+    unavailableWeatherRequested.current = true;
     void invoke('refresh_weather').catch(() => {}).then(refresh);
   }, [readiness?.pluginReady, monitor, refresh]);
   const action = useCallback(async (command: string, args?: Record<string, unknown>) => {

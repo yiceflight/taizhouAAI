@@ -1,3 +1,4 @@
+import { createTaskTabManager, waitForTaskList } from '../extension/src/task-tab.js';
 import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -131,17 +132,18 @@ test('rejects wrong project, missing login, invalid task identity and failed bus
   await assert.rejects(fixture({code:200401}).run(),/登录已过期/);
   await assert.rejects(fixture({total:1,map:r=>({...r,prj_uuid:'other'})}).run(),/身份/);
 });
-test('worker reuses the project page without creating a shared media tab',async()=>{
+test('worker reuses its dedicated task page without creating a shared media tab',async()=>{
   const source=await readFile(new URL('../extension/src/service-worker.js',import.meta.url),'utf8');
   const sync=source.slice(source.indexOf('async function syncDjiTasks('),source.indexOf('async function bridgeTabs('));
   const tabs=[{id:1,url:PLAN_URL.replace('#/plan','#/team'),status:'complete',active:true},{id:2,url:PLAN_URL.replace('#/plan','#/media?page=1&size=50'),status:'complete'},{id:3,url:PLAN_URL,status:'complete',active:false},{id:4,url:PLAN_URL,status:'complete',active:true}];
   const stored={'flight-task-history-tab':3,'flight-task-sync-tab':4};const removed=[];let creates=0;
   const context=vm.createContext({evaluateBackgroundRead,PLAN_URL,readDjiTasks, evaluationValue:r=>r.result.value,debuggerSession:{acquire:async()=>true,release:async()=>{}},chrome:{debugger:{sendCommand:async()=>({result:{value:{url:PLAN_URL,tasks:[],cursor:null}}})},tabs:{query:async()=>tabs,get:async id=>tabs.find(t=>t.id===id),create:async()=>{creates++;throw Error('unexpected tab')},remove:async ids=>removed.push(...ids)},storage:{local:{get:async()=>stored,set:async v=>Object.assign(stored,v),remove:async keys=>keys.forEach(k=>delete stored[k])}}}});
+  context.taskTabFor = createTaskTabManager(context.chrome); context.waitForTaskList = waitForTaskList;
   vm.runInContext(sync,context);for(let i=0;i<3;i++)await vm.runInContext('syncDjiTasks({includeHistory:true,cursor:null})',context);
-  assert.equal(creates,0);assert.deepEqual(removed,[3]);assert.equal(stored['flight-report-media-tab'],undefined);
+  assert.equal(creates,0);assert.deepEqual(removed,[]);assert.equal(stored['flight-report-media-tab'],undefined);
 });
 
-test('task sync never selects a media or team page when a plan page is open', async () => {
+test('task sync creates its own plan page even when user plan, media and team pages are open', async () => {
   const source = await readFile(new URL('../extension/src/service-worker.js', import.meta.url), 'utf8');
   const sync = source.slice(source.indexOf('async function syncDjiTasks('), source.indexOf('async function bridgeTabs('));
   const tabs = [
@@ -153,11 +155,12 @@ test('task sync never selects a media or team page when a plan page is open', as
   const context = vm.createContext({ evaluateBackgroundRead, PLAN_URL, readDjiTasks, evaluationValue: r => r.result.value,
     debuggerSession: { acquire: async () => true, release: async () => {} },
     chrome: { debugger: { sendCommand: async ({ tabId }, method) => { if (method === 'Runtime.evaluate') calls.push(tabId); return { result: { value: { url: PLAN_URL, tasks: [], cursor: null } } }; } },
-      tabs: { query: async () => tabs, get: async id => tabs.find(t => t.id === id), remove: async () => {} },
+      tabs: { query: async () => tabs, get: async id => tabs.find(t => t.id === id), create: async options => { assert.equal(options.active, false); const tab = { id: 4, url: options.url, status: 'complete' }; tabs.push(tab); return tab; }, remove: async () => {} },
       storage: { local: { get: async () => ({}), set: async () => {}, remove: async () => {} } } } });
+  context.taskTabFor = createTaskTabManager(context.chrome); context.waitForTaskList = waitForTaskList;
   vm.runInContext(sync, context);
   await vm.runInContext('syncDjiTasks({ includeHistory: false, cursor: null })', context);
-  assert.deepEqual(calls, [3]);
+  assert.deepEqual(calls, [4]);
 });
 
 test('report media tabs are owned per task and closed after collection', async () => {

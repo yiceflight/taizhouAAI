@@ -159,7 +159,7 @@ describe('manual launch confirmation', () => {
     expect(action).not.toHaveBeenCalled();
     const dialog = document.querySelector('dialog[open]')!;
     expect(dialog).not.toBeNull();
-    for (const text of ['当前钾离子未超标', '阴 · 25.7 °C', '1.97 m/s', '机场降雨', '预报湿度', '0.2 μg/m³', '> 1 μg/m³', '数据时间：', '天气时刻：']) expect(dialog.textContent).toContain(text);
+    for (const text of ['当前已配置指标未超标', '阴 · 25.7 °C', '1.97 m/s', '机场降雨', '预报湿度', '0.2 μg/m³', '> 1 μg/m³', '数据时间：', '天气时刻：']) expect(dialog.textContent).toContain(text);
     await click('取消');
     expect(action).not.toHaveBeenCalled();
     expect(document.querySelector('dialog')).toBeNull();

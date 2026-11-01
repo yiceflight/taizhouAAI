@@ -7,7 +7,8 @@ const time = (n: number | undefined) => n == null ? '尚未获取' : new Date(n 
 function weatherPresentation(weather: WeatherView | undefined) {
   const allowed = weatherPasses(weather);
   const refreshing = !!weather?.refreshing;
-  if (!weather?.current || weather.level === 'unknown') return { allowed: false, label: weather?.current ? '暂无法判断' : refreshing ? '正在获取天气' : '暂无法判断', reasons: weather?.reasons.length ? weather.reasons : [refreshing ? '正在向司空获取最新天气和适飞结论，请稍候。' : '等待司空气象数据和适飞结论。'], refreshing };
+  if (!weather?.current) return { allowed: false, label: refreshing ? '正在获取天气' : '暂无天气数据', reasons: [refreshing ? '正在向司空获取最新天气，请稍候。' : '暂无天气数据，将自动获取。'], refreshing };
+  if (weather.level === 'unknown') return { allowed: false, label: '暂无法判断', reasons: weather.reasons.length ? weather.reasons : ['等待司空气象数据和适飞结论。'], refreshing };
   const now = Date.now() / 1000, sample = weather.current;
   if (now - sample.observedAt < -60 || now - sample.observedAt > 1920 || now - sample.fetchedAt < 0 || now - sample.fetchedAt > 1800) {
     return { allowed: false, label: '天气已过期', reasons: ['天气数据已过期，请刷新。'], refreshing };

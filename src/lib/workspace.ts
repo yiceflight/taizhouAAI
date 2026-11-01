@@ -12,7 +12,7 @@ export type NoFlyPeriod = { start: string; end: string };
 // Legacy input only; route selection now depends on whether wind rules exist.
 export type RouteSelectionMode = 'fixed' | 'wind';
 export type WindRouteRule = { startDegrees: number; endDegrees: number; route: string };
-export type WorkspaceSettings = { potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[]; routeSelectionMode?: RouteSelectionMode; windRouteRules?: WindRouteRule[] };
+export type WorkspaceSettings = { potassiumEnabled?: boolean; pm25Enabled?: boolean; potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[]; routeSelectionMode?: RouteSelectionMode; windRouteRules?: WindRouteRule[] };
 export type FlightRoute = { routeId: string; name: string; updateTime?: number };
 export const defaultSettings: WorkspaceSettings = { potassiumThreshold: 1.0, pm25Threshold: 30, takeoffDelayMinutes: 5, requireManualConfirmation: true, noFlyPeriods: [{ start: '05:00', end: '08:00' }], windRouteRules: [] };
 export type FlightEvent = { id: string; observedAt: string; sourceHour?: string | null; potassium: number | null; pm25?: number | null; route?: string | null; name: string; status: 'countdown' | 'preparing' | 'ready' | 'submitting' | 'submitted' | 'uncertain' | 'flying' | 'paused' | 'completed' | 'flight_error' | 'failed' | 'not_flown' | 'restricted' | 'canceled' | 'dismissed'; error: string | null; preview: boolean; source?: string; launchAt?: number | null; statusCheckError?: string | null; statusCheckedAt?: number | null; weatherOverrideConfirmedAt?: number | null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
@@ -54,13 +54,19 @@ export function latestValidRow(data: MonitorView | null, field?: 'potassium' | '
   });
 }
 export function triggerReading(data: MonitorView | null, now = Date.now()) {
-  const latest = latestValidRow(data) ?? data?.rows.find(row => [row.potassium, row.pm25].some(value => value != null));
-  const age = latest ? now - hourTime(latest.time) : NaN;
-  const valid = !!latest && age >= 0 && age <= 3 * 3600000 && [latest.potassium, latest.pm25].some(value => value != null && Number.isFinite(value));
   const settings = data?.settings ?? defaultSettings;
-  const potassiumExceeded = valid && latest?.potassium != null && Number.isFinite(latest.potassium) && latest.potassium > settings.potassiumThreshold;
-  const pm25Exceeded = valid && latest?.pm25 != null && Number.isFinite(latest.pm25) && latest.pm25 > settings.pm25Threshold;
-  return { latest, valid, potassiumExceeded, pm25Exceeded, exceeded: potassiumExceeded || pm25Exceeded, potassiumThreshold: settings.potassiumThreshold, pm25Threshold: settings.pm25Threshold };
+  const potassium = latestValidRow(data, 'potassium') ?? data?.rows.find(row => row.potassium != null);
+  const pm25 = latestValidRow(data, 'pm25') ?? data?.rows.find(row => row.pm25 != null);
+  const fresh = (row: HourRow | undefined) => !!row && now >= hourTime(row.time) && now - hourTime(row.time) <= 3 * 3600000;
+  const potassiumValid = settings.potassiumEnabled !== false && fresh(potassium) && Number.isFinite(potassium?.potassium);
+  const pm25Valid = settings.pm25Enabled !== false && fresh(pm25) && Number.isFinite(pm25?.pm25);
+  const potassiumExceeded = potassiumValid && potassium!.potassium! > settings.potassiumThreshold;
+  const pm25Exceeded = pm25Valid && pm25!.pm25! > settings.pm25Threshold;
+  const candidates = [settings.potassiumEnabled !== false ? potassium : undefined, settings.pm25Enabled !== false ? pm25 : undefined].filter((row): row is HourRow => !!row).sort((a, b) => b.time.localeCompare(a.time));
+  const latest = candidates.find(fresh) ?? candidates[0];
+  const triggerHour = [potassiumExceeded ? potassium : undefined, pm25Exceeded ? pm25 : undefined].filter((row): row is HourRow => !!row).sort((a, b) => b.time.localeCompare(a.time))[0]?.time;
+  return { latest, potassium, pm25, potassiumValid, pm25Valid, triggerHour, valid: potassiumValid || pm25Valid, potassiumExceeded, pm25Exceeded, exceeded: potassiumExceeded || pm25Exceeded, potassiumThreshold: settings.potassiumThreshold, pm25Threshold: settings.pm25Threshold };
+
 }
 export function dataQuality(data: MonitorView | null) {
   const reading = triggerReading(data);
@@ -74,7 +80,7 @@ export function dataQuality(data: MonitorView | null) {
     const label = reading.potassiumExceeded && reading.pm25Exceeded ? 'K⁺、PM2.5 均超过巡查阈值' : reading.potassiumExceeded ? 'K⁺ 超过巡查阈值' : 'PM2.5 超过巡查阈值';
     return { tone: 'warning', label, detail: '监测数据超过巡查触发阈值' };
   }
-  return { tone: 'success', label: '数据正常', detail: 'K⁺ 与 PM2.5 数据在有效时间内' };
+  return { tone: 'success', label: '数据正常', detail: `${[reading.potassiumValid ? 'K⁺' : '', reading.pm25Valid ? 'PM2.5' : ''].filter(Boolean).join('、')} 数据在有效时间内` };
 }
 
 type FlightSummary = { title: string; detail: string; tone: 'muted' | 'warning' | 'danger' | 'active' | 'ready'; needsManualLaunch?: boolean };
@@ -108,14 +114,14 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
     if (event.source === 'manual') return { title: '手动任务已取消', detail: '本次取消不影响自动触发 · 可立即执行任务', tone: 'muted' };
     return { title: '无人机 · 任务已取消', detail: event.source === 'auto' ? '该小时不再自动触发 · 新小时重新判断' : '可立即执行任务', tone: 'muted' };
   }
-  const { latest, valid, potassiumExceeded, pm25Exceeded, exceeded, potassiumThreshold, pm25Threshold } = triggerReading(data, now);
+  const { potassium, pm25, triggerHour, valid, potassiumExceeded, pm25Exceeded, exceeded, potassiumThreshold, pm25Threshold } = triggerReading(data, now);
   if (noFlyPeriod(data.settings, now)) return { title: '禁飞时间 · 不执行起飞', detail: '超标仅记录', tone: 'muted' };
   if (exceeded) {
-    if (!event && records.some(record => record.status === 'restricted' && record.observedAt === latest!.time)) {
+    if (!event && records.some(record => record.status === 'restricted' && record.observedAt === triggerHour)) {
       const metric = potassiumExceeded && pm25Exceeded ? 'K⁺、PM2.5' : potassiumExceeded ? 'K⁺' : 'PM2.5';
       return { title: `${metric} 超标 · 等待新小时数据`, detail: '本小时已记录，不自动补飞 · 可手动执行任务', tone: 'warning', needsManualLaunch: true };
     }
-    const details = [potassiumExceeded && latest!.potassium != null ? `K⁺ ${latest!.potassium} > ${potassiumThreshold} μg/m³` : '', pm25Exceeded && latest!.pm25 != null ? `PM2.5 ${latest!.pm25} > ${pm25Threshold} μg/m³` : ''].filter(Boolean).join('；');
+    const details = [potassiumExceeded && potassium!.potassium != null ? `K⁺ ${potassium!.potassium} > ${potassiumThreshold} μg/m³` : '', pm25Exceeded && pm25!.pm25 != null ? `PM2.5 ${pm25!.pm25} > ${pm25Threshold} μg/m³` : ''].filter(Boolean).join('；');
     const detail = details;
     const needsManualLaunch = data.settings.requireManualConfirmation;
     const next = !ready ? '请先完成工作准备' : needsManualLaunch ? '请手动执行巡查任务' : '等待自动巡飞调度';

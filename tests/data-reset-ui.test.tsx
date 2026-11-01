@@ -23,6 +23,7 @@ const click=async(text:string)=>{await act(async()=>[...document.querySelectorAl
 beforeEach(()=>{
   const {window}=parseHTML('<html><body><div id="root"></div></body></html>');
   window.HTMLElement.prototype.showModal=function(){this.setAttribute('open','');};
+  vi.stubGlobal('HTMLFormElement', window.HTMLFormElement);
   vi.stubGlobal('window',window);vi.stubGlobal('document',window.document);vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT',true);
   root=createRoot(document.getElementById('root')!);
   state.workspace={bridge:null,readiness:null,monitor:{settings:defaultSettings,flight:{routes:[],records:[]}},error:'',acting:false,action:vi.fn(),refresh:vi.fn(async()=>{}),resetStartup:vi.fn()};

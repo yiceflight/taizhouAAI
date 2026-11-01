@@ -282,6 +282,7 @@ fn browser_job_label(kind: &str) -> String {
         "site-health" => "检查可飞网站连接".into(),
         "jiangsu-health" => "检查江苏监测网站连接".into(),
         "dji-health-open" => "检查司空 FlightHub 连接".into(),
+        "open-business-site" => "打开托管平台页面".into(),
         "airins-health-open" => "检查可飞平台连接".into(),
         "airins-realtime" => "读取可飞实时监测数据".into(),
         "jiangsu-hourly" => "同步江苏小时监测数据".into(),
@@ -719,7 +720,8 @@ impl Bridge {
             if !crate::readiness::compatible(&client.version) {
                 return Err(format!("浏览器插件必须更新：当前 v{}，需要 v{} 或以上。请在 Chrome 扩展管理页重新加载插件。", client.version, crate::readiness::MIN_VERSION));
             }
-            if job["type"] != "dji-prepare"
+            if job["type"] != "open-business-site"
+                && job["type"] != "dji-prepare"
                 && job["type"] != "dji-submit"
                 && job["type"] != "dji-open-prepared"
                 && job["type"] != "dji-status"
@@ -739,6 +741,12 @@ impl Bridge {
                 if tab.status != "complete" {
                     return Err("页面尚未加载完成，请稍后重试。".into());
                 }
+            } else if job["type"] == "open-business-site"
+                && (tab_id != -1
+                    || !job["url"].as_str().is_some_and(allowed_url)
+                    || job.as_object().is_none_or(|value| value.len() != 2))
+            {
+                return Err("托管平台页面参数无效。".into());
             } else if (job["type"] == "dji-tasks" || job["type"] == "dji-routes")
                 && (tab_id != -1
                     || job.as_object().is_none_or(|value| {
@@ -762,7 +770,8 @@ impl Bridge {
                 && (tab_id < -1 || job.as_object().is_none_or(|value| value.len() != 1))
             {
                 return Err("江苏大气站验证任务参数无效。".into());
-            } else if job["type"] != "dji-tasks"
+            } else if job["type"] != "open-business-site"
+                && job["type"] != "dji-tasks"
                 && job["type"] != "dji-routes"
                 && job["type"] != "airins-realtime"
                 && job["type"] != "airins-health-open"
@@ -1011,6 +1020,37 @@ mod tests {
         );
         prune(&mut inner);
         assert!(inner.clients.is_empty());
+    }
+    #[test]
+    fn managed_site_open_validates_url_and_does_not_require_existing_tabs() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let session = Uuid::new_v4().to_string();
+            bridge.0.lock().unwrap().clients.insert(session.clone(), Client {
+                version: crate::readiness::MIN_VERSION.into(),
+                tabs: vec![], last_seen: Instant::now(),
+            });
+            for (tab, job) in [
+                (-1, json!({"type":"open-business-site","url":"https://example.test"})),
+                (1, json!({"type":"open-business-site","url":"https://fh.dji.com/"})),
+                (-1, json!({"type":"open-business-site","url":"https://fh.dji.com/","submit":true})),
+            ] {
+                assert!(bridge.request(session.clone(), tab, job).await.is_err());
+            }
+            let worker = bridge.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                worker.request(session, -1, json!({"type":"open-business-site","url":"https://fh.dji.com/"})).await
+            });
+            for _ in 0..100 {
+                if bridge.busy() { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let pending = bridge.0.lock().unwrap().pending.drain().next().unwrap().1;
+            assert_eq!(pending.tab_id, -1);
+            pending.dispatched.unwrap().send(()).unwrap();
+            pending.result.send(Ok(json!({"opened":true}))).unwrap();
+            assert_eq!(task.await.unwrap().unwrap()["opened"], true);
+        });
     }
     #[test]
     fn background_read_only_jobs_require_fixed_parameters_and_allow_missing_tabs() {

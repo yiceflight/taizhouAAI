@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "江苏省泰州环境监测中心智能监测系统 · 浏览器桥接",
-  "version": "0.7.38",
+  "version": "0.7.40",
   "description": "江苏省泰州环境监测中心智能监测系统的 Chrome 数据采集与 CDP 桥接插件。",
   "permissions": [
     "debugger",
     "tabs",
     "alarms",
-    "storage"
+    "storage",
+    "tabGroups"
   ],
   "host_permissions": [
     "http://61.155.4.60:18080/*",

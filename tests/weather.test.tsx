@@ -46,7 +46,7 @@ describe('weather gates',()=>{
     expect(d.documentElement.textContent).toContain('是否允许起飞由大疆后台决定');
     expect(d.documentElement.textContent).not.toContain('12 m/s');
     const missing=doc(<WeatherPanel busy={false} onRefresh={noop}/>);
-    expect(missing.documentElement.textContent).toContain('暂无法判断');
+    expect(missing.documentElement.textContent).toContain('暂无天气数据');
     expect(missing.documentElement.textContent).not.toContain('天气条件通过');
   });
   it('keeps task entry available for unsafe, missing or stale weather',()=>{
@@ -113,6 +113,9 @@ describe('weather status explanation', () => {
       expect(trigger(sample).textContent).toContain('天气已过期');
       expect(trigger(sample).textContent).not.toContain('m/s');
     }
-    expect(trigger().textContent).toContain('等待司空气象数据');
+    expect(trigger().textContent).toContain('暂无天气数据，将自动获取');
+    const missing = { ...good(), current: null, level: 'unknown' as const, reasons: ['测试版插件未连接，请加载开发版插件。'] };
+    expect(trigger(missing).textContent).not.toContain('插件未连接');
+    expect(trigger({ ...missing, refreshing: true }).textContent).toContain('正在向司空获取最新天气');
   });
 });

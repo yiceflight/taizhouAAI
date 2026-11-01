@@ -49,3 +49,9 @@
 - [`docs/flight-plan-preparation.md`](../docs/flight-plan-preparation.md)
 - [`docs/drone-dispatch.md`](../docs/drone-dispatch.md)
 - [`docs/flight-report.md`](../docs/flight-report.md)
+
+## 托管标签组
+
+插件 v0.7.40 起，App 自动打开的业务页统一归入蓝色「泰州监测 · App 托管」标签组；开发版使用独立的「泰州监测 · App 托管（开发版）」组。后台查找只复用该组的页面，用户另行打开的平台页不会仅因网址相同而被接管。已有任务保存的页面在再次使用时会归组。所有页面仍共用原 Chrome 配置中的登录态。
+
+从 App 打开平台也通过桥接插件执行，插件未连接或过旧时会提示修复连接，不会绕过分组打开普通页面。标签组用于区分用途，Chrome 仍允许手动关闭；关闭后下次需要时会重建页面和分组，原有飞行草稿与提交防重规则不变。

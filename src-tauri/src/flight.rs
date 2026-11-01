@@ -521,16 +521,33 @@ fn observe_with_weather(
     check: Option<WeatherCheck>,
 ) -> Result<Option<Event>, String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
-    let latest: Option<(String, Option<f64>, Option<f64>)> = tx.query_row(
-        "SELECT observed_at,potassium,pm25 FROM hourly_observations WHERE city_code='321200' AND (potassium IS NOT NULL OR pm25 IS NOT NULL) ORDER BY observed_at DESC LIMIT 1", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(|e| e.to_string())?;
-    let Some((time, k, pm25)) = latest else {
-        return Ok(None);
-    };
-    let age = at - parse(&time)?;
-    if age < Duration::zero() || age > Duration::hours(3) {
-        return Ok(None);
+    let settings = crate::settings::read(&tx)?;
+    // Each configured metric has its own reporting clock. Never let a newer
+    // normal PM2.5 row hide a delayed, still-fresh potassium exceedance.
+    let mut readings = Vec::new();
+    for (field, enabled, threshold) in [
+        ("potassium", settings.potassium_enabled, settings.potassium_threshold),
+        ("pm25", settings.pm25_enabled, settings.pm25_threshold),
+    ] {
+        if !enabled { continue; }
+        let row: Option<(String, f64)> = tx.query_row(
+            &format!("SELECT observed_at,{field} FROM hourly_observations WHERE city_code='321200' AND {field} IS NOT NULL ORDER BY observed_at DESC LIMIT 1"), [],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+        if let Some((time, value)) = row {
+            let age = at - parse(&time)?;
+            if value.is_finite() && age >= Duration::zero() && age <= Duration::hours(3) {
+                readings.push((time, field, value, value > threshold));
+            }
+        }
     }
+    // Bind the task to the newest exceeding source hour, not the other
+    // metric's newer normal hour. Normal readings never consume an hour.
+    readings.sort_by(|a, b| b.0.cmp(&a.0));
+    let Some(selected) = readings.iter().find(|r| r.3).or_else(|| readings.first()) else { return Ok(None); };
+    let time = selected.0.clone();
+    // Event values belong to the bound hour; do not mislabel mixed-hour data.
+    let k = readings.iter().find(|r| r.1 == "potassium" && r.0 == time).map(|r| r.2);
+    let pm25 = readings.iter().find(|r| r.1 == "pm25" && r.0 == time).map(|r| r.2);
     // Failed means no launch request was sent. All sources, including manual
     // and preview attempts, release their slot on the next valid source hour.
     // Keep the original receipt and handled-hour guards in the same transaction.
@@ -549,7 +566,6 @@ fn observe_with_weather(
             put(&tx, "flight_episode", "")?;
         }
     }
-    let settings = crate::settings::read(&tx)?;
     let potassium_exceeded = k.is_some_and(|value| value > settings.potassium_threshold);
     let pm25_exceeded = pm25.is_some_and(|value| value > settings.pm25_threshold);
     if potassium_exceeded || pm25_exceeded {
@@ -1984,6 +2000,49 @@ mod tests {
         observe(&mut db, t, true).unwrap();
         reading(&db, "2026-09-22 10:00:00", Some(2.));
         assert!(observe(&mut db, t, true).unwrap().is_none());
+    }
+    #[test]
+    fn delayed_potassium_triggers_after_normal_newer_pm25() {
+        for same_hour in [true, false] {
+            let mut db = db();
+            configure(&db, 1.0, 5, false);
+            let at = parse("2026-09-22 15:00:00").unwrap();
+            reading_pm25(&db, "2026-09-22 15:00:00", Some(20.0));
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+            let hour = if same_hour { "2026-09-22 15:00:00" } else { "2026-09-22 14:00:00" };
+            if same_hour {
+                db.execute("UPDATE hourly_observations SET potassium=2", []).unwrap();
+            } else { reading(&db, hour, Some(2.0)); }
+            let event = observe(&mut db, at, true).unwrap().unwrap();
+            assert_eq!(event.source_hour.as_deref(), Some(hour));
+            assert_eq!(event.potassium, Some(2.0));
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+            dismiss(&db);
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn only_configured_metrics_trigger_and_each_has_own_freshness() {
+        for potassium_enabled in [true, false] {
+            let mut db = db();
+            configure(&db, 1.0, 5, false);
+            let mut settings = crate::settings::read(&db).unwrap();
+            settings.potassium_enabled = potassium_enabled;
+            settings.pm25_enabled = !potassium_enabled;
+            put(&db, "workspace_settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+            let at = parse("2026-09-22 15:00:00").unwrap();
+            reading(&db, "2026-09-22 14:00:00", Some(if potassium_enabled { 0.2 } else { 2.0 }));
+            reading_pm25(&db, "2026-09-22 15:00:00", Some(if potassium_enabled { 80.0 } else { 20.0 }));
+            assert!(observe(&mut db, at, true).unwrap().is_none());
+            if potassium_enabled { reading(&db, "2026-09-22 14:00:00", Some(2.0)); }
+            else { reading_pm25(&db, "2026-09-22 15:00:00", Some(80.0)); }
+            assert!(observe(&mut db, at, true).unwrap().is_some());
+        }
+        let mut db = db();
+        configure(&db, 1.0, 5, false);
+        reading(&db, "2026-09-22 11:00:00", Some(2.0));
+        reading_pm25(&db, "2026-09-22 15:00:00", Some(20.0));
+        assert!(observe(&mut db, parse("2026-09-22 15:00:00").unwrap(), true).unwrap().is_none());
     }
     #[test]
     fn pm25_threshold_uses_or_rule_and_strict_boundary() {

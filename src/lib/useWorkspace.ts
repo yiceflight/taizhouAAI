@@ -13,6 +13,7 @@ export function useWorkspace() {
   const lock = useRef(false);
   const pendingActions = useRef(0);
   const autoStartAttempted = useRef(false);
+  const missingWeatherRequested = useRef(false);
   const [startupReset, setStartupReset] = useState(0);
   const refresh = useCallback(async () => {
     if (!isTauri()) { setPollError('请使用桌面客户端完成插件配置和监测。'); return; }
@@ -43,6 +44,18 @@ export function useWorkspace() {
       window.removeEventListener('focus', onFocus);
     };
   }, [refresh]);
+  useEffect(() => {
+    const weather = monitor?.weather;
+    if (!readiness?.pluginReady || weather?.current) {
+      missingWeatherRequested.current = false;
+      return;
+    }
+    if (!monitor || weather?.refreshing || missingWeatherRequested.current) return;
+    // Recover immediately from a weather read made before the plugin connected.
+    // Leave subsequent retries to the native timer, without locking other actions.
+    missingWeatherRequested.current = true;
+    void invoke('refresh_weather').catch(() => {}).then(refresh);
+  }, [readiness?.pluginReady, monitor, refresh]);
   const action = useCallback(async (command: string, args?: Record<string, unknown>) => {
     const priority = command === 'cancel_flight';
     if (lock.current && !priority) return false;

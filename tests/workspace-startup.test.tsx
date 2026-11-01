@@ -196,3 +196,37 @@ it('keeps unrelated action failures until dismissed and does not dismiss connect
   expect(current.error).toContain('无法读取客户端状态');
   expect(current.canDismissError).toBe(false);
 });
+
+it('fetches missing weather immediately after plugin checks pass without retrying on every poll', async () => {
+  state = { ...state, pluginReady: false, started: true };
+  let weather: { current: object | null; refreshing: boolean } = { current: null, refreshing: false };
+  let finish!: () => void;
+  ipc.invoke.mockImplementation(async (command: string) => {
+    if (command === 'get_readiness') return state;
+    if (command === 'get_monitoring') return { weather, flight: {} };
+    if (command === 'refresh_weather') return new Promise<void>(resolve => { finish = resolve; });
+    return null;
+  });
+  const requests = () => ipc.invoke.mock.calls.filter(([command]) => command === 'refresh_weather');
+  await mount();
+  expect(requests()).toHaveLength(0);
+  state = { ...state, pluginReady: true };
+  await act(async () => { await current.refresh(); });
+  expect(requests()).toHaveLength(1);
+  expect(current.acting).toBe(false);
+  await tick();
+  expect(requests()).toHaveLength(1);
+  await act(async () => finish());
+  await tick();
+  expect(requests()).toHaveLength(1); // native timer owns retries after a failed read
+  weather = { current: {}, refreshing: false };
+  await tick();
+  expect(requests()).toHaveLength(1);
+  weather = { current: null, refreshing: true };
+  await tick();
+  expect(requests()).toHaveLength(1); // an existing native fetch is enough
+  weather = { current: null, refreshing: false };
+  await tick();
+  expect(requests()).toHaveLength(2);
+  await act(async () => finish());
+});

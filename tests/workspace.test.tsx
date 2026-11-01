@@ -201,3 +201,31 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(d.documentElement.textContent).not.toContain('读取并核对资料');
   });
 });
+
+
+describe('independent configured monitoring metrics', () => {
+  it('reevaluates delayed potassium even with a newer normal PM2.5 row', () => {
+    const data = monitor(0, null);
+    data.rows = [{time:at(0), potassium:null, pm25:20}];
+    expect(triggerReading(data).exceeded).toBe(false);
+    data.rows.push({time:at(1), potassium:2, pm25:null});
+    expect(triggerReading(data).potassiumExceeded).toBe(true);
+    expect(triggerReading(data).triggerHour).toBe(at(1));
+    expect(flightSummary(data, true).detail).toContain('K⁺ 2 > 1');
+    data.settings.potassiumEnabled = false;
+    expect(triggerReading(data).exceeded).toBe(false);
+    data.settings.potassiumEnabled = true;
+    data.settings.pm25Enabled = false;
+    expect(triggerReading(data).latest?.time).toBe(at(1));
+    expect(triggerReading(data).exceeded).toBe(true);
+  });
+  it('does not treat stale potassium as fresh because PM2.5 is fresh', () => {
+    const data = monitor(0, null);
+    data.rows = [{time:at(0), potassium:null, pm25:20}, {time:at(4), potassium:2, pm25:null}];
+    expect(triggerReading(data).valid).toBe(true);
+    expect(triggerReading(data).exceeded).toBe(false);
+    expect(dataQuality(data).detail).toBe('PM2.5 数据在有效时间内');
+    data.settings.pm25Enabled = false;
+    expect(triggerReading(data).valid).toBe(false);
+  });
+});

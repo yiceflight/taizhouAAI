@@ -2,7 +2,7 @@ import React, { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { parseHTML } from 'linkedom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { SettingsDialog } from '../src/components/SettingsDialog';
+let SettingsDialog: typeof import('../src/components/SettingsDialog').SettingsDialog;
 import { defaultSettings } from '../src/lib/workspace';
 
 const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -10,10 +10,16 @@ vi.mock('@tauri-apps/api/core', () => ipc);
 let root: ReturnType<typeof createRoot>;
 const onClose = vi.fn();
 const onSaved = vi.fn(async () => {});
-beforeEach(() => {
+beforeEach(async () => {
   const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
   Object.defineProperty(window.HTMLElement.prototype, 'showModal', { configurable: true, value() { this.setAttribute('open', ''); } });
+  vi.stubGlobal('HTMLFormElement', window.HTMLFormElement);
+  vi.stubGlobal('DocumentFragment', function () { return window.document.createDocumentFragment(); });
+  vi.stubGlobal('Event', window.Event);
+  vi.stubGlobal('getComputedStyle', () => ({ animationName: 'none', display: 'block' }));
   vi.stubGlobal('window', window); vi.stubGlobal('document', window.document); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  // Import after installing the DOM so Radix enables its browser layout effects.
+  ({ SettingsDialog } = await import('../src/components/SettingsDialog'));
   root = createRoot(document.getElementById('root')!);
   ipc.invoke.mockReset().mockResolvedValue(null); onClose.mockClear(); onSaved.mockClear();
 });
@@ -117,8 +123,9 @@ it('keeps the confirmation available and shows storage errors on clear failure',
 });
 it('shows the synced route choice and persists a changed route prefix', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[{ routeId: 'r1', name: '东南火点巡查航线-改' }, { routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }]} selectedRoute="东南火点巡查航线-改" onClose={onClose} onSaved={onSaved} />));
-  const select = document.querySelector<HTMLSelectElement>('#flight-route')!;
-  expect(select.value).toBe('东南火点巡查航线-改');
+  const trigger = document.querySelector<HTMLButtonElement>('#flight-route')!;
+  const select = trigger.parentElement!.querySelector<HTMLSelectElement>('select')!;
+  expect(trigger.textContent).toBe('东南火点巡查航线-改');
   expect([...select.options].map(option => option.textContent)).toEqual(['东南火点巡查航线-改', '东南火点巡查航线-改-副本(6)']);
   ipc.invoke.mockResolvedValueOnce({ routes: [{ routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }], selected: '东南火点巡查航线-改-副本(6)' });
   await act(async () => { select.options[1].selected = true; select.dispatchEvent(new window.Event('change', { bubbles: true })); });
@@ -131,7 +138,7 @@ it('configures eight Chinese wind choices and persists the matching sector', asy
   const direction = document.querySelector<HTMLSelectElement>('[aria-label="第 1 条风向规则风向"]')!;
   expect([...direction.options].map(option => option.textContent)).toEqual(['北风', '东北风', '东风', '东南风', '南风', '西南风', '西风', '西北风']);
   await act(async () => { direction.options[1].selected = true; direction.dispatchEvent(new window.Event('change', { bubbles: true })); });
-  expect(document.querySelector('[aria-label="第 1 条风向规则航线"]')?.value).toBe('东南航线');
+  expect(document.querySelector('[aria-label="第 1 条风向规则航线"]')?.textContent).toBe('东南航线');
   await submit();
   expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', { settings: expect.objectContaining({ windRouteRules: [{ startDegrees: 22.5, endDegrees: 67.5, route: '东南航线' }] }) });
 });
@@ -146,20 +153,23 @@ it('allows no wind rules when a synced default route is selected', async () => {
 });
 it('keeps the sync prompt only before the first route sync', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} onClose={onClose} onSaved={onSaved} />));
-  const unsynced = document.querySelector<HTMLSelectElement>('#flight-route')!;
-  expect([...unsynced.options].map(option => option.textContent)).toEqual(['请先同步航线列表']);
+  const unsynced = document.querySelector<HTMLButtonElement>('#flight-route')!;
+  expect(unsynced.textContent).toBe('请先同步航线列表');
+  expect(unsynced.disabled).toBe(true);
   await act(async () => root.unmount());
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={[{ routeId: 'r1', name: '东南火点巡查航线' }]} routesSyncedAt={Date.now()} onClose={onClose} onSaved={onSaved} />));
-  const synced = document.querySelector<HTMLSelectElement>('#flight-route')!;
-  expect([...synced.options].map(option => option.textContent)).toEqual(['请选择航线', '东南火点巡查航线']);
+  const synced = document.querySelector<HTMLButtonElement>('#flight-route')!;
+  expect(synced.textContent).toBe('请选择航线');
+  expect(synced.disabled).toBe(false);
   expect(document.body.textContent).not.toContain('请先同步航线列表');
 });
 it('uses a matching-height refresh icon and shows its spinning state while syncing', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[{ routeId: 'r1', name: '东南火点巡查航线-改' }]} selectedRoute="东南火点巡查航线-改" onClose={onClose} onSaved={onSaved} />));
-  const select = document.querySelector<HTMLSelectElement>('#flight-route')!;
+  const trigger = document.querySelector<HTMLButtonElement>('#flight-route')!;
   const refresh = document.querySelector<HTMLButtonElement>('[aria-label="同步司空航线"]')!;
-  expect(select.className).toBe('');
+  expect(trigger.classList.contains('route-select-trigger')).toBe(true);
+  expect(trigger.getAttribute('role')).toBe('combobox');
   expect(refresh.classList.contains('settings-route-sync')).toBe(true);
   expect(refresh.querySelector('svg.refresh-icon')?.classList.contains('is-spinning')).toBe(false);
   let resolveSync!: (value: unknown) => void;
@@ -240,7 +250,7 @@ it('serializes route selection with clearing so a late selection cannot restore 
   await clickText('清空数据');
   let finish!: (value: unknown) => void;
   ipc.invoke.mockImplementationOnce(() => new Promise(resolve => {finish=resolve;}));
-  const select=document.querySelector<HTMLSelectElement>('#flight-route')!;
+  const select=document.querySelector('#flight-route')!.parentElement!.querySelector<HTMLSelectElement>('select')!;
   await act(async () => { select.options[1].selected=true; select.dispatchEvent(new window.Event('change',{bubbles:true})); });
   // Programmatic clicks can bypass disabled fieldsets in a DOM fixture. The shared lock still rejects them.
   await clickText('确认清空数据');
@@ -249,4 +259,20 @@ it('serializes route selection with clearing so a late selection cannot restore 
   await clickText('确认清空数据');
   expect(ipc.invoke.mock.calls.map(call=>call[0])).toEqual(['set_flight_route','clear_all_data']);
   expect(document.querySelector('#flight-route')?.textContent).not.toContain('航线乙');
+});
+
+
+it.each([true, false])('preserves a single configured metric (potassium: %s)', async (potassiumEnabled) => {
+  await act(async () => root.render(<SettingsDialog settings={{...defaultSettings, potassiumEnabled, pm25Enabled: !potassiumEnabled}} onClose={onClose} onSaved={onSaved} />));
+  const blank = document.querySelector<HTMLInputElement>(potassiumEnabled ? '#pm25-threshold' : '#potassium-threshold')!;
+  expect(blank.value).toBe('');
+  expect(blank.required).toBeFalsy();
+  await submit();
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings', {settings:expect.objectContaining({potassiumEnabled, pm25Enabled: !potassiumEnabled})});
+});
+it('requires at least one configured metric', async () => {
+  await act(async () => root.render(<SettingsDialog settings={{...defaultSettings, potassiumEnabled:false, pm25Enabled:false}} onClose={onClose} onSaved={onSaved} />));
+  await submit();
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain('请至少设置一个监测阈值');
 });

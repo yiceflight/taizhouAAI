@@ -119,13 +119,16 @@ fn open_chrome_extensions() -> Result<(), String> {
     open_in_chrome("chrome://extensions")
 }
 #[tauri::command]
-fn open_business_site(url: String) -> Result<(), String> {
+async fn open_business_site(app: tauri::AppHandle, url: String) -> Result<(), String> {
     if !bridge::allowed_url(&url) {
         return Err("不支持的业务网站。".into());
     }
-    // Every browser entry point uses the user's existing Chrome profile so
-    // platform sessions and the bridge extension see the same pages.
-    open_default_chrome(&url)
+    let bridge = app.state::<bridge::Bridge>();
+    let session = bridge.single_session()?;
+    bridge
+        .request(session, -1, serde_json::json!({"type":"open-business-site", "url":url}))
+        .await?;
+    Ok(())
 }
 
 #[tauri::command]

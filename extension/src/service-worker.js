@@ -1,7 +1,10 @@
+import { createManagedChrome } from './managed-tabs.js';
+const chrome = createManagedChrome(globalThis.chrome);
 import { readOnlyJob, createReadScheduler } from './read-scheduler.js';
 import { collectDjiWeather, openDjiWeather, WEATHER_READ_TIMEOUT_MS } from './dji-weather.js';
 import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from './site-health.js';
 import { readDjiTasks } from './dji-tasks.js';
+import { createTaskTabManager, waitForTaskList } from './task-tab.js';
 import { readDjiRoutes } from './dji-routes.js';
 import { airinsReport, djiReport } from './flight-report.js';
 import { captureAirinsChart } from './airins-chart.js';
@@ -27,6 +30,7 @@ let keepAliveSupported = false;
 let capturing = false;
 let activeReportCaptures = 0;
 const readScheduler = createReadScheduler(executeJob, () => void heartbeat());
+const taskTabFor = createTaskTabManager(chrome);
 const reportTabs = new Map();
 const REPORT_MEDIA_ROOT = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/media?page=1&size=50';
 const REPORT_TAB_PREFIX = 'flight-report-tab:';
@@ -359,38 +363,18 @@ async function watchFlight(job) {
   } finally { await debuggerSession.release(tab.id, attached); }
 }
 async function syncDjiTasks(job) {
-  const project = PLAN_URL.split('#')[0];
-  const tabs = await chrome.tabs.query({ url: 'https://fh.dji.com/*' });
-  const oldKeys = ['flight-task-sync-tab', 'flight-task-history-tab'];
-  const legacyMediaKey = 'flight-report-media-tab';
-  const saved = await chrome.storage.local.get([...oldKeys, legacyMediaKey]);
-  // Task metadata such as type, plan name, route name, and upload receipt is
-  // read from the rendered plan table. A media/team page has the same project
-  // URL prefix and valid login context, but no task rows; selecting it silently
-  // drops those fields and makes the app show "航线未记录". Only reuse an
-  // actual plan page, preferring the active one when several are open.
-  const candidates = tabs.filter(tab => tab.status === 'complete' && tab.url === PLAN_URL)
-    .sort((a, b) => Number(b.active) - Number(a.active) || a.id - b.id);
-  const tab = candidates.find(tab => !oldKeys.some(key => saved[key] === tab.id)) || candidates[0];
-  if (!tab) throw new Error('请先登录并打开泰州项目，任务同步会复用该页面');
+  const started = Date.now();
+  const tab = await taskTabFor();
   const attached = await debuggerSession.acquire(tab.id);
   let result;
   try {
     const response = await evaluateBackgroundRead(chrome.debugger, tab.id, {
-      expression: `(${readDjiTasks.toString()})(${JSON.stringify(tab.url)}, ${JSON.stringify({ cursor: job.cursor, includeHistory: job.includeHistory })})`,
+      expression: `(async () => { await (${waitForTaskList.toString()})(${JSON.stringify(tab.url)}); return (${readDjiTasks.toString()})(${JSON.stringify(tab.url)}, ${JSON.stringify({ cursor: job.cursor, includeHistory: job.includeHistory })}); })()`,
       awaitPromise: true, returnByValue: true,
-    });
+    }, Math.max(1000, Math.min(25000, 30000 - (Date.now() - started))));
     result = evaluationValue(response);
     if ((await chrome.tabs.get(tab.id)).url !== tab.url || result.url !== PLAN_URL) throw new Error('司空任务同步期间页面已切换');
   } finally { await debuggerSession.release(tab.id, attached); }
-  // Retire only obsolete, extension-owned background list tabs, never a user's
-  // active page, a changed page, or a flight draft/monitor page.
-  const obsolete = [...new Set(['flight-task-sync-tab', 'flight-task-history-tab'].map(key => saved[key]))]
-    .filter(id => Number.isInteger(id) && id !== tab.id && tabs.some(t => t.id === id && !t.active && t.url === PLAN_URL));
-  const legacyMedia = tabs.find(t => t.id === saved[legacyMediaKey] && !t.active && t.url?.startsWith(project) && t.url.includes('#/media'));
-  if (legacyMedia) await chrome.tabs.remove(legacyMedia.id).catch(() => {});
-  if (obsolete.length) await chrome.tabs.remove(obsolete).catch(() => {});
-  await chrome.storage.local.remove([...oldKeys.filter(key => !tabs.some(t => t.id === saved[key]) || obsolete.includes(saved[key])), legacyMediaKey]);
   return { ...result, mediaTabId: null };
 }
 async function syncDjiRoutes() {
@@ -434,10 +418,15 @@ async function keepAlive() {
 }
 async function executeJob(job) {
   if (Number.isFinite(job.expiresAt) && Date.now() >= job.expiresAt) return null;
-  if (!["dji-tasks", "dji-routes", "dji-weather", "dji-submit", "dji-open-prepared", "dji-status", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image", "airins-realtime"].includes(job.type) || !Number.isInteger(job.tabId)) return null;
+  if (!["open-business-site", "dji-tasks", "dji-routes", "dji-weather", "dji-submit", "dji-open-prepared", "dji-status", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image", "airins-realtime"].includes(job.type) || !Number.isInteger(job.tabId)) return null;
   let result;
   try {
-    result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, capture) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, capture) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, capture, {}, enterJiangsuBusiness) : await capture(job.tabId, job) };
+    if (job.type === 'open-business-site') {
+      if (!allowedUrl(job.url)) throw new Error('不支持的业务网站');
+      const tab = await chrome.tabs.create({ url: job.url, active: true });
+      await chrome.windows.update(tab.windowId, { focused: true });
+      result = { data: { opened: true } };
+    } else result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, capture) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, capture) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, capture, {}, enterJiangsuBusiness) : await capture(job.tabId, job) };
   } catch (error) {
     result = { error: (error.message || String(error)).split("\n")[0].slice(0, 300) };
   }

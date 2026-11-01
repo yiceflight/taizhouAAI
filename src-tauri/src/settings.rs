@@ -48,6 +48,10 @@ fn minute(value: &str) -> Result<u32, String> {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default = "default_enabled")]
+    pub potassium_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub pm25_enabled: bool,
     pub potassium_threshold: f64,
     pub pm25_threshold: f64,
     pub takeoff_delay_minutes: u32,
@@ -61,9 +65,13 @@ pub struct Settings {
     pub wind_route_rules: Vec<WindRouteRule>,
 }
 
+fn default_enabled() -> bool { true }
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            potassium_enabled: true,
+            pm25_enabled: true,
             potassium_threshold: 1.0,
             pm25_threshold: 30.0,
             takeoff_delay_minutes: 5,
@@ -77,6 +85,9 @@ impl Default for Settings {
 
 impl Settings {
     fn validate(&self) -> Result<(), String> {
+        if !self.potassium_enabled && !self.pm25_enabled {
+            return Err("请至少设置一个监测阈值。".into());
+        }
         if !self.potassium_threshold.is_finite() || self.potassium_threshold <= 0.0 {
             return Err("钾离子阈值必须是大于 0 的有效数值。".into());
         }
@@ -203,11 +214,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metric_selection_survives_save_and_requires_one_enabled_metric() {
+        let db = crate::monitoring::connect(std::path::Path::new(":memory:")).unwrap();
+        for potassium_enabled in [true, false] {
+            let settings = Settings { potassium_enabled, pm25_enabled: !potassium_enabled, ..Settings::default() };
+            save(&db, &settings).unwrap();
+            assert_eq!(read(&db).unwrap(), settings);
+        }
+        let settings = Settings { potassium_enabled: false, pm25_enabled: false, ..Settings::default() };
+        assert!(save(&db, &settings).is_err());
+    }
+    #[test]
     fn defaults_and_saved_settings_survive_reopening() {
         let path = std::env::temp_dir().join(format!("settings-{}.sqlite3", uuid::Uuid::new_v4()));
         let db = crate::monitoring::connect(&path).unwrap();
         assert_eq!(read(&db).unwrap(), Settings::default());
         let settings = Settings {
+            potassium_enabled: true,
+            pm25_enabled: true,
             potassium_threshold: 1.6,
             pm25_threshold: 80.0,
             takeoff_delay_minutes: 15,

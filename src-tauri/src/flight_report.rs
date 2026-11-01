@@ -1009,6 +1009,33 @@ fn fill_slots(template: &str, fields: &[(&str, String)]) -> Result<String, Strin
     out.push_str(rest);
     Ok(out)
 }
+// Template fields occupy individual runs; preserve their fonts and other properties.
+fn mark_missing_red(doc: &str) -> String {
+    let mut out = String::new();
+    let mut rest = doc;
+    while let Some(start) = rest.find("<w:r>") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find("</w:r>") else { break };
+        let end = end + 6;
+        let mut run = rest[..end].to_owned();
+        if run.contains("【") {
+            let properties = run.find("<w:rPr>").and_then(|a| run.find("</w:rPr>").map(|b| run[a..b+8].to_owned())).unwrap_or_else(|| "<w:rPr></w:rPr>".into());
+            let mut red = properties.clone();
+            if let Some(start) = red.find("<w:color ") {
+                if let Some(end) = red[start..].find("/>") { red.replace_range(start..start+end+2, ""); }
+            }
+            red = red.replace("</w:rPr>", "<w:color w:val=\"FF0000\"/></w:rPr>");
+            for blank in ["【 】", "【待编】"] {
+                run = run.replace(blank, &format!("</w:t></w:r><w:r>{red}<w:t>{blank}</w:t></w:r><w:r>{properties}<w:t xml:space=\"preserve\">"));
+            }
+        }
+        out.push_str(&run);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
 fn fill_table(doc: &mut String, index: usize, rows: &[Vec<String>]) -> Result<(), String> {
     let token = format!("{{{{T{index}_0}}}}");
     let pos = doc.find(&token).ok_or("模板表格行缺失")?;
@@ -1118,14 +1145,7 @@ fn build_docx(
         ("ISSUE", "【待编】".into()),
         ("SERIES_ISSUE", "【待编】".into()),
         ("ISSUED", date(issued, "%Y年%-m月%-d日")),
-        (
-            "ANALYSIS_WINDOW",
-            format!(
-                "{}00:00至{}（北京时间）",
-                date(issued, "%Y年%m月%d日"),
-                date(issued, "%H:%M")
-            ),
-        ),
+        ("ANALYSIS_WINDOW", evidence.trigger_hour_label()),
         ("FLIGHT_WINDOW", flight_window.clone()),
         ("PHOTO_COUNT", count.clone()),
         ("TOTAL0_1", "本航次".into()),
@@ -1316,7 +1336,7 @@ fn build_docx(
     fill_table(&mut doc, 2, &air_rows)?;
     block(&mut doc, "SECTION_PHOTOS", &section_xml)?;
     block(&mut doc, "PHOTOS", &photo_xml)?;
-    parts.insert("word/document.xml".into(), doc.into_bytes());
+    parts.insert("word/document.xml".into(), mark_missing_red(&doc).into_bytes());
     parts.insert("word/_rels/document.xml.rels".into(), rels.into_bytes());
     parts.insert("[Content_Types].xml".into(), types.into_bytes());
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1991,10 +2011,18 @@ mod tests {
     }
     pub(super) const PNG:&str="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII=";
     #[test]
-    fn template_summarizes_flight_and_analysis_uses_issue_day() {
-        let data = sample();
+    fn template_summarizes_flight_and_analysis_uses_trigger_hour() {
+        let mut data = sample();
+        data.evidence = Some(Evidence {
+            event: Some(json!({"source":"auto","sourceHour":"2026-09-22 06:00:00"})),
+            city_hours: vec![
+                evidence::CityHour {time:"2026-09-22 04:00:00".into(),potassium:Some(0.4),pm25:Some(30.0),source_url:String::new(),synced_at:String::new()},
+                evidence::CityHour {time:"2026-09-22 06:00:00".into(),potassium:None,pm25:Some(65.0),source_url:String::new(),synced_at:String::new()},
+            ], ..Default::default()
+        });
         let issued = data.mission.start_time + 86400000;
         let bytes = build_docx(&data, &[PNG.into(), PNG.into()], issued).unwrap();
+        if let Ok(path) = std::env::var("TAIZHOU_REPORT_QA_SAMPLE") { fs::write(path, &bytes).unwrap(); }
         let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut doc = String::new();
         z.by_name("word/document.xml")
@@ -2002,7 +2030,14 @@ mod tests {
             .read_to_string(&mut doc)
             .unwrap();
         assert_eq!(doc.matches("<w:tbl>").count(), 3);
-        assert!(doc.contains("2026年09月23日00:00至07:01"));
+        assert!(doc.contains("2026年09月22日06时"));
+        assert!(!doc.contains("00:00至"));
+        assert!(doc.contains("<w:color w:val=\"FF0000\"/>"));
+        for run in doc.split("<w:r>").skip(1) {
+            let run = run.split("</w:r>").next().unwrap();
+            if run.contains("【") { assert!(run.contains("<w:color w:val=\"FF0000\"/>")); }
+            if run.contains("65.00") { assert!(!run.contains("FF0000")); }
+        }
         let air_table = doc
             .split("<w:tbl>")
             .nth(3)

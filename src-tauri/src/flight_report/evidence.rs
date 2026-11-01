@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
     pub captured_at: i64,
+    /// Actual departure hour for flights without a local monitoring trigger.
+    #[serde(default)]
+    pub flight_hour: Option<String>,
     pub city_hours: Vec<CityHour>,
     pub trigger: String,
     pub event: Option<Value>,
@@ -58,30 +61,44 @@ struct ReviewFile {
 pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
 pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path, now: i64) -> Result<Evidence, String> {
-    let start = date(now, "%Y-%m-%d 00:00:00");
-    let end = date(now, "%Y-%m-%d %H:%M:%S");
-    // Both fields are now populated by the verified Jiangsu city-hour adapter.
-    let mut stmt = db.prepare("SELECT observed_at,potassium,source_url,synced_at,pm25 FROM hourly_observations WHERE city_code='321200' AND data_source='A_6' AND common_site_type='30' AND unit='μg/m³' AND observed_at>=?1 AND observed_at<=?2 ORDER BY observed_at").map_err(|e| e.to_string())?;
-    let city_hours = stmt.query_map(params![start, end], |r| Ok(CityHour { time:r.get(0)?, potassium:r.get(1)?, source_url:r.get(2)?, synced_at:r.get(3)?, pm25:r.get(4)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
-    let mut e = Evidence { captured_at:now, city_hours, ..Default::default() };
+    let mut e = Evidence {
+        captured_at:now,
+        flight_hour: DateTime::from_timestamp_millis(data.mission.start_time)
+            .filter(|_| data.mission.start_time > 0)
+            .map(|_| date(data.mission.start_time, "%Y-%m-%d %H:00:00")),
+        ..Default::default()
+    };
     let tasks = read_dji_tasks(db)?;
     let matching: Vec<_> = tasks.into_iter().filter(|t| !t.actual_time_missing
         && t.mission.mission_name == data.mission.mission_name
         && t.mission.start_time == data.mission.start_time && t.mission.end_time == data.mission.end_time).collect();
     if matching.len() == 1 { e.dji_task = matching.into_iter().next(); }
-    if let Some(id) = &data.local_event_id {
-        for key in ["flight_event".to_string(), format!("flight_history:{id}")] {
-            if let Some(raw) = crate::monitoring::setting(db, &key)? {
-                let event: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-                if event["id"].as_str() == Some(id) && event["flightTime"]["startTime"].as_i64() == Some(data.mission.start_time) && event["flightTime"]["endTime"].as_i64() == Some(data.mission.end_time) {
-                    e.trigger = match event["source"].as_str() { Some("manual") => "由人工手动发起", Some("auto") if event["name"].as_str().is_some_and(|name| name.starts_with("PM2.5超标巡查-")) => "由PM2.5监测触发流程发起", Some("auto") => "由K⁺/PM2.5监测触发流程发起", _ => "触发原因待核实" }.into();
-                    e.event = Some(event);
-                    break;
-                }
-            }
+    // Platform-history exports may omit localEventId. Recover only an exact,
+    // unique flight-time match; never guess from task names or nearby times.
+    let mut stmt = db.prepare("SELECT value FROM monitor_settings WHERE key='flight_event' OR key LIKE 'flight_history:%'").map_err(|e| e.to_string())?;
+    let raws = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+    let mut events: HashMap<String, Value> = HashMap::new();
+    for raw in raws {
+        let event: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let Some(id) = event["id"].as_str() else { continue };
+        if data.local_event_id.as_ref().is_some_and(|wanted| wanted != id) { continue; }
+        if event["flightTime"]["startTime"].as_i64() == Some(data.mission.start_time)
+            && event["flightTime"]["endTime"].as_i64() == Some(data.mission.end_time) {
+            events.insert(id.to_owned(), event);
         }
+    }
+    if events.len() == 1 {
+        let event = events.into_values().next().unwrap();
+        e.trigger = match event["source"].as_str() { Some("manual") => "由人工手动发起", Some("auto") if event["name"].as_str().is_some_and(|name| name.starts_with("PM2.5超标巡查-")) => "由PM2.5监测触发流程发起", Some("auto") => "由K⁺/PM2.5监测触发流程发起", _ => "触发原因待核实" }.into();
+        e.event = Some(event);
     } else if let Some(reason) = list_reasons(db)?.get(&data.mission.mission_id.to_string()) {
         e.trigger = match reason.as_str() { "manual_immediate" => "由人工手动发起", "dji_scheduled" => "由司空定时任务发起", "potassium_manual" => "由K⁺/PM2.5巡查经人工确认发起", "potassium_auto" => "由K⁺或PM2.5监测自动触发", _ => "触发原因待核实" }.into();
+    }
+    // Include earlier valid readings across midnight, but never later hours.
+    if let Some(end) = e.trigger_hour() {
+        let mut stmt = db.prepare("SELECT observed_at,potassium,source_url,synced_at,pm25 FROM hourly_observations WHERE city_code='321200' AND data_source='A_6' AND common_site_type='30' AND unit='μg/m³' AND observed_at<=?1 ORDER BY observed_at").map_err(|e| e.to_string())?;
+        e.city_hours = stmt.query_map(params![end], |r| Ok(CityHour { time:r.get(0)?, potassium:r.get(1)?, source_url:r.get(2)?, synced_at:r.get(3)?, pm25:r.get(4)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     }
     // Reviews are explicit local editorial inputs, bound to exact image bytes and flight.
     // A different/partial flight never inherits a conclusion or a pollution finding.
@@ -190,8 +207,23 @@ fn number(value: Option<f64>) -> String {
     value.map(|v| format!("{v:.2}")).unwrap_or_else(|| "【 】".into())
 }
 impl Evidence {
+    pub fn trigger_hour(&self) -> Option<String> {
+        let event_hour = self.event.as_ref().filter(|event| event["source"].as_str() == Some("auto"))
+            .and_then(|event| event["sourceHour"].as_str().or_else(|| event["observedAt"].as_str()));
+        let valid_hour = |raw: &str| {
+            let parsed = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok()?;
+            (parsed.format("%M:%S").to_string() == "00:00").then(|| raw.to_owned())
+        };
+        event_hour.and_then(valid_hour).or_else(|| self.flight_hour.as_deref().and_then(valid_hour))
+    }
+    pub fn trigger_hour_label(&self) -> String {
+        self.trigger_hour().and_then(|h| NaiveDateTime::parse_from_str(&h, "%Y-%m-%d %H:%M:%S").ok())
+            .map(|h| h.format("%Y年%m月%d日%H时").to_string()).unwrap_or_else(|| "【 】".into())
+    }
+
     pub fn city_fields(&self) -> Vec<(&'static str, String)> {
-        let mut hours: Vec<_> = self.city_hours.iter().collect();
+        let trigger = self.trigger_hour();
+        let mut hours: Vec<_> = self.city_hours.iter().filter(|h| trigger.as_ref().is_some_and(|t| h.time <= *t)).collect();
         hours.sort_by(|a,b| a.time.cmp(&b.time));
         let k: Vec<_> = hours.iter().filter_map(|h| valid_value(h.potassium).map(|v|(*h,v))).collect();
         let pm: Vec<_> = hours.iter().filter_map(|h| valid_value(h.pm25).map(|v|(*h,v))).collect();
@@ -205,14 +237,20 @@ impl Evidence {
             (&k, "CITY_K_START", "CITY_K_END", "CITY_K_DIRECTION"),
             (&ratios, "CITY_RATIO_START", "CITY_RATIO_END", "CITY_RATIO_DIRECTION"),
         ] {
-            fields.push((start, number(values.first().map(|(_,v)|*v))));
-            let pair = values.first().zip(values.last()).filter(|(a,b)| a.0.time != b.0.time);
-            fields.push((end, number(pair.map(|(_,b)|b.1))));
+            let previous = values.iter().rev().find(|(h,_)| Some(&h.time) < trigger.as_ref());
+            let current = values.iter().find(|(h,_)| Some(&h.time) == trigger.as_ref());
+            fields.push((start, number(previous.map(|(_,v)|*v))));
+            let pair = previous.zip(current);
+            fields.push((end, number(current.map(|(_,v)|*v))));
             fields.push((direction, pair.map(|(a,b)| if b.1>a.1 {"升至"} else if b.1<a.1 {"降至"} else {"持平于"}).unwrap_or("【 】").into()));
         }
-        let pair = pm.first().zip(pm.last()).filter(|(a,b)|a.0.time!=b.0.time);
+        let pair = pm.iter().rev().find(|(h,_)| Some(&h.time) < trigger.as_ref())
+            .zip(pm.iter().find(|(h,_)| Some(&h.time) == trigger.as_ref()));
         fields.push(("CITY_PM_CHANGE", pair.filter(|(a,_)|a.1>0.0).map(|(a,b)|format!("{:.1}",(b.1-a.1).abs()/a.1*100.0)).unwrap_or_else(||"【 】".into())));
         fields.push(("CITY_PM_CHANGE_LABEL", pair.map(|(a,b)|if b.1<a.1 {"降幅"} else {"升幅"}).unwrap_or("【 】").into()));
+        // Remaining process statistics cover the trigger day through that hour.
+        let k: Vec<_> = k.into_iter().filter(|(h,_)| trigger.as_ref().is_some_and(|t| h.time[..10] == t[..10])).collect();
+        let ratios: Vec<_> = ratios.into_iter().filter(|(h,_)| trigger.as_ref().is_some_and(|t| h.time[..10] == t[..10])).collect();
         let high:Vec<_> = k.iter().filter(|(_,v)|*v>1.0).collect();
         fields.push(("CITY_HIGH_HOURS", if k.is_empty() {"【 】".into()} else {high.len().to_string()}));
         fields.push(("CITY_HIGH_WINDOW", if high.is_empty() {"【 】".into()} else {high.iter().map(|(h,_)|hour(&h.time)).collect::<Vec<_>>().join("、")}));
@@ -292,7 +330,7 @@ mod tests {
     use super::*;
     #[test]
     fn missing_hours_zero_and_threshold_are_not_confused() {
-        let e=Evidence {captured_at:1791739800000,city_hours:vec![
+        let e=Evidence {event:Some(json!({"source":"auto","sourceHour":"2026-10-12 01:00:00"})),captured_at:1791739800000,city_hours:vec![
             CityHour{time:"2026-10-12 00:00:00".into(),potassium:Some(0.0),pm25:None,source_url:String::new(),synced_at:String::new()},
             CityHour{time:"2026-10-12 01:00:00".into(),potassium:Some(1.0),pm25:None,source_url:String::new(),synced_at:String::new()},
             CityHour{time:"2026-10-12 02:00:00".into(),potassium:None,pm25:None,source_url:String::new(),synced_at:String::new()},
@@ -314,20 +352,53 @@ mod tests {
         data.local_event_id=Some("event".into());
         crate::monitoring::put(&db,"flight_event",&json!({"id":"different","source":"manual","flightTime":{"startTime":data.mission.start_time,"endTime":data.mission.end_time}}).to_string()).unwrap();
         let e=snapshot(&db,&data,Path::new("/nonexistent"),1791736491228).unwrap();
-        assert_eq!(e.city_hours.len(),1); // generated 00:34; 01:00 is outside window
-        assert_eq!(e.city_hours[0].potassium,Some(0.39));
+        assert!(e.city_hours.is_empty()); // An unrelated event cannot establish a trigger hour.
         assert!(e.trigger.is_empty());
-        assert_eq!(e.city_hours[0].pm25,Some(99.0));
-        assert!(e.city_fields().iter().any(|(k,v)|*k=="CITY_PM_START"&&v.contains("99.00")));
+        assert_eq!(e.trigger_hour_label(), date(data.mission.start_time, "%Y年%m月%d日%H时"));
+        crate::monitoring::put(&db,"flight_event",&json!({"id":"event","source":"auto","sourceHour":"2026-10-12 00:00:00","flightTime":{"startTime":data.mission.start_time,"endTime":data.mission.end_time}}).to_string()).unwrap();
+        let e=snapshot(&db,&data,Path::new("/nonexistent"),1791836491228).unwrap();
+        assert_eq!(e.city_hours.len(),2);
+        let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
+        assert_eq!(fields["CITY_K_START"], "9.00");
+        assert_eq!(fields["CITY_K_END"], "0.39");
+        assert_eq!(e.trigger_hour_label(), "2026年10月12日00时");
+    }
+    #[test]
+    fn platform_flight_without_local_event_fills_departure_hour() {
+        let db=crate::monitoring::connect(Path::new(":memory:")).unwrap();
+        let mut data=super::super::tests::sample();
+        data.local_event_id=None;
+        data.mission.start_time=1793523600000; // 2026-11-01 17:00 Beijing
+        data.mission.end_time=1793525040000;
+        for (hour,k,pm) in [("16",0.39,30.0),("17",0.40,31.0),("18",0.35,32.0)] {
+            db.execute("INSERT INTO hourly_observations VALUES ('321200',?1,?2,?3,'μg/m³','source','A_6','30','sync')",
+                params![format!("2026-11-01 {hour}:00:00"),k,pm]).unwrap();
+        }
+        let e=snapshot(&db,&data,Path::new("/nonexistent"),1793540000000).unwrap();
+        assert!(e.event.is_none());
+        assert_eq!(e.trigger_hour_label(),"2026年11月01日17时");
+        let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
+        assert_eq!(fields["CITY_PM_START"],"30.00");
+        assert_eq!(fields["CITY_PM_END"],"31.00");
+        assert_eq!(fields["CITY_K_START"],"0.39");
+        assert_eq!(fields["CITY_K_END"],"0.40");
+        // A platform export of a delayed local task must recover its source hour.
+        crate::monitoring::put(&db,"flight_history:matched",&json!({
+            "id":"matched","source":"auto","sourceHour":"2026-11-01 16:00:00",
+            "flightTime":{"startTime":data.mission.start_time,"endTime":data.mission.end_time}
+        }).to_string()).unwrap();
+        let e=snapshot(&db,&data,Path::new("/nonexistent"),1793540000000).unwrap();
+        assert_eq!(e.trigger_hour_label(),"2026年11月01日16时");
+        assert!(e.event.is_some());
     }
     #[test]
     fn city_ratios_pair_same_hour_and_k_peak_uses_corresponding_pm() {
-        let mut e=Evidence::default();
+        let mut e=Evidence { event:Some(json!({"source":"auto","sourceHour":"2026-10-25 03:00:00"})), ..Default::default() };
         for (hour,k,pm) in [("00:00",Some(0.0),Some(0.0)),("01:00",Some(2.0),Some(10.0)),("02:00",None,Some(100.0)),("03:00",Some(1.0),Some(2.0))] {
             e.city_hours.push(CityHour{time:format!("2026-10-25 {hour}:00"),potassium:k,pm25:pm,source_url:String::new(),synced_at:String::new()});
         }
         let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
-        assert_eq!(fields["CITY_PM_CHANGE"], "【 】");
+        assert_eq!(fields["CITY_PM_CHANGE"], "98.0");
         assert!(fields["CITY_PEAK_PM"].contains("10.00"));
         assert_eq!(fields["CITY_MAX_RATIO"], "50.00");
         assert_eq!(fields["COMBUSTION_FINDING"], "【 】");
@@ -337,7 +408,7 @@ mod tests {
     fn declining_city_values_and_absent_evidence_remain_field_values() {
         let empty:HashMap<_,_> = Evidence::default().city_fields().into_iter().collect();
         assert!(empty.values().all(|v|v=="【 】"));
-        let mut e = Evidence::default();
+        let mut e = Evidence { event:Some(json!({"source":"auto","sourceHour":"2026-10-31 11:00:00"})), ..Default::default() };
         for (time, value) in [("2026-10-31 11:00:00",43.0),("2026-10-31 00:00:00",48.0)] {
             e.city_hours.push(CityHour {time:time.into(),pm25:Some(value),potassium:None,source_url:String::new(),synced_at:String::new()});
         }
@@ -349,6 +420,23 @@ mod tests {
         assert_eq!(fields["CITY_K_PEAK"], "【 】");
         e.combustion_confirmed = true;
         assert!(e.city_fields().iter().any(|(k,v)|*k=="COMBUSTION_FINDING" && v=="生物质燃烧特征明显"));
+    }
+    #[test]
+    fn current_missing_k_never_reuses_old_or_future_values() {
+        let mut e = Evidence { event:Some(json!({"source":"auto","sourceHour":"2026-10-31 12:00:00","observedAt":"2026-10-31 13:00:00"})), ..Default::default() };
+        for (time,k,pm) in [("09",Some(0.4),Some(20.0)),("10",Some(0.6),Some(30.0)),("11",None,None),("12",None,Some(60.0)),("13",Some(9.0),Some(99.0))] {
+            e.city_hours.push(CityHour {time:format!("2026-10-31 {time}:00:00"),potassium:k,pm25:pm,source_url:String::new(),synced_at:String::new()});
+        }
+        let fields:HashMap<_,_>=e.city_fields().into_iter().collect();
+        assert_eq!(e.trigger_hour_label(), "2026年10月31日12时");
+        assert_eq!(fields["CITY_PM_START"], "30.00");
+        assert_eq!(fields["CITY_PM_END"], "60.00");
+        assert_eq!(fields["CITY_PM_CHANGE"], "100.0");
+        assert_eq!(fields["CITY_K_START"], "0.60");
+        assert_eq!(fields["CITY_RATIO_START"], "2.00");
+        for key in ["CITY_K_END","CITY_RATIO_END","CITY_K_DIRECTION","CITY_RATIO_DIRECTION"] {
+            assert_eq!(fields[key], "【 】");
+        }
     }
     #[test]
     fn image_type_requires_metadata_and_missing_gps_never_becomes_zero() {

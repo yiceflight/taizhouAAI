@@ -11,13 +11,13 @@
 | 字段 | 来源/计算 | 缺失或未确认 |
 |---|---|---|
 | ISSUE/SERIES_ISSUE | 人工编期（当前无自动编期来源） | 【待编】 |
-| ISSUED/ANALYSIS_WINDOW | 生成日期及当日00:00至生成时刻，北京时间 | 时间必须有效 |
-| CITY_PM/K/RATIO_START/END | 城市序列各自首末有效小时；比值仅同小时配对且PM2.5>0 | 【 】；仅一个小时则末值和方向留空 |
+| ISSUED/ANALYSIS_WINDOW | 生成日期 / 精确匹配航次自动事件的 sourceHour（旧事件回退整点 observedAt）；没有本地监测触发记录的司空/手动航次用实际起飞所在小时，北京时间 | 支持缺少 localEventId 时按唯一起止时间恢复本地事件；不得用生成时刻代替。flightHour 归档实际起飞小时，event 保留优先采用的触发依据 |
+| CITY_PM/K/RATIO_START/END | 各指标在触发小时之前最近有效值 → 触发小时值（允许跨日）；比值仅同小时配对且PM2.5>0 | 红色【 】；当前小时缺失不得用旧值回填，方向需两端均有效 |
 | CITY_*_DIRECTION | 升至、降至、持平于 | 【 】 |
-| CITY_PM_CHANGE/LABEL | 首末变化率绝对值及升幅/降幅 | 起点为0则百分数留空 |
+| CITY_PM_CHANGE/LABEL | 前一有效值至当前小时变化率绝对值及升幅/降幅 | 起点为0则百分数留空 |
 | CITY_HIGH_HOURS/WINDOW | K⁺严格大于1的有效小时数、对应时刻列表 | 无数据留空；有数据但无高值，小时数0、时段留空 |
 | CITY_PROCESS_COUNT/TIME | 尚未定义过程划分规则 | 保留【 】，不推断 |
-| CITY_K_PEAK/PEAK_PM/MAX_RATIO | 全窗有效K⁺峰值、对应小时PM2.5、配对比值最大值 | 【 】 |
+| CITY_K_PEAK/PEAK_PM/MAX_RATIO | 触发日00时至触发小时有效K⁺峰值、对应小时PM2.5、配对比值最大值 | 【 】 |
 | COMBUSTION_FINDING | 完整航次判读文件combustionConfirmed=true | 【 】 |
 | TRIGGER | 精确航次匹配的事件/已保存原因 | 【 】；不采用任务名称或平台类型 |
 | FLIGHT_WINDOW | 航次实际起止时间 | 验证失败阻止生成 |
@@ -39,3 +39,5 @@
 ## 验收
 
 运行Python模板保真及固定段落检查、Rust flight_report测试、Node报告相关测试。至少验证44张照片无可飞航次和有六参数航次，独立输出到验收目录；旧报告不覆盖。逐页渲染检查中文、图片、表格、分页。生成器改动不等同于运行客户端已采用新版本。
+
+所有未填写的【 】及【待编】以红色显示，保留模板字体和字号，提醒人工核对。

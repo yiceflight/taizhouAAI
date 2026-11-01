@@ -60,7 +60,7 @@ jobs:
 
   build-macos:
     needs: [metadata, validate]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,7 +142,7 @@ jobs:
   publish:
     if: github.event_name == 'push'
     needs: [metadata, build-macos, build-windows]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:

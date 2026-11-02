@@ -1,6 +1,6 @@
 [package]
 name = "taizhou-aai"
-version = "0.2.13"
+version = "0.2.14"
 description = "江苏省泰州环境监测中心智能监测系统 browser automation desktop client"
 authors = ["you"]
 edition = "2021"
@@ -47,6 +47,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -176,6 +176,16 @@ pub fn run() {
     let mut context = tauri::generate_context!();
     environment::configure(&mut context);
     let mut builder = tauri::Builder::default();
+    // Must be registered first. A second launch (e.g. double-clicking the desktop
+    // icon while the app is hidden in the tray) restores the running window
+    // instead of starting another process that cannot bind the bridge port.
+    // The plugin keys on the app identifier, so test and release builds stay isolated.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            window_lifecycle::show_main_window(app);
+        }));
+    }
     if !environment::IS_TEST {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }

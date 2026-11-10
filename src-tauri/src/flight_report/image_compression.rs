@@ -2,6 +2,8 @@
 //! smoothing, or chroma subsampling. Failed/unsafe/unhelpful conversions retain
 //! the exact input. Quality is bounded rather than reduced to meet a size target.
 use image::{ImageDecoder, ImageReader, RgbImage};
+// Keep libjpeg linked in release/LTO builds: the C helper calls it directly.
+use mozjpeg_sys as _;
 use std::io::Cursor;
 
 pub(super) fn compress(bytes: Vec<u8>, ext: &'static str) -> (Vec<u8>, &'static str) {

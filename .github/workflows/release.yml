@@ -107,6 +107,9 @@ jobs:
   build-windows:
     needs: [metadata, validate]
     runs-on: windows-2025
+    env:
+      # jpegli-sys expects libraries directly under build/lib (no Debug/Release subdir).
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,6 +122,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: ninja --version
       - run: rustup target add x86_64-pc-windows-msvc
       - name: Provision private report email defaults
         shell: bash

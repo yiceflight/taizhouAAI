@@ -284,6 +284,9 @@ pub fn run() {
             reports::list_reports,
             reports::open_report,
             reports::open_reports_directory,
+            email::send_flight_report_email,
+            email::get_email_settings,
+            email::save_email_settings,
             updates::check_update_channel
         ])
         .build(context)
@@ -323,6 +326,7 @@ mod bridge;
 mod bridge_diagnostics;
 mod reports;
 mod updates;
+mod email;
 
 mod monitoring;
 mod settings;

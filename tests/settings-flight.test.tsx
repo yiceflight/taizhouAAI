@@ -7,6 +7,7 @@ import { defaultSettings } from '../src/lib/workspace';
 
 const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ipc);
+vi.mock('../src/components/EmailSettingsSection', () => ({ EmailSettingsSection: () => null }));
 let root: ReturnType<typeof createRoot>;
 const onClose = vi.fn();
 const onSaved = vi.fn(async () => {});

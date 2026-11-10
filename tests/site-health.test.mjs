@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
-import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from '../extension/src/site-health.js';
+import { checkSiteHealth, captureHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from '../extension/src/site-health.js';
 import { findJiangsuApi } from '../extension/src/jiangsu.js';
 const run = (url, extra = {}) => runInNewContext(`(${checkSiteHealth.toString()})((${findJiangsuApi.toString()}))`, {
   location: new URL(url), document: { querySelectorAll: () => [], querySelector: () => null }, AbortSignal, ...extra,
@@ -9,6 +9,34 @@ const run = (url, extra = {}) => runInNewContext(`(${checkSiteHealth.toString()}
 const map = 'http://61.155.4.60:18080/#/particle-analysis/feature-analysis/time-series';
 const dji = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 const air = 'https://aai.airins.cn/sniff/HistoryCloud';
+test('health recovers from a replaced execution context in the same page without waiting for the next cycle', async () => {
+  let elapsed = 0, calls = 0;
+  const chrome = { tabs: { get: async () => ({url:dji,status:elapsed === 200 ? 'loading' : 'complete'}) } };
+  const result = await captureHealth(chrome, async () => {
+    if (++calls === 1) throw Error('Inspected target navigated or closed');
+    return {url:dji,state:'ready'};
+  }, 1, {now:()=>elapsed,pause:async()=>{elapsed+=200;}});
+  assert.equal(result.state,'ready');
+  assert.equal(calls,2);
+  assert.equal(elapsed,400);
+});
+test('health retry is bounded and never follows navigation, retries network failures or retries auth results', async () => {
+  for (const mode of ['changed','pending','loading','twice','network','auth']) {
+    let elapsed=0,calls=0;
+    const chrome={tabs:{get:async()=>({url:elapsed && mode==='changed' ? 'https://fh.dji.com/#/login' : dji,
+      pendingUrl:elapsed && mode==='pending' ? 'https://evil.test' : undefined,
+      status:elapsed && mode==='loading' ? 'loading' : 'complete'})}};
+    const task=captureHealth(chrome,async()=>{
+      calls++;
+      if(mode==='auth') return {state:'login_required'};
+      throw Error(mode==='network' ? 'network failure' : 'Inspected target navigated or closed');
+    },1,{now:()=>elapsed,pause:async()=>{elapsed+=200;}});
+    if(mode==='auth') assert.equal((await task).state,'login_required');
+    else await assert.rejects(task);
+    assert.equal(calls,mode==='twice' ? 2 : 1);
+    assert.ok(elapsed<=2000);
+  }
+});
 test('health never treats an open login page as authenticated or touches credential values', async () => {
   assert.equal((await run('https://fh.dji.com/#/login')).state, 'login_required');
   assert.equal((await run(air, { document: { querySelectorAll: () => [{ getClientRects: () => [1], get value() { throw Error('credential read'); } }] } })).state, 'login_required');

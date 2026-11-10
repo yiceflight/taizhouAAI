@@ -108,7 +108,7 @@ test('DJI does not choose the nearest flight outside the tolerance or infer time
 test('DJI distinguishes missing photo folder from a confirmed empty photo folder', async()=>{
  const pages=[['每日7时 2026-09-22 07:00:05 (UTC+08)']];
  await assert.rejects(autoMediaFixture({pages,immediate:false}).run(),/司空媒体解析失败：缺少航次目录编号/);
- await assert.rejects(autoMediaFixture({pages,folderPhotos:[]}).run(), /司空媒体无照片：照片文件夹为空/);
+ assert.equal((await autoMediaFixture({pages,folderPhotos:[]}).run()).files.length, 0);
 });
 
 test('DJI inventories every photo page and records the download page without truncation', async () => {
@@ -147,7 +147,9 @@ test('DJI reads direct task-root photos mixed with videos and preserves folder i
 });
 test('DJI proves video-only only after a complete multipage inventory', async () => {
  const videos = Array.from({length: 52}, (_, i) => `DJI_20260922071701_${String(i).padStart(4, '0')}_V.mp4`);
- await assert.rejects(rootFixture({rootPages: [videos.slice(0, 50), videos.slice(50)]}).run(), /司空媒体无照片：已完整解析 52 个视频文件/);
+ const empty = await rootFixture({rootPages: [videos.slice(0, 50), videos.slice(50)]}).run();
+ assert.equal(empty.files.length, 0);
+ assert.equal(empty.rootFolderId, 359292376);
  const result = await rootFixture({rootPages: [videos.slice(0, 50), [rootPhoto]]}).run();
  assert.deepEqual([...result.files], [rootPhoto]);
  assert.equal(result.filePages[rootPhoto], 2);
@@ -158,6 +160,12 @@ test('DJI never treats missing, unknown, duplicated or incomplete root media as 
   {rootPages: [[rootVideo, 'Other-Photos']]},
   {rootPages: [[rootVideo, 'picture.jpeg']]},
   {rootPages: [[rootVideo], [rootVideo]]},
-  {rootPages: [[]]},
+  {rootPages: [[]], rootTotal: 1},
  ]) await assert.rejects(rootFixture(options).run(), /司空媒体解析失败/);
+});
+
+test('DJI accepts a confirmed empty task root for a zero-issue report', async () => {
+ const result = await rootFixture({rootPages: [[]]}).run();
+ assert.equal(result.files.length, 0);
+ assert.equal(result.rootFolderId, 359292376);
 });

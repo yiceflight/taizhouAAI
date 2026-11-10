@@ -74,6 +74,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Provision private report email defaults
+        shell: bash
+        env:
+          EMAIL_DEFAULTS_JSON: ${{ secrets.EMAIL_DEFAULTS_JSON }}
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; const raw = process.env.EMAIL_DEFAULTS_JSON; if (!raw) throw new Error("Missing private email defaults"); const value = JSON.parse(raw); if (typeof value.password !== "string" || !value.password || value.password.length > 512) throw new Error("Invalid private email defaults"); fs.mkdirSync(".secrets", { recursive: true }); fs.writeFileSync(".secrets/email-defaults.json", JSON.stringify(value), { mode: 0o600 });'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build universal macOS updater artifact
         env:
@@ -114,6 +120,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: rustup target add x86_64-pc-windows-msvc
+      - name: Provision private report email defaults
+        shell: bash
+        env:
+          EMAIL_DEFAULTS_JSON: ${{ secrets.EMAIL_DEFAULTS_JSON }}
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; const raw = process.env.EMAIL_DEFAULTS_JSON; if (!raw) throw new Error("Missing private email defaults"); const value = JSON.parse(raw); if (typeof value.password !== "string" || !value.password || value.password.length > 512) throw new Error("Invalid private email defaults"); fs.mkdirSync(".secrets", { recursive: true }); fs.writeFileSync(".secrets/email-defaults.json", JSON.stringify(value), { mode: 0o600 });'
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build Windows x64 updater artifact
         env:

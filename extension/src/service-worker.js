@@ -2,7 +2,7 @@ import { createManagedChrome } from './managed-tabs.js';
 const chrome = createManagedChrome(globalThis.chrome);
 import { readOnlyJob, createReadScheduler } from './read-scheduler.js';
 import { collectDjiWeather, openDjiWeather, WEATHER_READ_TIMEOUT_MS } from './dji-weather.js';
-import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from './site-health.js';
+import { checkSiteHealth, captureHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from './site-health.js';
 import { readDjiTasks } from './dji-tasks.js';
 import { createTaskTabManager, waitForTaskList } from './task-tab.js';
 import { readDjiRoutes } from './dji-routes.js';
@@ -100,7 +100,21 @@ async function enterJiangsuBusiness(tabId) {
     if (evaluationValue(response)?.opened !== true) throw new Error('未能进入综合分析，请手动进入后重新验证');
   } finally { await debuggerSession.release(tabId, attached); }
 }
+async function closeCachedReportTab(job) {
+  const key = reportKey(job);
+  if (!key) throw new Error('巡飞报告媒体任务缺少有效任务标识');
+  const saved = reportTabs.get(key) || (await chrome.storage.local.get(REPORT_TAB_PREFIX + key))[REPORT_TAB_PREFIX + key];
+  const tab = Number.isInteger(saved) ? await chrome.tabs.get(saved).catch(() => null) : null;
+  await closeReportTab(key, tab?.url?.startsWith('https://fh.dji.com/') && tab.url.includes('#/media') ? saved : undefined);
+  return { closed: true };
+}
+
 async function capture(tabId, job) {
+  if (job?.type === 'flight-dji-list' && job.closeOnly === true) return closeCachedReportTab(job);
+  if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId);
+  return captureOnce(tabId, job);
+}
+async function captureOnce(tabId, job) {
   const parallelReport = reportJob(job);
   const independentRead = readOnlyJob(job);
   if (!parallelReport && !independentRead && capturing) throw new Error("另一个采集正在执行，请稍后重试");

@@ -6,9 +6,16 @@ export async function waitForTaskList(expectedUrl) {
   while (Date.now() < deadline) {
     if (location.href !== expectedUrl) throw new Error('司空任务列表发生跳转，请检查登录状态后刷新任务');
     if (!localStorage.getItem('x-user-token') && !localStorage.getItem('x-auth-token')) throw new Error('请在 Chrome 登录司空后同步任务');
-    const table = document.querySelector('tbody tr, tr[role="row"], .plan-app-ant-empty, .ant-empty');
+    const empty = document.querySelector('.plan-app-ant-empty, .ant-empty');
+    const rows = [...(document.querySelectorAll?.('tbody tr, tr[role="row"]') || [])];
+    // FlightHub renders a date separator row before it renders the actual
+    // task rows. The separator also has data-row-key, so merely waiting for
+    // any table row races the async row contents and loses DOM-only fields
+    // such as the route name.
+    const taskRow = rows.some(row => row.querySelector?.('.duration-box, .plan-name-wrapper, .action-box')
+      || row.querySelectorAll?.('.duration-box .time-content')?.length);
     const loading = document.querySelector('.plan-app-ant-spin-spinning, .ant-spin-spinning');
-    if (table && !loading) return;
+    if ((taskRow || empty) && !loading) return;
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   throw new Error('司空任务列表尚未加载完成，请稍后刷新任务');

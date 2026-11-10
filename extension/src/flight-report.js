@@ -240,7 +240,7 @@ export async function djiReport(job, inspectPresentation) {
   const unique = [...new Set(pageNames())];
   if (!taskRoot && !unique.length && !/暂无数据|无文件|No data|No files/i.test([...document.querySelectorAll('table')].map(e=>e.innerText).join(' '))) throw new Error('未识别到图片列表，无法确认文件夹是否为空');
   if (job.type === 'flight-dji-list') {
-    if (taskRoot && (!Number.isSafeInteger(rootTotal) || rootTotal <= 0)) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
+    if (taskRoot && (!Number.isSafeInteger(rootTotal) || rootTotal < 0)) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
     // Legacy manual probes cannot prove a complete multipage inventory.
     const initialNext = document.querySelector('.ant-pagination-next');
     if (job.startTime == null && initialNext && initialNext.getAttribute('aria-disabled') !== 'true' && !initialNext.classList.contains('ant-pagination-disabled')) throw new Error('图片超过一页，请按飞行时间自动匹配后重试');
@@ -261,10 +261,8 @@ export async function djiReport(job, inspectPresentation) {
       if (taskRoot ? rootFiles.size >= rootTotal : (!next || next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled'))) {
         if ((document.querySelector('[aria-label="Breadcrumb"],.ant-breadcrumb')?.innerText?.trim() || '') !== folder) throw new Error('采集期间照片文件夹已变化');
         if (taskRoot) {
-          if (!Number.isSafeInteger(rootTotal) || rootTotal <= 0 || rootFiles.size !== rootTotal) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
-          if (!files.length) throw new Error(`司空媒体无照片：已完整解析 ${rootFiles.size} 个视频文件，本航次未发现照片`);
+          if (!Number.isSafeInteger(rootTotal) || rootTotal < 0 || rootFiles.size !== rootTotal) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');
         }
-        if (!files.length) throw new Error('司空媒体无照片：照片文件夹为空，本航次未发现照片');
         return { url: location.href, folder, files, filePages, rootFolderId: taskRoot ? rootFolderId : null, matchedStartTime: job.startTime, matchedTaskFolderId: job.folderId ?? null };
       }
       if (taskRoot && next && (next.getAttribute('aria-disabled') === 'true' || next.classList.contains('ant-pagination-disabled'))) throw new Error('司空媒体解析失败：媒体文件数量未核对完整，请刷新后重试');

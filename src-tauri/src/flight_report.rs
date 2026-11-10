@@ -16,6 +16,7 @@ use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 mod evidence;
+mod cache;
 mod presentation;
 mod air_chart;
 use evidence::{photo_facts, Evidence};
@@ -74,12 +75,12 @@ fn channel_spec(name: &str) -> Option<(&'static str, &'static str, f64)> {
     }
 }
 fn air_value(air: &AirData, name: &str, index: usize) -> Option<f64> {
+    if name == "pm25" { return air.points.get(index)?.pm25; }
     let factor = channel_spec(name)?.2;
     air.channels.get(name)?.values.get(index)?.map(|v| v * factor)
 }
-#[cfg(test)]
 fn air_cell(air: &AirData, name: &str, index: usize) -> String {
-    if !air.channels.contains_key(name) { return "未取得".into(); }
+    if name != "pm25" && !air.channels.contains_key(name) { return "未取得".into(); }
     air_value(air, name, index).map(|v| if name == "co" { format!("{v:.3}") } else { format!("{v:.1}") })
         .unwrap_or_else(|| "缺测".into())
 }
@@ -163,6 +164,8 @@ pub struct Summary {
     pub photo_count: usize,
     #[serde(default)]
     pub issue_count: Option<usize>,
+    #[serde(default)]
+    pub issue_number: Option<u64>,
     pub point_count: usize,
     pub warning: String,
     #[serde(default)]
@@ -232,6 +235,7 @@ fn during_flight(mission: &Mission, point: &Point) -> bool {
     (mission.start_time..=mission.end_time).contains(&point.time)
 }
 
+#[cfg(test)]
 fn channel_stat(data: &Collected, name: &str, maximum: bool) -> String {
     if !data.air.channels.contains_key(name) { return "未取得".into(); }
     let values: Vec<_> = data.air.points.iter().enumerate()
@@ -241,6 +245,40 @@ fn channel_stat(data: &Collected, name: &str, maximum: bool) -> String {
     let value = if maximum { values.iter().copied().fold(f64::NEG_INFINITY, f64::max) }
         else { values.iter().sum::<f64>() / values.len() as f64 };
     if name == "co" { format!("{value:.3}") } else { format!("{value:.1}") }
+}
+const AIR_METRICS: [&str; 5] = ["pm25", "pm10", "so2", "no2", "co"];
+fn air_peak_indices(data: &Collected) -> [Option<usize>; 5] {
+    AIR_METRICS.map(|name| {
+        if data.without_air_data { return None; }
+        data.air.points.iter().enumerate()
+            .filter(|(_, p)| during_flight(&data.mission, p))
+            .filter_map(|(i, p)| air_value(&data.air, name, i)
+                .filter(|v| v.is_finite()).map(|v| (i, p.time, v)))
+            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.1.cmp(&a.1)).then_with(|| b.0.cmp(&a.0)))
+            .map(|(i, _, _)| i)
+    })
+}
+fn air_peak_rows(data: &Collected, peaks: &[Option<usize>; 5]) -> Vec<Vec<String>> {
+    peaks.iter().enumerate().map(|(row, peak)| {
+        let blank = "【 】".to_owned();
+        if data.without_air_data { return vec![blank; 8]; }
+        let mut cells = vec![blank.clone(); 8];
+        cells[0] = (row + 1).to_string();
+        if let Some(index) = peak {
+            let point = &data.air.points[*index];
+            cells[1] = date(point.time, "%m-%d %H:%M:%S");
+            cells[2] = point.longitude.zip(point.latitude)
+                .filter(|(lon, lat)| lon.is_finite() && lat.is_finite() && lon.abs() <= 180.0 && lat.abs() <= 90.0 && (*lon != 0.0 || *lat != 0.0))
+                .map(|(lon, lat)| format!("{:.6}°{} / {:.6}°{}", lon.abs(), if lon < 0.0 { "W" } else { "E" }, lat.abs(), if lat < 0.0 { "S" } else { "N" }))
+                .unwrap_or(blank);
+            for (col, name) in AIR_METRICS.iter().enumerate() {
+                cells[col + 3] = air_cell(&data.air, name, *index);
+            }
+        } else {
+            cells[row + 3] = if row > 0 && !data.air.channels.contains_key(AIR_METRICS[row]) { "未取得" } else { "缺测" }.into();
+        }
+        cells
+    }).collect()
 }
 fn source(url: &str, dji: bool) -> Result<(), String> {
     let u = tauri::Url::parse(url).map_err(|_| "资料来源地址无效")?;
@@ -305,6 +343,35 @@ fn issue_groups(files: &[String]) -> Result<Vec<Vec<String>>, String> {
         groups.last_mut().unwrap().push(name);
     }
     Ok(groups)
+}
+// Highest-temperature annotations select candidate groups; raw captures alone
+// (including minimum-temperature marks) do not establish an issue.
+fn maximum_labels(photo: &Photo) -> Vec<String> {
+    photo.presentation.as_ref().map(|p| p.labels.iter()
+        .flat_map(|label| label.lines())
+        .map(str::trim).filter(|label| label.starts_with("最高温度"))
+        .map(str::to_owned).collect()).unwrap_or_default()
+}
+fn high_temperature_groups(data: &Collected) -> Result<Vec<Vec<String>>, String> {
+    let names = data.photos.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    Ok(issue_groups(&names)?.into_iter().filter(|group| group.iter().any(|name|
+        data.photos.iter().any(|p| &p.name == name && !maximum_labels(p).is_empty())
+    )).collect())
+}
+// Only target coordinates from maximum-temperature photos belong on this map.
+// Keep table-2 group numbers even when an earlier group has no coordinates.
+fn high_temperature_points(photos: &[&Photo], facts: &[evidence::PhotoFacts], groups: &[Vec<String>]) -> Vec<(usize, f64, f64)> {
+    let mut points = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        for (photo, fact) in photos.iter().zip(facts) {
+            if !group.contains(&photo.name) || maximum_labels(photo).is_empty() { continue; }
+            if let Some((lon, lat)) = fact.laser_target {
+                let point = (i + 1, lon, lat);
+                if !points.contains(&point) { points.push(point); }
+            }
+        }
+    }
+    points
 }
 fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     if data.without_air_data {
@@ -872,9 +939,12 @@ pub async fn collect_flight_report(
         if req.mission.end_time > Utc::now().timestamp_millis() - 60000 {
             return Err("请等待飞行结束并完成上传至少 1 分钟。".into());
         }
+        let cache_root = root(&app)?;
+        let cached_air = if req.without_air_data { None } else { cache::air(&cache_root, &req.mission, Utc::now().timestamp_millis()) };
+        let reuse_air = cached_air.is_some();
         let air: AirData = if req.without_air_data {
             AirData { url: String::new(), mission_id: 0, unit: String::new(), points: vec![], channels: HashMap::new(), chart: None }
-        } else { serde_json::from_value(
+        } else if let Some(air) = cached_air { air } else { serde_json::from_value(
             bridge
                 .request(
                     req.sniff_session.clone().ok_or("请选择可飞页面")?,
@@ -886,6 +956,9 @@ pub async fn collect_flight_report(
         .map_err(|e| format!("可飞格式错误：{e}"))? };
         if !req.without_air_data && air.chart.is_none() {
             return Err("未取得可飞 PM2.5 图表截图，请更新并重新加载浏览器插件后重试".into());
+        }
+        if !req.without_air_data && !reuse_air {
+            cache::store_air(&cache_root, &req.mission, &air, Utc::now().timestamp_millis())?;
         }
         let media = if req.no_media {
             // A missing media folder is not evidence of zero photos. Only an exact
@@ -926,9 +999,15 @@ pub async fn collect_flight_report(
             media
         };
         if !req.without_air_data { source(&air.url, false)?; }
-        let mut photos = vec![];
+        let cached_photos = cache::photos(&cache_root, &req.mission, &media, Utc::now().timestamp_millis());
+        let reuse_photos = cached_photos.is_some();
+        if reuse_photos && !req.no_media {
+            bridge.request(req.dji_session.clone(), req.dji_tab_id,
+                json!({"type":"flight-dji-list", "mediaKey":media_key(&req), "closeOnly":true})).await?;
+        }
+        let mut photos = cached_photos.unwrap_or_default();
         let media_key = media_key(&req);
-        for (index, name) in media.files.iter().enumerate() {
+        for (index, name) in media.files.iter().enumerate().filter(|_| !reuse_photos) {
             let t = photo_time(name)?;
             if t < req.mission.start_time - 300000 || t > req.mission.end_time + 300000 {
                 return Err("照片不属于本次飞行，已停止采集。".into());
@@ -958,6 +1037,10 @@ pub async fn collect_flight_report(
             photos,
         };
         validate(&data, Utc::now().timestamp_millis())?;
+        if !reuse_photos { cache::store_photos(&cache_root, &data)?; }
+        crate::runtime_log::record(&app, "info", "report", "collect_flight_report.cache",
+            "巡查报告本地资料复用完成",
+            json!({"airReused":reuse_air,"photosReused":reuse_photos,"photoCount":data.photos.len()}));
         Ok(data)
     }.await;
     crate::runtime_log::record(
@@ -991,6 +1074,14 @@ fn date(t: i64, pattern: &str) -> String {
         .format(pattern)
         .to_string()
 }
+// Both masthead numbers identify the actual flight minute in Beijing time.
+// Never inherit a historical counter when regenerating an older report.
+fn flight_issue_number(start_time: i64) -> Result<u64, String> {
+    let start = DateTime::from_timestamp_millis(start_time).ok_or("实际起飞时间无效")?;
+    start.with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+        .format("%Y%m%d%H%M").to_string().parse::<u64>()
+        .map_err(|_| "实际起飞时间无法生成期号".into())
+}
 // Fill only known slots; inserted user text is never interpreted as a slot.
 fn fill_slots(template: &str, fields: &[(&str, String)]) -> Result<String, String> {
     let mut rest = template;
@@ -1009,34 +1100,45 @@ fn fill_slots(template: &str, fields: &[(&str, String)]) -> Result<String, Strin
     out.push_str(rest);
     Ok(out)
 }
-// Template fields occupy individual runs; preserve their fonts and other properties.
-fn mark_missing_red(doc: &str) -> String {
-    let mut out = String::new();
-    let mut rest = doc;
-    while let Some(start) = rest.find("<w:r>") {
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        let Some(end) = rest.find("</w:r>") else { break };
-        let end = end + 6;
-        let mut run = rest[..end].to_owned();
-        if run.contains("【") {
-            let properties = run.find("<w:rPr>").and_then(|a| run.find("</w:rPr>").map(|b| run[a..b+8].to_owned())).unwrap_or_else(|| "<w:rPr></w:rPr>".into());
-            let mut red = properties.clone();
-            if let Some(start) = red.find("<w:color ") {
-                if let Some(end) = red[start..].find("/>") { red.replace_range(start..start+end+2, ""); }
-            }
-            red = red.replace("</w:rPr>", "<w:color w:val=\"FF0000\"/></w:rPr>");
-            for blank in ["【 】", "【待编】"] {
-                run = run.replace(blank, &format!("</w:t></w:r><w:r>{red}<w:t>{blank}</w:t></w:r><w:r>{properties}<w:t xml:space=\"preserve\">"));
-            }
+// Delete authored text across Word runs while retaining the XML and formatting.
+// Called only on our template before any external/user text is inserted.
+fn omit_high_process_details(doc: &mut String) -> Result<(), String> {
+    let mut spans = Vec::new();
+    let mut text = String::new();
+    let mut cursor = 0;
+    while let Some(relative) = doc[cursor..].find("<w:t") {
+        let tag = cursor + relative;
+        let boundary = doc.as_bytes().get(tag + 4).copied();
+        if !matches!(boundary, Some(b'>' | b' ')) {
+            cursor = tag + 4;
+            continue;
         }
-        out.push_str(&run);
-        rest = &rest[end..];
+        let start = tag + doc[tag..].find('>').ok_or("模板文本起点缺失")? + 1;
+        if doc.as_bytes()[start - 2] == b'/' {
+            cursor = start;
+            continue;
+        }
+        let end = start + doc[start..].find("</w:t>").ok_or("模板文本终点缺失")?;
+        spans.push((start, end, text.len()));
+        text.push_str(&doc[start..end]);
+        cursor = end + 6;
     }
-    out.push_str(rest);
-    out
+    let start = text.find("主要集中在").ok_or("模板高值说明缺失")?;
+    let suffix = "前后高值过程最为突出，";
+    let end = start + text[start..].find(suffix).ok_or("模板高值说明未结束")? + suffix.len();
+    for (xml_start, xml_end, offset) in spans.into_iter().rev() {
+        let left = start.max(offset);
+        let right = end.min(offset + xml_end - xml_start);
+        if left < right {
+            doc.replace_range(xml_start + left - offset..xml_start + right - offset, "");
+        }
+    }
+    Ok(())
 }
 fn fill_table(doc: &mut String, index: usize, rows: &[Vec<String>]) -> Result<(), String> {
+    fill_table_emphasized(doc, index, rows, &[])
+}
+fn fill_table_emphasized(doc: &mut String, index: usize, rows: &[Vec<String>], bold_columns: &[Option<usize>]) -> Result<(), String> {
     let token = format!("{{{{T{index}_0}}}}");
     let pos = doc.find(&token).ok_or("模板表格行缺失")?;
     let start = doc[..pos]
@@ -1046,7 +1148,7 @@ fn fill_table(doc: &mut String, index: usize, rows: &[Vec<String>]) -> Result<()
     let end = pos + doc[pos..].find("</w:tr>").ok_or("模板行终点缺失")? + 7;
     let row_template = &doc[start..end];
     let mut filled = String::new();
-    for row in rows {
+    for (row_index, row) in rows.iter().enumerate() {
         let fields: Vec<_> = row
             .iter()
             .enumerate()
@@ -1056,14 +1158,41 @@ fn fill_table(doc: &mut String, index: usize, rows: &[Vec<String>]) -> Result<()
             .iter()
             .map(|(key, value)| (key.as_str(), value.clone()))
             .collect();
-        filled.push_str(&fill_slots(row_template, &fields)?);
+        let mut row_xml = fill_slots(row_template, &fields)?;
+        if let Some(Some(column)) = bold_columns.get(row_index) {
+            let start = row_xml.match_indices("<w:tc>").nth(*column).ok_or("最高值单元格缺失")?.0;
+            let end = start + row_xml[start..].find("</w:tc>").ok_or("最高值单元格未闭合")? + 7;
+            let mut cell = row_xml[start..end].to_owned();
+            for tag in ["<w:b/>", "<w:b w:val=\"0\"/>", "<w:b w:val=\"false\"/>"] { cell = cell.replace(tag, ""); }
+            cell = cell.replace("<w:rPr/>", "<w:rPr></w:rPr>")
+                .replace("<w:rPr>", "<w:rPr><w:b/><w:bCs/>");
+            cell = cell.replace("<w:r><w:t", "<w:r><w:rPr><w:b/><w:bCs/></w:rPr><w:t");
+            row_xml.replace_range(start..end, &cell);
+        }
+        filled.push_str(&row_xml);
     }
     doc.replace_range(start..end, &filled);
     Ok(())
 }
+// The report tables use black text for both populated values and blanks. The
+// retained reference template marks several editable cells red, so remove
+// that presentation color from table XML before filling any values.
+fn remove_table_red(doc: &mut String) {
+    let mut cursor = 0;
+    while let Some(relative_start) = doc[cursor..].find("<w:tbl") {
+        let start = cursor + relative_start;
+        let Some(relative_end) = doc[start..].find("</w:tbl>") else { break };
+        let end = start + relative_end + "</w:tbl>".len();
+        let table = doc[start..end]
+            .replace("<w:color w:val=\"FF0000\"/>", "")
+            .replace("<w:color w:val=\"ff0000\"/>", "");
+        doc.replace_range(start..end, &table);
+        cursor = start + table.len();
+    }
+}
 fn image_xml(id: usize, width: i64, height: i64) -> String {
     format!(
-        r#"<w:p><w:pPr><w:jc w:val="center"/><w:keepNext/><w:spacing w:before="200" w:after="80"/></w:pPr><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{id}" name="Report image {id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="0" name="image"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdFlight{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+        r#"<w:p><w:pPr><w:jc w:val="center"/><w:keepNext/><w:spacing w:before="200" w:after="80"/></w:pPr><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{id}" name="Report image {id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="0" name="image"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdFlight{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
     )
 }
 fn block(doc: &mut String, key: &str, value: &str) -> Result<(), String> {
@@ -1078,12 +1207,48 @@ fn block(doc: &mut String, key: &str, value: &str) -> Result<(), String> {
     doc.replace_range(start..end, value);
     Ok(())
 }
+fn photo_coordinate(f: &evidence::PhotoFacts) -> Option<String> {
+    match (f.longitude, f.latitude) {
+        (Some(lon), Some(lat)) => Some(format!(
+            "{:.6}°{} / {:.6}°{}",
+            lon.abs(),
+            if lon < 0.0 { "W" } else { "E" },
+            lat.abs(),
+            if lat < 0.0 { "S" } else { "N" }
+        )),
+        _ => None,
+    }
+}
+fn photo_auto_description(p: &Photo, f: &evidence::PhotoFacts) -> String {
+    let coordinate = photo_coordinate(f)
+        .map(|value| format!("照片坐标{value}"))
+        .unwrap_or_else(|| "照片无有效GPS坐标".into());
+    let height = f
+        .relative_height
+        .map(|value| format!("相对高度{value:.2}米"));
+    let labels = maximum_labels(p);
+    let thermal = if f.image_type == "红外热成像" || !labels.is_empty() {
+        if labels.is_empty() {
+            "红外热成像，高温点待判读".into()
+        } else {
+            format!("红外高温点，司空标注{}；热源性质待核实", labels.join("，"))
+        }
+    } else {
+        "可见光辅助影像，不单独计为问题".into()
+    };
+    [Some(coordinate), Some(thermal), height]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("；")
+}
 fn build_docx(
     data: &Collected,
     charts: &[String; 2],
     issued: i64,
 ) -> Result<Vec<u8>, String> {
     let stats = validate(data, issued)?;
+    let issue_number = flight_issue_number(data.mission.start_time)?;
     // Chart inputs remain validated for compatibility; the report uses a
     // compact statistics table and the reference layout for field photos.
     if !data.without_air_data {
@@ -1101,6 +1266,7 @@ fn build_docx(
     }
     let mut doc = String::from_utf8(parts.remove("word/document.xml").ok_or("模板正文缺失")?)
         .map_err(|e| e.to_string())?;
+    remove_table_red(&mut doc);
     let caption = String::from_utf8(
         parts
             .remove("word/report-caption.xml")
@@ -1108,7 +1274,9 @@ fn build_docx(
     )
     .map_err(|e| e.to_string())?;
     let caption = &caption[caption.find("<w:p ").ok_or("图注段落缺失")?..];
-    let caption_for = |text: String| fill_slots(caption, &[("CAPTION", text)]);
+    // Keep each image with its caption, but do not chain the caption to the next image.
+    let caption = caption.replace("<w:keepNext/>", "<w:keepNext w:val=\"0\"/>");
+    let caption_for = |text: String| fill_slots(&caption, &[("CAPTION", text)]);
     let m = &data.mission;
     let flight_window = format!(
         "{}～{}",
@@ -1139,93 +1307,141 @@ fn build_docx(
         ..Default::default()
     };
     let evidence = data.evidence.as_ref().unwrap_or(&fallback);
+    let visible = facts
+        .iter()
+        .filter(|f| f.image_type.starts_with("可见光"))
+        .count();
+    let infrared = facts
+        .iter()
+        .filter(|f| f.image_type == "红外热成像")
+        .count();
     let count = photos.len().to_string();
+    // Group nearby captures, then select only groups with maximum-temperature evidence.
+    let groups = high_temperature_groups(data)?;
+    let issue_count = groups.len();
+    let target_points = high_temperature_points(&photos, &facts, &groups);
+    let coverage = evidence
+        .dji_task
+        .as_ref()
+        .map(|task| match task.status.as_str() {
+            "执行成功" => "完整覆盖",
+            "部分执行" | "执行终止" | "执行失败" => "部分覆盖",
+            _ => "覆盖范围待核实",
+        })
+        .unwrap_or("覆盖范围待核实");
+    let anomaly_summary = format!("高温疑似问题{issue_count}组");
     let blank = "【 】".to_owned();
     let mut fields = vec![
-        ("ISSUE", "【待编】".into()),
-        ("SERIES_ISSUE", "【待编】".into()),
+        ("ISSUE", issue_number.to_string()),
+        ("SERIES_ISSUE", issue_number.to_string()),
         ("ISSUED", date(issued, "%Y年%-m月%-d日")),
         ("ANALYSIS_WINDOW", evidence.trigger_hour_label()),
         ("FLIGHT_WINDOW", flight_window.clone()),
         ("PHOTO_COUNT", count.clone()),
         ("TOTAL0_1", "本航次".into()),
         ("TOTAL0_2", table_window.clone()),
-        ("TOTAL0_3", blank.clone()),
+        ("TOTAL0_3", coverage.into()),
         ("TOTAL0_4", format!("{count}张")),
-        ("TOTAL0_5", blank.clone()),
-        ("TOTAL1_1", blank.clone()),
-        ("TOTAL1_2", blank.clone()),
-        ("TOTAL1_3", blank.clone()),
-        ("TOTAL1_4", blank.clone()),
-        ("TOTAL1_5", format!("{count}张")),
-        ("TOTAL1_6", blank.clone()),
+        (
+            "TOTAL0_5",
+            anomaly_summary.clone(),
+        ),
+        (
+            "TOTAL1_1",
+            match (photos.first(), photos.last()) {
+                (Some(a), Some(b)) => format!(
+                    "{}～{}",
+                    date(photo_time(&a.name)?, "%m-%d %H:%M"),
+                    date(photo_time(&b.name)?, "%m-%d %H:%M")
+                ),
+                _ => blank.clone(),
+            },
+        ),
+        ("TOTAL1_2", "本航次抓拍点".into()),
+        ("TOTAL1_3", "—".into()),
+        ("TOTAL1_4", format!("可见光{visible}张，红外{infrared}张")),
+        ("TOTAL1_5", format!("共{count}张")),
     ];
+    // The authored threshold occupies its own Word run; preserve its styling.
+    let threshold_start = doc.find("高于</w:t>").ok_or("模板高值阈值缺失")?;
+    let threshold_offset = doc[threshold_start..].find("<w:t>1</w:t>").ok_or("模板高值阈值数字缺失")? + threshold_start;
+    doc.replace_range(threshold_offset..threshold_offset + "<w:t>1</w:t>".len(),
+        &format!("<w:t>{}</w:t>", evidence.high_threshold()));
     fields.extend(evidence.city_fields());
-    let editorial = |value: &str| if value.trim().is_empty() { blank.clone() } else { value.to_owned() };
-    fields.push(("TRIGGER", if evidence.trigger.starts_with("由司空平台执行") || evidence.trigger == "触发原因待核实" { blank.clone() } else { editorial(&evidence.trigger) }));
-    fields.push(("REVIEW_METHOD", editorial(&evidence.review_method)));
-    fields.push(("ANOMALY_COUNT", evidence.anomaly_count.map(|n|n.to_string()).unwrap_or_else(||blank.clone())));
+    if fields.iter().any(|(key, value)| *key == "CITY_HIGH_HOURS" && value == "0") {
+        omit_high_process_details(&mut doc)?;
+    }
+    fields.push((
+        "TRIGGER",
+        format!("由【{}】触发", m.mission_name),
+    ));
+    fields.push(("PHOTO_REVIEW_SUMMARY", "经AI智能识别，发现异常情况【】处".into()));
+
     // A flight execution is a task/route, never one row per photograph.
     let execution = vec![vec![
         "1".into(),
         evidence.dji_task.as_ref().and_then(|t| t.route_name.clone())
-            .filter(|v| !v.is_empty()).unwrap_or_else(|| blank.clone()),
+            .filter(|v| !v.is_empty()).unwrap_or_else(|| m.mission_name.clone()),
         table_window.clone(),
-        blank.clone(),
-        format!("{count}张"),
-        blank.clone(),
+        coverage.into(),
+        format!("照片{count}张"),
+        anomaly_summary,
     ]];
 
-    let rows: Vec<_> = photos
-        .iter()
-        .zip(&facts)
-        .enumerate()
-        .map(|(i, (p, f))| {
-            Ok(vec![
-                (i + 1).to_string(),
-                date(photo_time(&p.name)?, "%m-%d %H:%M:%S"),
-                evidence.reviews.get(&f.hash).map(|r|editorial(&r.location)).unwrap_or_else(||blank.clone()),
-                match (f.longitude, f.latitude) {
-                    (Some(lon), Some(lat)) => format!(
-                        "{:.6}°{} / {:.6}°{}",
-                        lon.abs(),
-                        if lon < 0.0 { "W" } else { "E" },
-                        lat.abs(),
-                        if lat < 0.0 { "S" } else { "N" }
-                    ),
-                    _ => blank.clone(),
-                },
-                if f.image_type == "影像类型未取得" { blank.clone() } else { f.image_type.clone() },
-                evidence
-                    .reviews
-                    .get(&f.hash)
-                    .map(|r| r.description.clone())
-                    .map(|v| editorial(&v)).unwrap_or_else(|| blank.clone()),
-                evidence
-                    .reviews
-                    .get(&f.hash)
-                    .map(|r| r.result.clone())
-                    .map(|v| editorial(&v)).unwrap_or_else(|| blank.clone()),
-            ])
-        })
-        .collect::<Result<_, String>>()?;
-    // Summarize all valid values inside the actual flight window, including
-    // low and zero readings. Full source arrays remain unchanged for audit.
-    let air_rows = if let Some(s) = &stats {
-        [true, false].into_iter().map(|maximum| {
-            let mut row = vec![
-                if maximum { "最高值".into() } else { "平均值".into() },
-                table_window.clone(),
-                s.count.to_string(),
-                format!("{:.1}", if maximum { s.max } else { s.mean }),
-            ];
-            row.extend(["pm10", "so2", "no2", "co", "o3"].map(|name| { let value = channel_stat(data, name, maximum); if value == "未取得" || value == "缺测" { blank.clone() } else { value } }));
-            row
-        }).collect()
-    } else { vec![vec![blank.clone(); 9]; 2] };
+    let route_name = evidence.dji_task.as_ref()
+        .and_then(|task| task.route_name.as_deref())
+        .map(str::trim).filter(|name| !name.is_empty()).unwrap_or(&blank);
+    let rows: Vec<_> = groups.iter().enumerate().map(|(i, group)| {
+        let selected: Vec<_> = photos.iter().zip(&facts)
+            .filter(|(p, _)| group.contains(&p.name) && !maximum_labels(p).is_empty()).collect();
+        let (p, f) = selected[0];
+        let coordinates = target_points.iter().filter(|(group, _, _)| *group == i + 1)
+            .map(|(_, lon, lat)| format!("经度{lon:.6}° / 纬度{lat:.6}°")).collect::<Vec<_>>();
+        let group_facts: Vec<_> = photos.iter().zip(&facts)
+            .filter(|(photo, _)| group.contains(&photo.name)).map(|(_, fact)| fact).collect();
+        let mut image_types = Vec::new();
+        if group_facts.iter().any(|fact| fact.image_type.starts_with("可见光")) {
+            image_types.push("可见光");
+        }
+        if group_facts.iter().any(|fact| fact.image_type == "红外热成像") {
+            image_types.push("红外");
+        }
+        let mut labels = selected.iter().flat_map(|(p, _)| maximum_labels(p)).collect::<Vec<_>>();
+        labels.sort(); labels.dedup();
+        Ok(vec![
+            (i + 1).to_string(), date(photo_time(&p.name)?, "%m-%d %H:%M:%S"),
+            route_name.to_owned(),
+            if coordinates.is_empty() { blank.clone() } else { coordinates.join("；") },
+            if image_types.is_empty() { blank.clone() } else { image_types.join(" / ") },
+            format!("{}；热源性质待核实{}", labels.join("；"),
+                photo_coordinate(f).map(|c| format!("；拍摄位置{c}")).unwrap_or_default()),
+        ])
+    }).collect::<Result<_, String>>()?;
+    let air_peaks = air_peak_indices(data);
+    let air_rows = air_peak_rows(data, &air_peaks);
 
-    fields.push(("CONCLUSION", editorial(&evidence.conclusion)));
-    fields.push(("RECOMMENDATION", editorial(&evidence.recommendation)));
+    let warning = if stats.as_ref().is_some_and(|s| s.max == 0.0) {
+        "本航次 PM2.5 有效数值全部为 0，请核查传感器状态；不能据此判断空气质量良好。"
+    } else { "" };
+    fields.push(("AIR_INTRO", if data.without_air_data { String::new() } else {
+        let s = stats.as_ref().unwrap();
+        format!("统计时段为{flight_window}（北京时间，含起止时刻），共{}条记录，其中PM2.5有效{}条、缺测{}条。表4依次列出PM2.5、PM10、SO₂、NO₂、CO最高值所在记录及同一记录的其他指标，最高值加粗；并列最高值取最早记录，缺测不补0。时段外数据不参与统计，完整采样另行归档。气体浓度按可飞平台口径换算。", s.count+s.missing, s.count, s.missing)
+    }));
+    let sampling_summary = stats.as_ref().map(|s| format!("实际执飞时段内PM2.5最高值{:.1} μg/m³，平均值{:.1} μg/m³；有效采样{}点、缺测{}点，最高值首次出现时间{}（北京时间）。{}", s.max, s.mean, s.count, s.missing, date(s.peak_time, "%m-%d %H:%M:%S"), warning)).unwrap_or_default();
+    fields.push(("CONCLUSION", if !evidence.conclusion.is_empty() {
+        format!("{}{}", evidence.conclusion, sampling_summary)
+    } else if stats.is_some() {
+        format!("本次巡航抓拍图片{count}张，影像异常及污染成因待判读、核实。{sampling_summary}")
+    } else { blank.clone() }));
+    // Use only explicit, flight-bound editorial input for recommendations.
+    fields.push((
+        "RECOMMENDATION",
+        if evidence.recommendation.is_empty() {
+            blank.clone()
+        } else {
+            evidence.recommendation.clone()
+        },
+    ));
     let mut rels = String::from_utf8(
         parts
             .remove("word/_rels/document.xml.rels")
@@ -1235,8 +1451,8 @@ fn build_docx(
     let mut types = String::from_utf8(parts.remove("[Content_Types].xml").ok_or("模板类型缺失")?)
         .map_err(|e| e.to_string())?;
     let mut photo_xml = String::new();
-    let mut table_images = HashMap::new();
-    let mut section_xml = String::new();
+    let mut photo_sizes = HashMap::new();
+
     for (i, p) in photos.iter().enumerate() {
         let id = i + 1000; // avoid the reference masthead drawing's ID
         let (bytes, ext) = decode_image(p.display_url())?;
@@ -1250,72 +1466,45 @@ fn build_docx(
                 &format!("<Default Extension=\"{ext}\" ContentType=\"image/{ext}\"/></Types>"),
             );
         }
-        let scale = (5500000.0 / width as f64).min(3200000.0 / height as f64);
-        let cell_scale = (2400000.0 / width as f64).min(2000000.0 / height as f64);
-        let cell_image = image_xml(
-            id,
-            (width as f64 * cell_scale) as i64,
-            (height as f64 * cell_scale) as i64,
-        )
-        .replace("name=\"image\"", &format!("name=\"{}\"", xml(&p.name)));
-        let run_start = cell_image.find("<w:r>").ok_or("照片图形缺失")?;
-        let run_end = cell_image.rfind("</w:r>").ok_or("照片图形未结束")? + 6;
-        table_images.insert(p.name.as_str(), cell_image[run_start..run_end].to_owned());
-        if i == 0 {
-            section_xml.push_str(
-                &image_xml(
-                    id + 10000,
-                    (width as f64 * scale) as i64,
-                    (height as f64 * scale) as i64,
-                )
-                .replace(
-                    &format!("rIdFlight{}", id + 10000),
-                    &format!("rIdFlight{id}"),
-                ),
-            );
-            section_xml.push_str(&caption_for(
-                "图1　巡航现场照片（抓拍点1，对应表2序号1）".into(),
-            )?);
-        }
+        photo_sizes.insert(p.name.as_str(), (id, width, height));
     }
-    let groups = issue_groups(&data.media.files)?;
     for (group_index, group) in groups.iter().enumerate() {
-        let mut indices: Vec<_> = group.iter().filter_map(|name| photos.iter().position(|p| &p.name == name)).collect();
-        indices.sort_unstable();
-        photo_xml.push_str("<w:p><w:pPr><w:keepNext/><w:ind w:left=\"0\" w:right=\"0\" w:firstLine=\"0\"/><w:jc w:val=\"center\"/><w:snapToGrid w:val=\"0\"/><w:spacing w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>");
-        for (j, &i) in indices.iter().enumerate() {
-            if j > 0 { photo_xml.push_str(if j % 2 == 0 {"<w:r><w:br/></w:r>"} else {"<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>"}); }
-            photo_xml.push_str(table_images.get(photos[i].name.as_str()).ok_or("现场照片图形缺失")?);
+        let mut group_photos: Vec<_> = group.iter().collect();
+        group_photos.sort_by_key(|name| {
+            let p = photos.iter().find(|p| &p.name == *name).unwrap();
+            (maximum_labels(p).is_empty(), p.name.clone())
+        });
+        // The template has 13040 twips of usable height. Reserve space for
+        // captions and inline baselines; scale the entire group proportionally.
+        const PHOTO_WIDTH: f64 = 5_600_000.0;
+        const GROUP_HEIGHT: f64 = 7_800_000.0;
+        let total_height: f64 = group_photos.iter().map(|name| {
+            let (_, width, height) = photo_sizes[name.as_str()];
+            PHOTO_WIDTH * height as f64 / width as f64
+        }).sum();
+        let scale = ((GROUP_HEIGHT - group_photos.len() as f64 * 300_000.0).max(300_000.0)
+            / total_height).min(1.0);
+        for (photo_index, name) in group_photos.iter().enumerate() {
+            let (id, width, height) = photo_sizes[name.as_str()];
+            let image = image_xml(id, (PHOTO_WIDTH * scale) as i64,
+                (PHOTO_WIDTH * height as f64 / width as f64 * scale) as i64)
+                .replace("name=\"image\"", &format!("name=\"{}\"", xml(name)))
+                .replace("<w:spacing w:before=\"200\" w:after=\"80\"/>",
+                    "<w:snapToGrid w:val=\"0\"/><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/>");
+            photo_xml.push_str(&image);
+            // Keep every picture and caption of a group on the same page,
+            // releasing the chain at the final caption so groups can paginate.
+            let keep = if photo_index + 1 < group_photos.len() { "1" } else { "0" };
+            photo_xml.push_str(&format!(r#"<w:p><w:pPr><w:keepNext w:val="{keep}"/><w:snapToGrid w:val="0"/><w:spacing w:before="0" w:after="80" w:line="240" w:lineRule="exact"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:color w:val="000000"/><w:sz w:val="20"/></w:rPr><w:t>{}-{}</w:t></w:r></w:p>"#,
+                group_index + 1, photo_index + 1));
         }
-        photo_xml.push_str("</w:p>");
-        photo_xml.push_str(&caption_for(format!("图{}　大疆司空平台抓拍图片（表2序号{}）", group_index+3, indices.iter().map(|i|(i+1).to_string()).collect::<Vec<_>>().join("、")))?);
     }
-    if photo_xml.is_empty() { photo_xml = caption_for("【 】".into())?; }
-    if let Some(map) = evidence::location_plot(&facts)? {
-        parts.insert("word/media/capture-locations.png".into(), map);
-        rels=rels.replace("</Relationships>","<Relationship Id=\"rIdFlight20000\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/capture-locations.png\"/></Relationships>");
-        if !types.contains("Extension=\"png\"") {
-            types = types.replace(
-                "</Types>",
-                "<Default Extension=\"png\" ContentType=\"image/png\"/></Types>",
-            );
-        }
-        section_xml.push_str(&image_xml(20000, 5500000, 3575000));
-        section_xml.push_str(&caption_for(
-            "图2　巡航抓拍位置图（编号对应表2序号）".into(),
-        )?);
-    } else if !photos.is_empty() {
-        section_xml.push_str(&caption_for("图2　巡航抓拍位置图【 】".into())?);
-    }
-    if photos.is_empty() {
-        section_xml = caption_for("巡航现场照片及对应位置图【 】".into())?;
-    }
+    if photo_xml.is_empty() { photo_xml = caption_for("未筛出含最高温度标注的照片组，不列问题图片。".into())?; }
+
     // Fill global fields before adding user-derived table/figure content; no
     // arbitrary strings are used as XML, and absent fields keep editable blanks.
     // Tables are already filled, so user data containing braces is protected by
     // limiting this pass to the named global slots.
-    // Preserve structural slots for the later table/image passes. Single pass
-    // prevents an editorial value containing {{...}} from changing another slot.
     let mut rest = doc.as_str();
     let mut filled = String::new();
     while let Some(start) = rest.find("{{") {
@@ -1324,19 +1513,29 @@ fn build_docx(
         let key = &rest[start+2..end-2];
         if let Some((_, value)) = fields.iter().find(|(name,_)|*name==key) {
             filled.push_str(&xml(value));
-        } else if key.starts_with("T0_") || key.starts_with("T1_") || key.starts_with("T2_") || key == "SECTION_PHOTOS" || key == "PHOTOS" {
+        } else {
             filled.push_str(&rest[start..end]);
-        } else { return Err(format!("模板字段未填写：{key}")); }
+        }
         rest = &rest[end..];
     }
     filled.push_str(rest);
     doc = filled;
     fill_table(&mut doc, 0, &execution)?;
-    fill_table(&mut doc, 1, &if rows.is_empty() { vec![vec![blank.clone();7]] } else { rows })?;
-    fill_table(&mut doc, 2, &air_rows)?;
-    block(&mut doc, "SECTION_PHOTOS", &section_xml)?;
+    fill_table(
+        &mut doc,
+        1,
+        &if rows.is_empty() {
+            vec![vec!["未取得".into(); 7]]
+        } else {
+            rows
+        },
+    )?;
+    let bold_columns: Vec<_> = air_peaks.iter().enumerate().map(|(i, peak)| peak.map(|_| i + 3)).collect();
+    fill_table_emphasized(&mut doc, 2, &air_rows, &bold_columns)?;
+    // Remove the distribution image and caption, including their template paragraph.
+    block(&mut doc, "SECTION_PHOTOS", "")?;
     block(&mut doc, "PHOTOS", &photo_xml)?;
-    parts.insert("word/document.xml".into(), mark_missing_red(&doc).into_bytes());
+    parts.insert("word/document.xml".into(), doc.into_bytes());
     parts.insert("word/_rels/document.xml.rels".into(), rels.into_bytes());
     parts.insert("[Content_Types].xml".into(), types.into_bytes());
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1409,6 +1608,7 @@ fn persist(
         .map_or_else(|| Utc::now().timestamp_millis(), |e| e.captured_at)
         .max(predecessor.map_or(0, |s| s.created_at + 1));
     let stats = validate(data, now)?;
+    let issue_number = flight_issue_number(data.mission.start_time)?;
     let bytes = build_docx(data, charts, now)?;
     let id = Uuid::new_v4().to_string();
     let temp = root.join(format!(".{id}.tmp"));
@@ -1429,7 +1629,8 @@ fn persist(
             title: data.mission.mission_name.clone(),
             path: dest.join(&name).to_string_lossy().into_owned(),
             photo_count: data.photos.len(),
-            issue_count: Some(issue_groups(&data.media.files)?.len()),
+            issue_count: Some(high_temperature_groups(data)?.len()),
+            issue_number: Some(issue_number),
             point_count: data.air.points.len(),
             warning: if data.without_air_data {
                 "未收录可飞数据，报告对应位置留空".into()
@@ -1442,13 +1643,13 @@ fn persist(
             media_url: data.media.url.clone(),
         };
         fs::write(temp.join("issues.json"), serde_json::to_vec_pretty(&json!({
-            "rule": "capture-time-span-at-most-3-seconds", "groups": issue_groups(&data.media.files)?
+            "rule": "highest-temperature-label-groups-span-at-most-3-seconds", "groups": high_temperature_groups(data)?
         })).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::write(temp.join("report-settings.json"), serde_json::to_vec_pretty(&json!({
-            "templateVersion": "fill-v8",
+            "templateVersion": "standard-20261103-v1",
             "runtimeTemplateSha256": evidence::digest(TEMPLATE),
-            "templateSha256": "e30bc73f8f720df2c150e36a41a10080a3ff871be0be7cd3e9466f09c16c0a32",
-            "generatorVersion": "flight-template-fill-v8", "statistics": ["maximum", "arithmetic-mean"],
+            "templateSha256": "25aa8b8df042c1f4577fc3ba0a19712dabd5a88543ff24abc75ec09c0c30b141",
+            "generatorVersion": "flight-standard-20261109-v2", "issueNumber": issue_number, "statistics": ["maximum", "arithmetic-mean"],
             "airinsChartIncluded": data.air.chart.is_some(),
             "windowStart": data.mission.start_time, "windowEnd": data.mission.end_time,
             "windowInclusive": true, "rawPointCount": data.air.points.len(),
@@ -1534,6 +1735,19 @@ pub async fn save_flight_report(
             &review_path,
             Utc::now().timestamp_millis(),
         )?);
+        // Refresh station observations on every save, even when flight assets
+        // came from cache or the preview has been open for a while.
+        if let Some(snapshot) = data.evidence.as_mut() {
+            if let Some(end) = snapshot.trigger_hour() {
+                let (rows, url, synced_at) = crate::monitoring::report_hours(&app, &end).await
+                    .map_err(|e| format!("重新读取大气站数据失败：{e}"))?;
+                snapshot.city_hours = rows.into_iter().map(|row| evidence::CityHour {
+                    time: row.time, potassium: row.potassium, pm25: row.pm25,
+                    source_url: url.clone(), synced_at: synced_at.clone(),
+                }).collect();
+                snapshot.captured_at = Utc::now().timestamp_millis();
+            }
+        }
         tauri::async_runtime::spawn_blocking(move || {
             // Cancellation of the caller cannot release the guard while the
             // blocking writer is still committing files.
@@ -1582,11 +1796,8 @@ fn read_summaries(root: &Path) -> Result<Vec<Summary>, String> {
                 if let Ok(bytes) = fs::read(p.join("source.json")) {
                     if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
                         if summary.issue_count.is_none() {
-                            if let Ok(files) = serde_json::from_value::<Vec<String>>(
-                                value["media"]["files"].clone(),
-                            ) {
-                                summary.issue_count =
-                                    issue_groups(&files).ok().map(|groups| groups.len());
+                            if let Ok(data) = serde_json::from_value::<Collected>(value.clone()) {
+                                summary.issue_count = high_temperature_groups(&data).ok().map(|g| g.len());
                             }
                         }
                         if summary.mission.is_none() {
@@ -1933,6 +2144,27 @@ mod tests {
         assert!(validate(&data, now).is_err());
     }
     #[test]
+    fn no_photos_omit_location_section_entirely() {
+        let mut data = sample();
+        data.media.url = format!("https://fh.dji.com{PROJECT}#/plan");
+        data.media.files.clear();
+        data.media.no_media = true;
+        data.photos.clear();
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis()).unwrap();
+        if let Ok(path) = std::env::var("TAIZHOU_REPORT_QA_NO_PHOTOS") {
+            fs::write(path, &bytes).unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert!(!doc.contains("巡航现场照片及对应位置图"));
+        assert!(!doc.contains("位置图未取得"));
+        assert!(!doc.contains("{{SECTION_PHOTOS}}"));
+        let after_table = &doc[doc.find("</w:tbl>").unwrap() + "</w:tbl>".len()..];
+        let next_paragraph = &after_table[..after_table.find("</w:p>").unwrap()];
+        assert!(next_paragraph.contains("三、大疆司空平台抓拍图片信息"));
+    }
+    #[test]
     fn root_media_requires_matching_folder_id_and_flight_time() {
         let mut data = sample();
         data.media.folder = data.media.folder.replace(" Immediate-Media", "");
@@ -2011,9 +2243,122 @@ mod tests {
     }
     pub(super) const PNG:&str="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS1kAAAAASUVORK5CYII=";
     #[test]
+    fn target_map_uses_only_high_temperature_targets_and_preserves_group_numbers() {
+        let mut data = sample();
+        let mut facts = Vec::new();
+        for (second, label, target) in [
+            (20, "最高温度: 80℃", None),
+            (21, "", Some((119.0, 32.0))), // Auxiliary target cannot fill group 1.
+            (30, "最低温度: 5℃", Some((119.1, 32.1))),
+            (40, "最高温度: 90℃", Some((119.98, 32.42))),
+            (41, "最高温度: 90℃", Some((119.98, 32.42))), // Same group/point once.
+            (50, "最高温度: 85℃", Some((119.99, 32.43))),
+        ] {
+            data.photos.push(Photo {
+                name: format!("DJI_202609220701{second}_0001_T.png"), kind: String::new(), data_url: PNG.into(),
+                presentation: Some(presentation::Presentation {
+                    method: "dji-viewer-capture-v1".into(), width: 1, height: 1, image_rect: None,
+                    annotation_count: usize::from(!label.is_empty()), labels: if label.is_empty() { vec![] } else { vec![label.into()] },
+                    captured_at: data.mission.end_time, data_url: None,
+                }),
+            });
+            facts.push(evidence::PhotoFacts { longitude: Some(120.0), latitude: Some(33.0), laser_target: target, ..Default::default() });
+        }
+        let groups = high_temperature_groups(&data).unwrap();
+        let photos = data.photos.iter().collect::<Vec<_>>();
+        let points = high_temperature_points(&photos, &facts, &groups);
+        assert_eq!(points, vec![(2,119.98,32.42),(3,119.99,32.43)]);
+        let png = evidence::location_plot(&points).unwrap().unwrap();
+        assert_eq!(image_dimensions(&png).unwrap(), (1000,650));
+        for f in &mut facts { f.laser_target = None; }
+        assert!(high_temperature_points(&photos, &facts, &groups).is_empty());
+    }
+    #[test]
+    fn only_maximum_temperature_groups_are_reported_with_auxiliary_photos() {
+        let mut bytes = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 640, 480);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&vec![50; 640 * 480]).unwrap();
+        }
+        let image = format!("data:image/png;base64,{}", STANDARD.encode(bytes));
+        let mut data = sample();
+        for (name, labels) in [
+            ("DJI_20260922070121_0001_T.png", vec!["最高温度: 76.7℃", "最低温度: -2.5℃"]),
+            ("DJI_20260922070122_0001_V.png", vec![]),
+            ("DJI_20260922070130_0002_T.png", vec!["最低温度: 5.3℃"]),
+            ("DJI_20260922070131_0002_V.png", vec![]),
+            ("DJI_20260922070140_0003_V.png", vec![]),
+        ] {
+            data.media.files.push(name.into());
+            data.photos.push(Photo { name: name.into(), kind: "司空原始照片".into(), data_url: image.clone(),
+                presentation: Some(presentation::Presentation {
+                    method: "dji-viewer-capture-v1".into(), width: 640, height: 480, image_rect: None,
+                    annotation_count: labels.len(), captured_at: data.mission.end_time,
+                    data_url: (!labels.is_empty()).then(|| image.clone()),
+                    labels: labels.into_iter().map(str::to_owned).collect(),
+                }) });
+        }
+        let groups = high_temperature_groups(&data).unwrap();
+        assert_eq!(groups, vec![data.media.files[..2].to_vec()]);
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], data.mission.end_time + 60000).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert!(doc.contains("高温疑似问题1组"));
+        assert!(doc.contains("最高温度: 76.7℃"));
+        assert!(!doc.contains("最低温度:"));
+        assert!(!doc.contains("同组辅助照片（不单独计为问题）"));
+        assert!(!doc.contains("最高温度标注照片"));
+        assert!(!doc.contains("表2第2组"));
+        assert!(!doc.contains("rIdFlight1002"));
+        assert!(!doc.contains("高温点坐标未取得"));
+        assert!(!doc.contains("点位分布"));
+        assert!(!doc.contains("rIdFlight20000"));
+        assert!(doc.contains("<w:t>1-1</w:t>"));
+        assert!(doc.contains("<w:t>1-2</w:t>"));
+        assert!(!doc.contains("抓拍位置分布"));
+        assert!(zip.by_name("word/media/high-temperature-targets.png").is_err());
+    }
+    #[test]
+    fn auto_photo_description_uses_dji_thermal_labels_and_photo_coordinates() {
+        let photo = Photo {
+            name: "DJI_20260922070121_0001_T.png".into(),
+            data_url: String::new(),
+            kind: "司空原始照片".into(),
+            presentation: Some(presentation::Presentation {
+                method: "dji-viewer-capture-v1".into(),
+                width: 640,
+                height: 480,
+                image_rect: None,
+                annotation_count: 2,
+                labels: vec!["最高温度: 76.7℃".into(), "最低温度: -2.5℃".into()],
+                captured_at: 1,
+                data_url: None,
+            }),
+        };
+        let facts = evidence::PhotoFacts {
+            longitude: Some(119.934438),
+            latitude: Some(32.410257),
+            image_type: "红外热成像".into(),
+            relative_height: Some(105.0),
+            hash: String::new(),
+            laser_target: None,
+        };
+        let description = photo_auto_description(&photo, &facts);
+        assert!(description.contains("照片坐标119.934438°E / 32.410257°N"));
+        assert!(description.contains("红外高温点"));
+        assert!(description.contains("最高温度: 76.7℃"));
+        assert!(!description.contains("最低温度"));
+        assert!(description.contains("热源性质待核实"));
+    }
+    #[test]
     fn template_summarizes_flight_and_analysis_uses_trigger_hour() {
         let mut data = sample();
+        data.mission.mission_name = "钾离子超标巡查-20261103-10".into();
         data.evidence = Some(Evidence {
+            trigger: "由人工手动发起".into(),
             event: Some(json!({"source":"auto","sourceHour":"2026-09-22 06:00:00"})),
             city_hours: vec![
                 evidence::CityHour {time:"2026-09-22 04:00:00".into(),potassium:Some(0.4),pm25:Some(30.0),source_url:String::new(),synced_at:String::new()},
@@ -2030,41 +2375,129 @@ mod tests {
             .read_to_string(&mut doc)
             .unwrap();
         assert_eq!(doc.matches("<w:tbl>").count(), 3);
+        assert!(doc.contains("第202609220701期（泰智飞  第202609220701期）"));
         assert!(doc.contains("2026年09月22日06时"));
+        assert!(doc.contains("本次任务由【钾离子超标巡查-20261103-10】触发，巡航时段为"));
+        assert!(!doc.contains("由人工手动发起"));
+        assert!(!doc.contains("触发原因待核实"));
         assert!(!doc.contains("00:00至"));
-        assert!(doc.contains("<w:color w:val=\"FF0000\"/>"));
-        for run in doc.split("<w:r>").skip(1) {
-            let run = run.split("</w:r>").next().unwrap();
-            if run.contains("【") { assert!(run.contains("<w:color w:val=\"FF0000\"/>")); }
-            if run.contains("65.00") { assert!(!run.contains("FF0000")); }
-        }
-        let air_table = doc
-            .split("<w:tbl>")
-            .nth(3)
-            .unwrap()
-            .split("</w:tbl>")
-            .next()
-            .unwrap();
-        assert_eq!(air_table.matches("</w:tr>").count(), 3); // header, maximum, mean
+        let first_table = doc.split("<w:tbl>").nth(1).unwrap().split("</w:tbl>").next().unwrap();
+        assert!(!first_table.contains("FF0000"));
+        assert!(doc.contains("最高值"));
+        assert!(doc.contains("平均值"));
         for value in [
             "最高值",
             "平均值",
             "65.0",
             "48.0",
-            "【 】",
+            "未取得",
         ] {
-            assert!(air_table.contains(value), "missing observation: {value}");
+            assert!(doc.contains(value), "missing observation: {value}");
         }
         assert!(!doc.contains("附录"));
         assert!(!doc.contains("{{"));
-        assert!(!doc.contains("生物质燃烧特征明显"));
+        assert!(doc.contains("生物质燃烧特征明显"));
         assert_eq!(
             fill_slots("{{VALUE}}", &[("VALUE", "<&> {{VALUE}}".into())]).unwrap(),
             "&lt;&amp;&gt; {{VALUE}}"
         );
     }
     #[test]
-    fn fixed_template_has_no_generated_narrative_and_keeps_editorial_text_exact() {
+    fn docx_displays_configured_threshold_and_daily_process_fields() {
+        let mut data = sample();
+        data.evidence = Some(Evidence {
+            flight_hour: Some("2026-11-03 02:00:00".into()),
+            potassium_threshold: Some(1.5),
+            city_hours: [1.4,2.0,2.1].into_iter().enumerate().map(|(h,k)| evidence::CityHour {
+                time: format!("2026-11-03 {h:02}:00:00"), potassium: Some(k), pm25: Some(30.0),
+                source_url: String::new(), synced_at: String::new(),
+            }).collect(), ..Default::default()
+        });
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis()).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        let mut reader = quick_xml::Reader::from_str(&doc);
+        let mut text = String::new();
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Text(t) => text.push_str(t.as_ref()),
+                quick_xml::events::Event::Eof => break,
+                _ => (),
+            }
+        }
+        assert!(text.contains("高于1.5微克/立方米的高值共2小时"));
+        assert!(text.contains("主要集中在01点、02点时段"));
+        assert!(text.contains("共出现2次明显高值过程，其中02点前后高值过程最为突出"));
+    }
+    #[test]
+    fn zero_high_hours_omit_process_details_but_keep_fixed_ending() {
+        for potassium in [Some(0.5), Some(1.2), None] {
+            let mut data = sample();
+            data.evidence = Some(Evidence {
+                event: Some(json!({"source":"auto","sourceHour":"2026-09-22 06:00:00"})),
+                city_hours: vec![evidence::CityHour {
+                    time: "2026-09-22 06:00:00".into(), potassium, pm25: Some(30.0),
+                    source_url: String::new(), synced_at: String::new(),
+                }],
+                ..Default::default()
+            });
+            let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis()).unwrap();
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut doc = String::new();
+            zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+            let mut reader = quick_xml::Reader::from_str(&doc);
+            let mut text = String::new();
+            loop {
+                match reader.read_event().unwrap() {
+                    quick_xml::events::Event::Text(t) => text.push_str(t.as_ref()),
+                    quick_xml::events::Event::Eof => break,
+                    _ => (),
+                }
+            }
+            for clause in ["主要集中在", "次明显高值过程", "前后高值过程最为突出"] {
+                assert_eq!(text.contains(clause), potassium != Some(0.5));
+            }
+            if potassium == Some(0.5) {
+                assert!(text.contains("高值共0小时，K⁺峰值浓度达0.50"));
+            }
+            assert!(text.contains("生物质燃烧特征明显。为核实高值点位、锁定污染源头，依托无人机机库启动自动巡飞。"));
+            assert!(!text.contains("{{"));
+        }
+    }
+    #[test]
+    fn table_one_uses_platform_coverage_and_photo_anomaly_groups() {
+        let mut data = sample();
+        data.evidence = Some(Evidence {
+            dji_task: Some(DjiTask {
+                task_id: Some("task-1".into()),
+                media_folder_id: Some(1),
+                planned_start_time: data.mission.start_time,
+                actual_time_missing: false,
+                task_type: Some("航线任务".into()),
+                route_name: Some("东南侧巡查航线".into()),
+                partial_reason: None,
+                mission: data.mission.clone(),
+                status: "执行成功".into(),
+                media_ready: true,
+                no_media: false,
+                media_uploaded_count: 2,
+                media_expected_count: 2,
+            }),
+            anomaly_count: Some(99), // Photo groups, rather than this legacy field, drive 表1.
+            ..Default::default()
+        });
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], Utc::now().timestamp_millis()).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert!(doc.contains("东南侧巡查航线"));
+        assert!(doc.contains("完整覆盖"));
+        assert!(doc.contains("高温疑似问题0组"));
+        assert!(!doc.contains("覆盖范围待核实"));
+    }
+    #[test]
+    fn standard_template_preserves_editorial_text() {
         for without_air in [false, true] {
             let mut data = if without_air { photo_only_sample() } else { sample() };
             data.evidence = Some(Evidence { conclusion: "人工结论<&> {{CITY_PM_START}}".into(), recommendation: "人工建议".into(), ..Default::default() });
@@ -2074,10 +2507,10 @@ mod tests {
             z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
             assert!(doc.contains("人工结论&lt;&amp;&gt; {{CITY_PM_START}}"));
             assert!(doc.contains("人工建议"));
-            assert!(doc.contains("高精度气体传感器"));
-            for banned in ["缺测或未发布值不补0", "明显高值过程划分规则待确定", "实际执飞时段内PM2.5最高值", "场景待判读", "附件1", "范围待核实", "异常事件数量尚未经现场核实"] {
-                assert!(!doc.contains(banned), "unexpected prose: {banned}");
+            for required in ["近期监测显示", "为核实高值点位、锁定污染源头", "覆盖范围待核实", "高温疑似问题0组"] {
+                assert!(doc.contains(required), "missing restored content: {required}");
             }
+            assert_eq!(doc.contains("实际执飞时段内PM2.5最高值"), !without_air);
         }
     }
     #[test]
@@ -2132,7 +2565,7 @@ mod tests {
         data.media.folder = data.media.folder.replace("09-22", "09-21");
         assert!(validate(&data, i64::MAX).is_err());
         data = photo_only_sample();
-        data.media.files.push("DJI_20260922070005_0001.JPG".into());
+        data.media.files.push("DJI_20260922070105_0001.JPG".into());
         assert!(validate(&data, i64::MAX).is_err()); // Missing photo export still blocks.
         data = photo_only_sample();
         assert!(validate(&data, data.mission.end_time).is_err());
@@ -2158,7 +2591,7 @@ mod tests {
         assert!(!doc.contains("建议逐张"));
         assert!(!doc.contains("建议优先"));
         assert!(!doc.contains("rIdFlight"));
-        assert!(doc.contains("空气六参数监测数据"));
+        assert!(doc.contains("空气五参数监测数据"));
         assert!(doc.contains("<w:tblGrid>"));
         assert!(!doc.contains("巡飞监测记录"));
         assert_eq!(
@@ -2194,6 +2627,35 @@ mod tests {
             saved.id
         );
         assert_eq!(read_summaries(&root).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn issue_number_uses_beijing_flight_minute() {
+        let utc = DateTime::parse_from_rfc3339("2026-12-31T16:02:59Z").unwrap().timestamp_millis();
+        assert_eq!(flight_issue_number(utc).unwrap(), 202701010002);
+        assert_eq!(flight_issue_number(utc - 59000).unwrap(), 202701010002);
+        assert!(flight_issue_number(i64::MAX).is_err());
+    }
+    #[test]
+    fn regeneration_replaces_legacy_issue_counter() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let data = photo_only_sample();
+        let charts = [String::new(), String::new()];
+        let mut old = persist(&root, &data, &charts, false).unwrap();
+        assert_eq!(old.issue_number, Some(202609220701));
+        old.issue_number = Some(2);
+        fs::write(root.join(&old.id).join("summary.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let new = persist(&root, &data, &charts, true).unwrap();
+        assert_eq!(new.issue_number, Some(202609220701));
+        let settings: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(&new.id).join("report-settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["issueNumber"], 202609220701_u64);
+        let mut archive = zip::ZipArchive::new(Cursor::new(fs::read(&new.path).unwrap())).unwrap();
+        let mut doc = String::new();
+        archive.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        assert!(doc.contains("第202609220701期（泰智飞  第202609220701期）"));
+        assert_eq!(persist(&root, &data, &charts, true).unwrap().issue_number, new.issue_number);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2407,6 +2869,55 @@ mod tests {
         assert_eq!((stats.max,stats.mean),(0.0,0.0));
     }
     #[test]
+    fn air_peak_records_keep_simultaneous_values_coordinates_and_bold_only_selected_metric() {
+        let mut d = sample();
+        let start = d.mission.start_time;
+        d.air.points = (0..8).map(|i| Point {
+            time: if i == 7 { d.mission.end_time + 1 } else if i == 6 { start } else { start + (i + 1) * 1000 },
+            pm25: Some(if i == 7 { 999.0 } else if i == 0 || i == 6 { 100.0 } else { i as f64 }),
+            longitude: Some(119.0 + i as f64 / 100.0), latitude: Some(32.0),
+        }).collect();
+        for (metric, name) in AIR_METRICS.iter().enumerate().skip(1) {
+            let (source, unit, _) = channel_spec(name).unwrap();
+            d.air.channels.insert((*name).into(), AirChannel {
+                source_channel: source.into(), unit: unit.into(),
+                values: (0..8).map(|i| Some(if i == 7 { 999.0 } else if i == metric { 100.0 } else { i as f64 })).collect(),
+            });
+        }
+        // The tied PM2.5 maximum occurs earlier in time at the later array index.
+        let peaks = air_peak_indices(&d);
+        assert_eq!(peaks, [Some(6), Some(1), Some(2), Some(3), Some(4)]);
+        let rows = air_peak_rows(&d, &peaks);
+        assert_eq!(&rows[0][1..5], &[date(start, "%m-%d %H:%M:%S"), "119.060000°E / 32.000000°N".into(), "100.0".into(), "6.0".into()]);
+        assert_eq!(&rows[1][3..5], &["1.0", "100.0"]);
+        let bytes = build_docx(&d, &[PNG.into(), PNG.into()], d.mission.end_time + 60000).unwrap();
+        if let Ok(path) = std::env::var("TAIZHOU_AIR_PEAK_QA_DOCX") { fs::write(path, &bytes).unwrap(); }
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new(); z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        let table = doc.split("<w:tbl>").nth(3).unwrap().split("</w:tbl>").next().unwrap();
+        let output_rows: Vec<_> = table.split("</w:tr>").collect();
+        assert_eq!(output_rows.len(), 7); // header + five data rows + trailing text
+        for row in 0..5 {
+            let cells: Vec<_> = output_rows[row + 1].split("<w:tc>").skip(1).collect();
+            for col in 3..8 { assert_eq!(cells[col].contains("<w:b/>"), col == row + 3); }
+        }
+        d.air.points[6].longitude = None;
+        d.air.points[1].pm25 = None;
+        d.air.channels.get_mut("no2").unwrap().values.fill(Some(0.0));
+        d.air.channels.get_mut("co").unwrap().values.fill(None);
+        d.air.channels.remove("so2");
+        let peaks = air_peak_indices(&d);
+        assert_eq!(peaks[3], Some(6)); // zero is valid, tied maxima use earliest time
+        let rows = air_peak_rows(&d, &peaks);
+        assert_eq!(rows[0][2], "【 】");
+        assert_eq!(rows[1][3], "缺测");
+        assert_eq!(rows[2][5], "未取得");
+        assert_eq!(rows[4][7], "缺测");
+        assert_eq!(rows[3][6], "0.0");
+        d.without_air_data = true;
+        assert!(air_peak_rows(&d, &air_peak_indices(&d)).iter().flatten().all(|v| v == "【 】"));
+    }
+    #[test]
     fn channel_alignment_units_missing_and_zero_are_preserved() {
         let mut d = sample();
         d.air.points[0].pm25 = Some(60.0);
@@ -2423,8 +2934,9 @@ mod tests {
         let mut xml=String::new();z.by_name("word/document.xml").unwrap().read_to_string(&mut xml).unwrap();
         let table=xml.split("<w:tbl>").nth(3).unwrap().split("</w:tbl>").next().unwrap();
         let rows:Vec<_>=table.split("</w:tr>").collect();
-        assert!(rows[1].contains("65.0")&&rows[1].contains("35.3")&&rows[1].contains("90.6"));
-        assert!(rows[2].contains("62.5")&&rows[2].contains("45.3")&&rows[2].contains("35.3"));
+        assert!(rows[1].contains("65.0")&&rows[1].contains("缺测")&&rows[1].contains("90.6"));
+        assert!(rows[2].contains("未取得"));
+        assert!(rows[3].contains("60.0") && rows[3].contains("35.3") && rows[3].contains("0.0"));
         d.air.points[0].time = d.mission.end_time + 1;
         assert_eq!(channel_stat(&d,"no2",false),"0.0");
         assert_eq!(channel_stat(&d,"no2",true),"0.0");
@@ -2440,6 +2952,19 @@ mod tests {
         d.air.channels.remove("no2");
         d.air.channels.insert("o3".into(),AirChannel{source_channel:"ad_7".into(),unit:"ppm".into(),values:vec![Some(0.0);2]});
         assert!(validate(&d,i64::MAX).is_err());
+    }
+    #[test]
+    #[ignore = "requires an archived report source for target-map visual QA"]
+    fn renders_archived_high_temperature_map() {
+        let input = std::env::var("TAIZHOU_TARGET_MAP_INPUT").unwrap();
+        let output = std::env::var("TAIZHOU_TARGET_MAP_OUTPUT").unwrap();
+        let data: Collected = serde_json::from_slice(&fs::read(input).unwrap()).unwrap();
+        let photos = data.photos.iter().collect::<Vec<_>>();
+        let facts = photos.iter().map(|p| evidence::photo_facts(&decode_image(&p.data_url).unwrap().0)).collect::<Vec<_>>();
+        let groups = high_temperature_groups(&data).unwrap();
+        let points = high_temperature_points(&photos, &facts, &groups);
+        fs::write(output, evidence::location_plot(&points).unwrap().unwrap()).unwrap();
+        println!("{} photos, {} high-temperature groups, {} target points: {:?}", photos.len(), groups.len(), points.len(), points);
     }
     #[test]
     #[ignore = "requires explicit local live-report fixture"]

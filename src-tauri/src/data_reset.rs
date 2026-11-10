@@ -108,6 +108,7 @@ pub fn clear_all_data(app: tauri::AppHandle, confirmed: bool) -> Result<ClearDat
     let flight = app.state::<Flight>();
     let _gate = flight.gate.lock().map_err(|_| "无法锁定巡查状态")?;
     crate::flight::require_clearable(&monitoring::database(&app)?)?;
+    crate::email::clear_email_settings(&app)?;
     // Invalidate pre-reset report previews even if a later file deletion fails.
     *access += 1;
     app.state::<Readiness>().reset_workspace();

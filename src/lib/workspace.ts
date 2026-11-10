@@ -83,7 +83,7 @@ export function dataQuality(data: MonitorView | null) {
   return { tone: 'success', label: '数据正常', detail: `${[reading.potassiumValid ? 'K⁺' : '', reading.pm25Valid ? 'PM2.5' : ''].filter(Boolean).join('、')} 数据在有效时间内` };
 }
 
-type FlightSummary = { title: string; detail: string; tone: 'muted' | 'warning' | 'danger' | 'active' | 'ready'; needsManualLaunch?: boolean };
+type FlightSummary = { title: string; detail: string; tone: 'muted' | 'warning' | 'danger' | 'active' | 'ready'; needsManualLaunch?: boolean; handledCurrentHour?: boolean };
 export function flightSummary(data: MonitorView | null, ready: boolean, now = Date.now()): FlightSummary {
   const { event, records } = flightDisplay(data, now);
   if (!data) return { title: '无人机 · 状态待读取', detail: '等待客户端获取巡飞任务', tone: 'muted' };
@@ -117,6 +117,20 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
   const { potassium, pm25, triggerHour, valid, potassiumExceeded, pm25Exceeded, exceeded, potassiumThreshold, pm25Threshold } = triggerReading(data, now);
   if (noFlyPeriod(data.settings, now)) return { title: '禁飞时间 · 不执行起飞', detail: '超标仅记录', tone: 'muted' };
   if (exceeded) {
+    // Finished platform tasks are archived and removed from flight.event.
+    // Match the source observation hour, not the task's manual creation time.
+    const handled = records.find(record => !record.preview && record.source !== 'preview'
+      && (record.sourceHour ?? (record.source === 'auto' ? record.observedAt : null)) === triggerHour
+      && (record.status === 'completed' || (record.status === 'flight_error' && record.error?.startsWith('司空任务已结束：'))));
+    if (handled) {
+      const metric = potassiumExceeded && pm25Exceeded ? 'K⁺、PM2.5' : potassiumExceeded ? 'K⁺' : 'PM2.5';
+      const completed = handled.status === 'completed';
+      return {
+        title: `${metric} 超标 · ${completed ? '本小时已完成巡飞' : '本小时任务已结束'}`,
+        detail: `${triggerHour?.slice(0, 16)} 数据已处理 · ${completed ? '巡飞已完成' : handled.error} · 同一小时不再自动触发，新小时数据重新判断`,
+        tone: completed ? 'ready' : 'warning', handledCurrentHour: true,
+      };
+    }
     if (!event && records.some(record => record.status === 'restricted' && record.observedAt === triggerHour)) {
       const metric = potassiumExceeded && pm25Exceeded ? 'K⁺、PM2.5' : potassiumExceeded ? 'K⁺' : 'PM2.5';
       return { title: `${metric} 超标 · 等待新小时数据`, detail: '本小时已记录，不自动补飞 · 可手动执行任务', tone: 'warning', needsManualLaunch: true };

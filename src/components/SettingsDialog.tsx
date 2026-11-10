@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { EmailSettingsSection, type EmailSettingsHandle } from './EmailSettingsSection';
 import { RouteSelect } from './RouteSelect';
 import { defaultSettings, type FlightRoute, type WindRouteRule, type WorkspaceSettings } from '../lib/workspace';
 import { windDirections, windDirectionForRule } from '../lib/windDirections';
@@ -19,12 +20,15 @@ function RouteRefreshIcon({ spinning = false }: { spinning?: boolean }) {
 
 export function SettingsDialog({ settings, flightReady = false, routes: availableRoutes = [], selectedRoute = '', routesSyncedAt = null, onClose, onSaved, onRoutesChanged, onDataCleared }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const emailSection = useRef<EmailSettingsHandle>(null);
   const [potassium, setPotassium] = useState(settings.potassiumEnabled === false ? '' : Number.isInteger(settings.potassiumThreshold) ? settings.potassiumThreshold.toFixed(1) : String(settings.potassiumThreshold));
   const [pm25, setPm25] = useState(settings.pm25Enabled === false ? '' : String(settings.pm25Threshold));
   const [delay, setDelay] = useState(String(settings.takeoffDelayMinutes));
   const [manual, setManual] = useState(settings.requireManualConfirmation);
   const [periods, setPeriods] = useState((settings.noFlyPeriods ?? defaultSettings.noFlyPeriods ?? []).map(period => ({ ...period })));
   const [windRules, setWindRules] = useState<WindRouteRule[]>((settings.windRouteRules ?? []).map(rule => ({ ...rule })));
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailResetKey, setEmailResetKey] = useState(0);
   const [saving, setSaving] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -33,7 +37,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
   const [syncingRoutes, setSyncingRoutes] = useState(false);
   const [routeError, setRouteError] = useState('');
   const [selectingRoute, setSelectingRoute] = useState(false);
-  const busy = saving || clearing || syncingRoutes || selectingRoute;
+  const busy = saving || clearing || syncingRoutes || selectingRoute || emailBusy;
   const [error, setError] = useState('');
   const lock = useRef(false);
   const clearData = async () => {
@@ -41,7 +45,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
     lock.current = true; setClearing(true); setError(''); setClearMessage('');
     try {
       await invoke<{ cleared: boolean }>('clear_all_data', { confirmed: true });
-      setRoutes(null); setRouteError('');
+      setRoutes(null); setRouteError(''); setEmailResetKey(value => value + 1);
       await onDataCleared?.();
       setConfirmClear(false); setClearMessage('本地数据已清空，客户端已恢复到首次安装状态。');
     } catch (reason) { setError(`清空失败：${String(reason)}`); }
@@ -104,6 +108,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
     }
     lock.current = true; setSaving(true); setError('');
     try {
+      if (emailSection.current && !await emailSection.current.saveIfDirty()) return;
       await invoke('save_workspace_settings', { settings: next });
       await onSaved();
       onClose();
@@ -113,7 +118,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
 
   return <dialog ref={dialog} className="settings-dialog" aria-labelledby="settings-title" onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}>
     <form onSubmit={event => void submit(event)}>
-      <header className="settings-header"><div><h2 id="settings-title">监测设置</h2><p>设置监测阈值与无人机巡查策略</p></div><button type="button" className="icon-button" aria-label="关闭设置" disabled={busy} onClick={onClose}>×</button></header>
+      <header className="settings-header"><div><h2 id="settings-title">监测设置</h2><p>设置监测阈值、无人机巡查策略及邮件发送</p></div><button type="button" className="icon-button" aria-label="关闭设置" disabled={busy} onClick={onClose}>×</button></header>
       <div className="settings-body">
         <fieldset disabled={busy} className="settings-section"><legend>监测阈值</legend><div className="settings-fields">
           <label htmlFor="potassium-threshold">钾离子 K⁺ 阈值<div className="settings-input"><input autoFocus id="potassium-threshold" type="number" step="any" min="0.000001" placeholder="留空则不参与判断" value={potassium} onChange={event => setPotassium(event.target.value)} /><span>μg/m³</span></div></label>
@@ -166,6 +171,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
           {!periods.length && <p className="settings-help">未配置禁飞时间。</p>}
           <button type="button" className="secondary-button no-fly-add" disabled={periods.length >= 24} onClick={() => setPeriods(current => [...current, { start: '12:00', end: '13:00' }])}>＋ 添加时段</button>
         </fieldset>
+        <EmailSettingsSection ref={emailSection} key={emailResetKey} disabled={saving || clearing || syncingRoutes || selectingRoute} onBusyChange={setEmailBusy} />
         <fieldset className="settings-section"><legend>AI 巡查分析</legend><div className="analysis-switches">{analyses.map(name => <div key={name} className="analysis-switch-row"><span>{name}巡查分析</span><button type="button" role="switch" aria-label={`${name}巡查分析`} aria-checked={name === '火点'} disabled className="settings-switch"><span /></button></div>)}</div></fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>数据管理</legend>
           <div className="task-clear-content">

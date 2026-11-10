@@ -277,6 +277,16 @@ mod tests {
             manifest[0]["originalSha256"]
         );
         let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&summary.path).unwrap())).unwrap();
+        let mut document = String::new();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut document)
+            .unwrap();
+        assert_eq!(document.matches("rIdFlight1000").count(), 1, "the media photo belongs only to 表2/附件1");
+        assert!(document.contains("高温疑似问题1组"));
+        assert!(!document.contains("最低温度:"));
+        assert_eq!(summary.issue_count, Some(1));
+        assert!(document.contains("最高温度: 76.7℃"));
         let mut bytes = vec![];
         zip.by_name("word/media/flight-1000.png")
             .unwrap()
@@ -284,6 +294,9 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, display);
         assert_eq!(summary.photo_count, 1);
+        if let Ok(path) = std::env::var("TAIZHOU_REPORT_QA_PHOTO_SAMPLE") {
+            fs::copy(&summary.path, path).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

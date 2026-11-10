@@ -81,7 +81,7 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(0);
     expect(document.querySelector('.history-card')?.textContent).toContain('0 个任务');
   });
-  it('shows media counts and does not offer reports for explicit no-media flights', async () => {
+  it('shows media counts and offers reports for explicit no-media flights', async () => {
     missions = []; reports = [];
     const start = Date.parse('2026-09-22T09:00:00+08:00');
     const task = (name: string, media: Partial<{ noMedia: boolean; mediaReady: boolean; mediaUploadedCount: number; mediaExpectedCount: number }>) => ({
@@ -98,8 +98,8 @@ describe('task-owned reports', () => {
     const noMediaRow = rows.find(row => row.textContent?.includes('无媒体巡飞'))!;
     const withMediaRow = rows.find(row => row.textContent?.includes('有媒体巡飞'))!;
     expect(noMediaRow.querySelector('.task-media')?.textContent).toContain('无媒体文件');
-    expect(noMediaRow.querySelector('.task-actions')?.textContent).toContain('无需生成报告');
-    expect(noMediaRow.querySelector('.task-actions button')).toBeNull();
+    expect(noMediaRow.querySelector('.task-actions')?.textContent).toContain('生成报告');
+    expect(noMediaRow.querySelector('.task-actions button')).not.toBeNull();
     expect(withMediaRow.querySelector('.task-media')?.textContent).toContain('媒体文件（12/15）');
   });
   it('does not render missing media counts as 0/0', async () => {
@@ -218,7 +218,7 @@ describe('task-owned reports', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
     expect(document.querySelector('tbody tr .task-actual-time')?.textContent).toContain('至');
     expect(document.querySelector('tbody tr .task-actual-time')?.textContent).not.toContain('结束');
-    expect(document.querySelectorAll('tbody td:last-child button')).toHaveLength(4);
+    expect(document.querySelectorAll('tbody td:last-child button')).toHaveLength(5);
     expect(button('打开 Word')).toBeDefined();
     await click('生成报告');
     expect(document.querySelector('dialog[open]')?.textContent).toContain('北侧巡飞');
@@ -228,7 +228,7 @@ describe('task-owned reports', () => {
     expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ mission: second }) }));
     await click('生成并保存 Word 快报');
     expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
-    expect([...document.querySelectorAll('tbody td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告', '打开 Word', '打开文件夹', '重新生成报告']);
+    expect([...document.querySelectorAll('tbody td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '重新发送邮件', '打开文件夹', '重新生成报告', '打开 Word', '重新发送邮件', '打开文件夹', '重新生成报告']);
     expect(button('生成报告')).toBeUndefined();
   });
   it('clears cached task rows after the local data reset completes', async () => {
@@ -245,7 +245,7 @@ describe('task-owned reports', () => {
     expect(actions).toHaveLength(3);
     expect(actions.every(action => action.textContent === '生成报告' && action.className === 'primary-button')).toBe(true);
     await act(async () => actions[2].click());
-    expect(document.querySelector('dialog')?.textContent).toContain('暂无可飞数据');
+    expect(document.querySelector('dialog')?.textContent).toContain('按飞行时间查找可飞历史采样');
     expect(button('自动匹配并读取资料')).toBeDefined();
     expect(document.querySelectorAll('dialog')).toHaveLength(1);
     expect(document.querySelectorAll('dialog input[type="datetime-local"]')).toHaveLength(0);
@@ -262,9 +262,9 @@ describe('task-owned reports', () => {
   it('regenerates from the report row and opens the newly saved version', async () => {
     await render();
     const row = button('打开 Word').closest('tr')!;
-    expect([...row.querySelectorAll('td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '打开文件夹', '重新生成报告']);
+    expect([...row.querySelectorAll('td:last-child button')].map(b => b.textContent)).toEqual(['打开 Word', '重新发送邮件', '打开文件夹', '重新生成报告']);
     expect(row.querySelector('.task-action-list')).toBeDefined();
-    expect(row.querySelectorAll('.task-action-link')).toHaveLength(2);
+    expect(row.querySelectorAll('.task-action-link')).toHaveLength(3);
     await click('重新生成报告');
     expect(document.querySelector('dialog')?.textContent).toContain('重新生成巡飞报告');
     expect(document.querySelector('dialog')?.textContent).toContain(first.missionName);
@@ -297,6 +297,52 @@ describe('task-owned reports', () => {
     await click('生成并保存 Word 快报');
     expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: true, charts: ['', ''] }));
     expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
+  });
+  it('retries historical association when regenerating a photo-only report', async () => {
+    const historical = { ...first, missionId: 0, startTime: first.startTime - 7 * 86400000, endTime: first.endTime - 7 * 86400000 };
+    const sampling = { ...historical, missionId: 88, startTime: historical.startTime + 78000, missionName: '自动采样时间戳' };
+    reports = [{ ...saved(historical), withoutAirData: true }];
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'list_flight_missions') return { missions: args.cursorId ? [sampling] : [first], total: 2 };
+      return original(command, args);
+    });
+    await render(); await click('重新生成报告');
+    expect(document.querySelector<HTMLInputElement>('dialog input[type="checkbox"]')!.checked).toBeFalsy();
+    await click('自动匹配并读取资料');
+    expect(ipc.invoke).toHaveBeenCalledWith('list_flight_missions', expect.objectContaining({ cursorId: first.missionId, cursorTime: first.startTime }));
+    const request = ipc.invoke.mock.calls.find(([command]) => command === 'collect_flight_report')![1].request;
+    expect(request.withoutAirData).toBeUndefined();
+    expect(request.mission).toEqual({ ...historical, missionId: 88 });
+    await click('生成并保存 Word 快报');
+    expect(ipc.invoke).toHaveBeenCalledWith('save_flight_report', expect.objectContaining({ regenerate: true, charts: ['chart', 'route'] }));
+  });
+  it('rechecks history when retrying after a completed lookup found no sampling', async () => {
+    missions = []; reports = [{ ...saved({ ...first, missionId: 0 }), withoutAirData: true }];
+    await render(); await click('重新生成报告'); await click('自动匹配并读取资料');
+    expect(document.querySelector('dialog')?.textContent).toContain('未找到匹配采样');
+    missions = [first];
+    await click('重新匹配资料'); await click('自动匹配并读取资料');
+    const calls = ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report');
+    expect(calls).toHaveLength(2);
+    expect(calls[0][1].request.withoutAirData).toBe(true);
+    expect(calls[1][1].request.withoutAirData).toBeUndefined();
+    expect(calls[1][1].request.mission.missionId).toBe(first.missionId);
+  });
+  it('does not inherit the blank-data flag after an existing report is associated', async () => {
+    missions = [first]; reports = [{ ...saved(first), withoutAirData: true }];
+    await render(); await click('重新生成报告'); await click('自动匹配并读取资料');
+    const request = ipc.invoke.mock.calls.find(([command]) => command === 'collect_flight_report')![1].request;
+    expect(request.withoutAirData).toBeUndefined();
+    expect(request.mission.missionId).toBe(first.missionId);
+  });
+  it('does not silently generate a blank report when historical lookup fails', async () => {
+    missions = []; reports = [{ ...saved({ ...first, missionId: 0 }), withoutAirData: true }];
+    await render(); await click('重新生成报告');
+    ipc.invoke.mockRejectedValueOnce(new Error('历史查询网络中断'));
+    await click('自动匹配并读取资料');
+    expect(document.querySelector('dialog [role="alert"]')?.textContent).toContain('历史查询网络中断');
+    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
   });
   it('explicitly skips unavailable Airins data for an existing mission and saves blank charts', async () => {
     await render(); await click('生成报告');
@@ -557,6 +603,21 @@ describe('DJI scheduled flight automation', () => {
     expect(collected[0][1]).toEqual(expect.objectContaining({ request: expect.objectContaining({ mission: today.mission }) }));
     expect(document.body.textContent).toContain('生成报告');
   });
+  it('synchronizes older Airins pages to associate historical DJI executions', async () => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const task = external(7 * 86400000);
+    const sampling = { ...task.mission, missionId: 88, startTime: task.mission.startTime + 78000 };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [task], skipped: 0 };
+      if (command === 'list_flight_missions') return { missions: args.cursorId ? [sampling] : [first], total: 2 };
+      return original(command, args);
+    });
+    await render(); await act(async () => vi.advanceTimersByTimeAsync(5000));
+    const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes(task.mission.missionName))!;
+    expect(row.querySelector('a')?.getAttribute('href')).toContain('missionId=88');
+    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
+  });
   it('serializes automatic DJI collection because all jobs share one media tab', async () => {
     vi.useFakeTimers(); reports = []; missions = [];
     const firstTask = external();
@@ -579,18 +640,18 @@ describe('DJI scheduled flight automation', () => {
     expect(maxActive).toBe(1);
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
   });
-  it('generates an external flight without Airins while the task page is hidden, then reuses the report', async () => {
+  it.each([false, true])('generates an external flight without Airins (noMedia=%s), then reuses the report', async noMedia => {
     vi.useFakeTimers(); reports = []; missions = [];
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
-      if (command === 'sync_dji_report_tasks') return { tasks: [external()], skipped: 0, mediaTabId: 2 };
+      if (command === 'sync_dji_report_tasks') return { tasks: [{ ...external(), noMedia }], skipped: 0, mediaTabId: 2 };
       const result = await original(command, args);
       if (command === 'save_flight_report') reports = [result];
       return result;
     });
     await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady active={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
     await act(async () => vi.advanceTimersByTimeAsync(5000));
-    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ withoutAirData: true, mission: external().mission }) }));
+    expect(ipc.invoke).toHaveBeenCalledWith('collect_flight_report', expect.objectContaining({ request: expect.objectContaining({ withoutAirData: true, noMedia, mission: external().mission }) }));
     expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
     expect(document.querySelector('tbody')?.textContent).toContain('司空平台任务');
     expect(document.querySelector('tbody')?.textContent).toContain('已生成报告');
@@ -785,7 +846,7 @@ describe('report interaction during background work', () => {
     await render(true, planTabs);
     await click('刷新任务');
     expect(button('正在读取…').disabled).toBe(true);
-    for (const action of ['打开 Word', '打开文件夹', '重新生成报告', '生成报告']) expect(button(action).disabled).toBe(false);
+    for (const action of ['打开 Word', '重新发送邮件', '打开文件夹', '重新生成报告', '生成报告']) expect(button(action).disabled).toBe(false);
     await click('打开 Word'); await click('打开文件夹');
     expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report', { id: 'report-11' });
     expect(ipc.invoke).toHaveBeenCalledWith('open_flight_report_directory', { id: 'report-11' });

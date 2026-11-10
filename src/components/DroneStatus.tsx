@@ -52,7 +52,7 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
 
   const status = flightSummary(data, started && ready, event?.status === 'countdown' ? now : Date.now());
   const djiWeatherBlocked = !!event && ['ready', 'uncertain', 'not_flown'].includes(event.status) && [event.statusCheckError, event.error].some(value => !!value?.includes('司空平台天气阻飞：') && value.includes('；未继续执行'));
-  const showStatus = event ? isCurrentFlightEvent(event) || djiWeatherBlocked : status.tone === 'danger' || !!status.needsManualLaunch;
+  const showStatus = !!status.handledCurrentHour || (event ? isCurrentFlightEvent(event) || djiWeatherBlocked : status.tone === 'danger' || !!status.needsManualLaunch);
   const preview = !!event && (event.preview || event.source === 'preview');
   const checkable = event && !preview && (['ready', 'submitted', 'uncertain', 'flying', 'paused', 'flight_error'].includes(event.status) || djiWeatherBlocked);
   const resolvable = event && (['ready', 'flight_error'].includes(event.status) || (event.status === 'not_flown' && djiWeatherBlocked));
@@ -104,7 +104,7 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
       {cancelable ? <button className="drone-action drone-cancel" onClick={() => void action('cancel_flight', { eventId: event.id })}>取消任务</button>
         : djiWeatherBlocked ? <button className="drone-action drone-launch" disabled={busy} onClick={openDji}>去司空确认阻飞 ↗</button>
         : active ? event.status !== 'submitting' && <button className="drone-action drone-launch" disabled={busy} onClick={openDji}>{djiLabel}</button>
-        : <ManualLaunchButton data={data} ready={ready} started={started} busy={busy} action={action} className="drone-action drone-launch" />}
+        : !status.handledCurrentHour && <ManualLaunchButton data={data} ready={ready} started={started} busy={busy} action={action} className="drone-action drone-launch" />}
       {resolvable && <div ref={more} className="drone-more" onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setMoreOpen(false); }}>
         <button ref={moreTrigger} className="drone-action drone-details" aria-expanded={moreOpen} aria-controls={`${id}-more`} onClick={() => setMoreOpen(!moreOpen)}>更多 ⋯</button>
         <div id={`${id}-more`} className="drone-more-popover" hidden={!moreOpen}>

@@ -27,7 +27,7 @@ beforeEach(()=>{
   vi.stubGlobal('window',window);vi.stubGlobal('document',window.document);vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT',true);
   root=createRoot(document.getElementById('root')!);
   state.workspace={bridge:null,readiness:null,monitor:{settings:defaultSettings,flight:{routes:[],records:[]}},error:'',acting:false,action:vi.fn(),refresh:vi.fn(async()=>{}),resetStartup:vi.fn()};
-  ipc.invoke.mockReset().mockImplementation(async command=>command==='list_reports'?[oldReport]:{cleared:true});
+  ipc.invoke.mockReset().mockImplementation(async command=>command==='list_reports'?[oldReport]:command==='get_email_settings'?{recipients:[],username:'sender@example.com',configured:true}:{cleared:true});
 });
 afterEach(async()=>{await act(async()=>root.unmount());vi.unstubAllGlobals();});
 it.each([false,true])('clears webpage rows and rejects pre-reset list receipts (pending=%s)',async(pending)=>{
@@ -36,7 +36,7 @@ it.each([false,true])('clears webpage rows and rejects pre-reset list receipts (
   await act(async()=>root.render(<App/>));
   if(!pending)expect(document.querySelector('.capture-panel')?.textContent).toContain(oldReport.title);
   await click('设置');await click('清空数据');
-  ipc.invoke.mockImplementation(async command=>command==='list_reports'?[]:{cleared:true});
+  ipc.invoke.mockImplementation(async command=>command==='list_reports'?[]:command==='get_email_settings'?{recipients:[],username:'sender@example.com',configured:true}:{cleared:true});
   await click('确认清空数据');
   if(pending)await act(async()=>finish([oldReport]));
   expect(document.querySelector('.capture-panel')?.textContent).toContain('网页采集与历史记录（0）');

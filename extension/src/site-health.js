@@ -1,6 +1,28 @@
 import { findJiangsuApi } from './jiangsu.js';
 import { PLAN_URL } from './flight-plan.js';
 
+// A SPA can replace its execution context during a read. Retry only this
+// transport failure, on the same loaded URL, rather than waiting for the next
+// 30-second readiness cycle. Never retry auth results or arbitrary failures.
+export async function captureHealth(chrome, capture, tabId, timing = {}) {
+  const original = await chrome.tabs.get(tabId);
+  const now = timing.now || Date.now;
+  const pause = timing.pause || (() => new Promise(resolve => setTimeout(resolve, 200)));
+  try {
+    return await capture(tabId, { type: 'site-health' });
+  } catch (error) {
+    if (!/Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id/.test(error?.message || '')) throw error;
+    const deadline = now() + 2000;
+    while (now() < deadline) {
+      await pause();
+      const current = await chrome.tabs.get(tabId);
+      if (current.url !== original.url || (current.pendingUrl && current.pendingUrl !== original.url)) throw error;
+      if (current.status === 'complete') return capture(tabId, { type: 'site-health' });
+    }
+    throw error;
+  }
+}
+
 // Fixed read-only checks in the site's own context. Platform credentials are
 // sent only to their fixed platform endpoint, never returned to the bridge.
 export function prioritizeHealthJobs(jobs, tabs) {

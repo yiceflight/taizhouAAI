@@ -248,6 +248,17 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .settings-input input { width: 100%; min-width: 0; border: 0; padding: 10px 12px; color: #243d33; background: transparent; outline: none; font-variant-numeric: tabular-nums; }
 .settings-input span { padding-right: 12px; white-space: nowrap; font-size: 12px; color: #718175; }
 .settings-help { margin-top: 10px; }
+.email-recipient-field { min-width: 0; }
+.email-recipient-field > label { margin-bottom: 8px; }
+.email-recipient-input { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 42px; padding: 6px 8px; border: 1px solid #cbdcd1; border-radius: 6px; background: #fff; }
+.email-recipient-input:focus-within { outline: 2px solid #5a9b7c; outline-offset: 2px; }
+.email-recipient-input input { flex: 1 1 180px; width: 180px; min-width: 0; max-width: 100%; padding: 5px 4px; border: 0; outline: none; color: #243d33; background: transparent; font: inherit; font-size: 13px; }
+.email-recipient-tag { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; border-radius: 5px; padding: 3px 4px 3px 9px; background: #eaf4ee; border: 1px solid #cbded2; color: #286c4e; font-size: 13px; }
+.email-recipient-tag > span { min-width: 0; overflow-wrap: anywhere; }
+.email-recipient-tag button { flex-shrink: 0; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: #486a54; font-size: 18px; }
+.email-recipient-tag button:hover:enabled { background: #d5e9dc; }
+.email-recipient-tag button:focus-visible { outline: 2px solid #5a9b7c; }
+.settings-section:disabled .email-recipient-input { opacity: .6; }
 .settings-flight-controls { display: flex; flex-direction: column; gap: 16px; }
 .settings-delay { display: grid; grid-template-columns: minmax(0, 1fr) 160px; align-items: center; gap: 12px 18px; font-size: 13px; color: #486a54; }
 .settings-delay-copy { min-width: 0; }

@@ -32,6 +32,31 @@ fn version(value: &str) -> [u16; 4] {
 }
 
 fn main() {
+    // Private release provisioning. Generate into ignored build output rather
+    // than printing secrets as cargo:rustc-env (which would leak to build logs).
+    let email_defaults = "../.secrets/email-defaults.json";
+    println!("cargo:rerun-if-changed={email_defaults}");
+    let password = match fs::read(email_defaults) {
+        Ok(bytes) => {
+            let config: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| panic!("Invalid private email defaults JSON"));
+            config["password"]
+                .as_str()
+                .expect("Missing private SMTP password")
+                .to_owned()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => panic!("Cannot read private email defaults"),
+    };
+    assert!(
+        password.len() <= 512,
+        "Invalid private SMTP password length"
+    );
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    write_changed(
+        &output.join("email-default-password.rs"),
+        format!("{password:?}").as_bytes(),
+    );
     println!("cargo:rustc-check-cfg=cfg(test_environment)");
     let packaged_test = std::env::var_os("CARGO_FEATURE_TEST_ENVIRONMENT").is_some();
     let test_environment = tauri_build::is_dev() || packaged_test;

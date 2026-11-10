@@ -21,6 +21,43 @@ const reading = (d: MonitorView, potassium: number | null, age = 1) => {
   return d;
 };
 describe('drone task display',()=>{
+  it.each(['completed', 'flight_error'] as const)('shows the archived %s receipt for the exceeding hour in both displays', status => {
+    const d = data();
+    const hour = new Date(now + 7 * 3600000).toISOString().slice(0, 13).replace('T', ' ') + ':00:00';
+    d.rows = [{ time: hour, potassium: 0.77, pm25: 62 }];
+    d.settings.pm25Threshold = 60;
+    d.flight.records = [{ ...event(status), sourceHour: hour, observedAt: hour,
+      error: status === 'flight_error' ? '司空任务已结束：部分执行' : null }];
+    const summary = flightSummary(d, true, now);
+    expect(summary.handledCurrentHour).toBe(true);
+    expect(summary.title).toContain(status === 'completed' ? '本小时已完成巡飞' : '本小时任务已结束');
+    expect(summary.detail).toContain('同一小时不再自动触发');
+    if (status === 'flight_error') expect(summary.detail).toContain('部分执行');
+    for (const compact of [true, false]) {
+      const html = renderToStaticMarkup(<DroneStatus compact={compact} data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}}/>);
+      expect(html).toContain(summary.title);
+      expect(html).not.toContain('等待巡飞任务');
+      expect(html).not.toContain('立即执行任务');
+    }
+    // Manual receipts bind by sourceHour rather than their creation timestamp.
+    d.flight.records[0].source = 'manual';
+    d.flight.records[0].observedAt = hour.replace(':00:00', ':15:00');
+    expect(flightSummary(d, true, now).handledCurrentHour).toBe(true);
+    d.flight.records[0].preview = true;
+    expect(flightSummary(d, true, now).handledCurrentHour).not.toBe(true);
+    d.flight.records[0].preview = false;
+    // A later normal metric must not obscure the already handled exceedance.
+    const nextHour = new Date(now + 8 * 3600000).toISOString().slice(0, 13).replace('T', ' ') + ':00:00';
+    d.rows.unshift({ time: nextHour, potassium: 0.7, pm25: null });
+    expect(flightSummary(d, true, now).handledCurrentHour).toBe(true);
+    d.rows[0].pm25 = 63;
+    expect(flightSummary(d, true, now).title).toBe('PM2.5 超标 · 等待巡飞任务');
+  });
+  it('does not treat an unverified flight error as a completed flight', () => {
+    const d = reading(data(), 2);
+    d.flight.records = [{ ...event('flight_error'), sourceHour: d.rows[0].time, error: '平台回执待核查' }];
+    expect(flightSummary(d, true, now).handledCurrentHour).not.toBe(true);
+  });
   it('shows status refresh only for checkable tasks and exposes check errors in the overview', () => {
     for (const state of ['ready', 'submitted', 'uncertain', 'flying', 'paused', 'flight_error'] as const) {
       const d = data(); d.flight.event = { ...event(state), statusCheckedAt: now, statusCheckError: '平台风速超限，请核查原任务' };

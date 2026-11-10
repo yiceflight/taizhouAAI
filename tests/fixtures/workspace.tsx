@@ -3,13 +3,15 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import App from '../../src/App';
+import bridgeConfig from '../../bridge-config.json';
 import { defaultSettings, type WorkspaceSettings } from '../../src/lib/workspace';
 let settings = { ...defaultSettings };
+let emailSettings = { recipients: [] as string[], username: 'report@dayialgo.com', configured: true };
 import { targetSites } from '../../src/config/sites';
 if (!import.meta.env.DEV) throw Error('UI fixtures must not run in a production build');
 Object.assign(globalThis, { isTauri: true });
-let scenario = 'missing';
-let started = false;
+let scenario = new URLSearchParams(location.search).get('scenario') === 'normal' ? 'normal' : 'missing';
+let started = scenario === 'normal';
 const tabs = targetSites.map((s,i) => ({session:'fixture',id:i+1,title:s.name,url:s.url,status:'complete'}));
 const getReadiness = () => ({
   pluginReady: scenario !== 'missing', pluginMessage: scenario === 'missing' ? '尚未连接插件。请安装或启用插件，并保持 Chrome 运行。' : '插件已连接，版本兼容', checking: false, started,
@@ -38,9 +40,12 @@ mockIPC(async (command, payload) => {
       {id:'plugin',label:'浏览器插件心跳',state:scenario==='missing'?'warning':'pass',detail:scenario==='missing'?'未收到有效插件心跳，无法据此判断插件是否已安装':'收到插件 v0.7.14 的有效心跳；网站登录状态请查看网站验证',suggestion:scenario==='missing'?'若本机服务通过：打开 Chrome 扩展管理页，确认插件已启用、ID 与下方一致，并重新加载当前 App 提供的插件目录；查看插件的“错误”和 Service Worker。App 内的端口检测不能证明 Chrome 到 App 的请求未被拦截。':''},
     ],
   };
-  if(command==='get_bridge_status')return {connected:scenario!=='missing',clients:scenario==='missing'?0:1,versions:['0.7.0'],tabs,error:null};
+  if(command==='get_bridge_status')return {connected:scenario!=='missing',clients:scenario==='missing'?0:1,versions:[bridgeConfig.minimumExtensionVersion],tabs,error:null};
   if(command==='get_readiness'||command==='check_readiness')return getReadiness();
   if(command==='get_monitoring')return getMonitor();
+  if(command==='get_email_settings')return emailSettings;
+  if(command==='save_email_settings'){emailSettings={recipients:payload?.recipients as string[],username:String(payload?.username??'').trim(),configured:true};return emailSettings;}
+  if(command==='send_flight_report_email')return emailSettings.recipients.join('、');
   if(command==='refresh_flight_status'){
     if(flightEvent?.id!==payload?.eventId)throw Error('任务已变化');
     flightRecords=[{...flightEvent,statusCheckedAt:Date.now(),statusCheckError:'司空列表未识别到该任务状态。已手动刷新并解除本地任务占用，原起飞结果仍未确认。'},...flightRecords];

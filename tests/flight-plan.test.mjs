@@ -1,3 +1,4 @@
+import { createTaskTabManager } from '../extension/src/task-tab.js';
 import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -201,7 +202,7 @@ test('status polling recovers a matching draft weather reason without submitting
     }}};
     const released=[];
     const debuggerSession={acquire:async()=>true,release:async id=>released.push(id)};
-    const execute=runInNewContext(`${source}; watchFlight`,{chrome,debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue,evaluateBackgroundRead});
+    const execute=runInNewContext(`${source}; watchFlight`,{chrome,monitorTabFor:createTaskTabManager(chrome,{key:'flight-monitor-tab'}),debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue,evaluateBackgroundRead});
     if(name===job.name) {await assert.rejects(execute(job),/在线天气风速： 12\.75m\/s/);assert.deepEqual(calls,[42]);}
     else {assert.equal((await execute(job)).status,'执行中');assert.deepEqual(calls,[42,43]);}
     assert.deepEqual(released,calls);

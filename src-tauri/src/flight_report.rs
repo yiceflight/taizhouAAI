@@ -530,6 +530,14 @@ fn validate(data: &Collected, now: i64) -> Result<Option<Stats>, String> {
     }))
 }
 fn decode_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
+    decode_image_with_limit(url, 12_000_000)
+}
+// Lossless annotated PNGs can be much larger than the source JPEG, especially
+// after browser pixel-rounding correction. Keep the original-photo limit.
+fn decode_presentation_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
+    decode_image_with_limit(url, 36_000_000)
+}
+fn decode_image_with_limit(url: &str, max_bytes: usize) -> Result<(Vec<u8>, &'static str), String> {
     let (value, ext) = if let Some(v) = url.strip_prefix("data:image/png;base64,") {
         (v, "png")
     } else if let Some(v) = url.strip_prefix("data:image/jpeg;base64,") {
@@ -537,8 +545,8 @@ fn decode_image(url: &str) -> Result<(Vec<u8>, &'static str), String> {
     } else {
         return Err("仅接受 PNG 或 JPEG 图片".into());
     };
-    if value.len() > 16000000 {
-        return Err("图片超过 12 MB 限制".into());
+    if value.len() > max_bytes / 3 * 4 {
+        return Err(format!("图片超过 {} MB 限制", max_bytes / 1_000_000));
     }
     let bytes = STANDARD.decode(value).map_err(|_| "图片编码错误")?;
     if (ext == "png" && !bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
@@ -1448,7 +1456,7 @@ fn build_docx(
 
     for (i, p) in photos.iter().enumerate() {
         let id = i + 1000; // avoid the reference masthead drawing's ID
-        let (bytes, ext) = decode_image(p.display_url())?;
+        let (bytes, ext) = p.decode_display_image()?;
         let (width, height) = image_dimensions(&bytes)?;
         let name = format!("media/flight-{id}.{ext}");
         parts.insert(format!("word/{name}"), bytes);

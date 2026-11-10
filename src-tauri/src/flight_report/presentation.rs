@@ -1,6 +1,6 @@
 //! The original remains the source of EXIF and review identity. A separately
 //! captured FlightHub rendering is used only for presentation and DOCX media.
-use super::{decode_image, evidence, image_dimensions, Photo};
+use super::{decode_image, decode_presentation_image, evidence, image_dimensions, Photo};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -29,6 +29,13 @@ pub struct Presentation {
 }
 
 impl Photo {
+    pub fn decode_display_image(&self) -> Result<(Vec<u8>, &'static str), String> {
+        match self.presentation.as_ref().and_then(|p| p.data_url.as_deref()) {
+            Some(url) => decode_presentation_image(url),
+            None => decode_image(&self.data_url),
+        }
+    }
+
     pub fn display_url(&self) -> &str {
         self.presentation
             .as_ref()
@@ -83,7 +90,7 @@ impl Photo {
                 .data_url
                 .as_deref()
                 .ok_or("司空照片含标注但缺少合成图，已停止生成。")?;
-            let (bytes, ext) = decode_image(url)?;
+            let (bytes, ext) = decode_presentation_image(url)?;
             if ext != "png" || image_dimensions(&bytes)? != (p.width, p.height) {
                 return Err("司空标注合成图格式或尺寸与原图不符。".into());
             }
@@ -102,7 +109,7 @@ pub fn archive(photos: &[Photo], root: &Path) -> Result<(), String> {
             "originalSha256": evidence::digest(&original), "presentation": null});
         if let Some(p) = &photo.presentation {
             let (display_file, display_hash) = if let Some(url) = &p.data_url {
-                let (bytes, _) = decode_image(url)?;
+                let (bytes, _) = decode_presentation_image(url)?;
                 let file = format!("photo-{}-annotated.png", i + 1);
                 fs::write(root.join(&file), &bytes).map_err(|e| e.to_string())?;
                 (file, evidence::digest(&bytes))
@@ -168,6 +175,38 @@ mod tests {
         }];
         data
     }
+    #[test]
+    fn large_lossless_presentation_validates_archives_and_embeds_without_relaxing_original_limit() {
+        let mut data = annotated();
+        data.photos[0].data_url = image(30, 2048, 2048);
+        let mut bytes = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2048, 2048);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::NoCompression);
+            encoder.write_header().unwrap().write_image_data(&vec![60; 2048*2048*3]).unwrap();
+        }
+        assert!(bytes.len() > 12_000_000);
+        let url = format!("data:image/png;base64,{}", STANDARD.encode(&bytes));
+        assert!(decode_image(&url).is_err());
+        let p = data.photos[0].presentation.as_mut().unwrap();
+        p.width = 2048;
+        p.height = 2048;
+        p.data_url = Some(url);
+        assert!(validate(&data, data.mission.end_time + 120000).is_ok());
+        let root = tempfile::tempdir().unwrap();
+        let summary = persist(root.path(), &data, &[PNG.into(), PNG.into()], false).unwrap();
+        let dir = Path::new(&summary.path).parent().unwrap();
+        assert_eq!(fs::read(dir.join("photo-1-annotated.png")).unwrap(), bytes);
+        let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&summary.path).unwrap())).unwrap();
+        let mut embedded = vec![];
+        zip.by_name("word/media/flight-1000.png").unwrap().read_to_end(&mut embedded).unwrap();
+        assert_eq!(embedded, bytes);
+        let too_large = format!("data:image/png;base64,{}", "A".repeat(48_000_004));
+        assert!(decode_presentation_image(&too_large).unwrap_err().contains("36 MB"));
+    }
+
     #[test]
     fn rejects_missing_mismatched_or_inconsistent_capture_but_reads_legacy_archives() {
         let mut data = annotated();

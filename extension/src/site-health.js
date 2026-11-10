@@ -119,11 +119,24 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     const userToken = localStorage.getItem('x-user-token');
     const authToken = userToken ? null : localStorage.getItem('x-auth-token');
     if (!userToken && !authToken) return result('login_required', '未取得司空登录状态，请在 Chrome 中完成登录');
-    const response = await fetch(`${apiOrigin}/manage/api/v1/users/current`, {
+    // Retry one transient transport/service failure within the original 12s
+    // budget. Auth failures remain immediate; never report cached success.
+    const signal = AbortSignal.timeout(12000);
+    const request = () => fetch(`${apiOrigin}/manage/api/v1/users/current`, {
       method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error',
       headers: userToken ? { 'X-User-Token': userToken } : { 'X-Auth-Token': authToken },
-      signal: AbortSignal.timeout(12000),
+      signal,
     });
+    let response, retried = false;
+    try { response = await request(); }
+    catch (error) {
+      if (signal.aborted || location.href !== url) throw error;
+      retried = true;
+      response = await request();
+    }
+    if ([502, 503, 504].includes(response.status) && !retried && !signal.aborted && location.href === url) {
+      response = await request();
+    }
     const changedPage = () => location.href !== url
       ? result(/[/#](login|signin)([/?#]|$)/i.test(location.href) ? 'login_required' : 'page_required', '验证期间页面已切换，请重新验证') : null;
     if (changedPage()) return changedPage();

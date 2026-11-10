@@ -205,7 +205,7 @@ export async function captureDjiPresentation(api, tabId, job, plan, inspect, uui
         result = dimensions(await normalize(result.data, plan.width, plan.height));
         if (result.width !== plan.width || result.height !== plan.height) throw new Error('标注合成图像素尺寸校正失败');
       }
-      if (result.data.length > 16000000) throw new Error('标注合成图超过 12 MB，未退回无标注原图');
+      if (result.data.length > 48000000) throw new Error('标注合成图超过 36 MB，未退回无标注原图');
       const verified = await evaluate('capture-inspect', {signature: prepared.signature,
         captureGeometry: {width: prepared.width, height: prepared.height, imageRect: prepared.imageRect}});
       if (!verified || verified.signature !== prepared.signature) throw new Error('司空标注画面在合成时发生变化');
@@ -229,7 +229,7 @@ export async function normalizeDjiCapture(data, width, height) {
     if (!context) throw new Error('无法校正标注合成图尺寸');
     context.drawImage(bitmap, 0, 0, width, height);
     const output = new Uint8Array(await (await canvas.convertToBlob({type: 'image/png'})).arrayBuffer());
-    if (output.length > 12000000) throw new Error('标注合成图超过 12 MB');
+    if (output.length > 36000000) throw new Error('标注合成图超过 36 MB');
     let binary = '';
     for (let i = 0; i < output.length; i += 32768) binary += String.fromCharCode(...output.subarray(i, i + 32768));
     return btoa(binary);

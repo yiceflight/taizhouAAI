@@ -31,6 +31,7 @@ let capturing = false;
 let activeReportCaptures = 0;
 const readScheduler = createReadScheduler(executeJob, () => void heartbeat());
 const taskTabFor = createTaskTabManager(chrome);
+const monitorTabFor = createTaskTabManager(chrome, { key: 'flight-monitor-tab' });
 const reportTabs = new Map();
 const REPORT_MEDIA_ROOT = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/media?page=1&size=50';
 const REPORT_TAB_PREFIX = 'flight-report-tab:';
@@ -162,7 +163,7 @@ async function captureOnce(tabId, job) {
         delete data.capturePlan;
         if ((await chrome.tabs.get(targetTabId)).url !== data.url) throw new Error('照片合成期间页面发生跳转，请重试');
       }
-      if (new TextEncoder().encode(JSON.stringify(data)).length > 34000000) throw new Error('巡飞资料超过单次传输限制');
+      if (new TextEncoder().encode(JSON.stringify(data)).length > 66000000) throw new Error('巡飞资料超过单次传输限制');
       completed = true;
       if (job.type === 'flight-dji-list' && (!Array.isArray(data.files) || data.files.length === 0)) await closeReportTab(mediaKey, targetTabId);
       return data;
@@ -347,23 +348,7 @@ async function watchFlight(job) {
       if (typeof issue === 'string' && issue) throw new Error(issue);
     } finally { await debuggerSession.release(draft.id, attached); }
   }
-  const key = 'flight-monitor-tab';
-  let tab = await chrome.storage.local.get(key).then(value => value[key]);
-  tab = Number.isInteger(tab) ? await chrome.tabs.get(tab).catch(() => null) : null;
-  if (!tab || tab.url !== PLAN_URL) {
-    tab = (await chrome.tabs.query({ url: 'https://fh.dji.com/*' })).find(t => t.url === PLAN_URL);
-    if (tab) await chrome.storage.local.set({ [key]: tab.id });
-  }
-  if (!tab || tab.url !== PLAN_URL) {
-    tab = await chrome.tabs.create({ url: PLAN_URL, active: false });
-    await chrome.storage.local.set({ [key]: tab.id });
-  }
-  const deadline = Date.now() + 15000;
-  while (tab.status !== 'complete' && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    tab = await chrome.tabs.get(tab.id);
-  }
-  if (tab.url !== PLAN_URL || tab.status !== 'complete') throw new Error('司空计划列表未就绪');
+  const tab = await monitorTabFor();
   const attached = await debuggerSession.acquire(tab.id);
   try {
     const response = await evaluateBackgroundRead(chrome.debugger, tab.id, {

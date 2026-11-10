@@ -218,3 +218,27 @@ test('Jiangsu launcher on the login route requests business verification without
   assert.equal((await run(url, { document: { ...document, querySelectorAll: () => [{ getClientRects: () => [1] }] } })).state, 'login_required');
   assert.equal((await run('https://fh.dji.com/#/login', { document })).state, 'login_required');
 });
+
+test('DJI retries one transient failure with a shared deadline, never auth failures or changed pages', async () => {
+  for (const failure of ['network',502,503,504,401,403]) {
+    let calls = 0, signal;
+    const result = await run(dji,djiSession({fetch:async(_url,options)=>{
+      calls++;
+      if(signal) assert.equal(options.signal,signal);
+      signal=options.signal;
+      if(calls===1) {
+        if(failure==='network') throw Error('offline');
+        return {status:failure,ok:false};
+      }
+      return {status:200,ok:true,json:async()=>({code:0,data:{user_id:'fixture'}})};
+    }}));
+    assert.equal(calls,[401,403].includes(failure)?1:2);
+    assert.equal(result.state,failure===401?'login_required':failure===403?'forbidden':'ready');
+  }
+  let calls=0;
+  const result=await run(dji,djiSession({fetch:async()=>{if(++calls===1)throw Error('offline');return {status:503,ok:false};}}));
+  assert.equal(calls,2);assert.equal(result.state,'error');
+  const location=new URL(dji);calls=0;
+  const changed=await run(dji,djiSession({location,fetch:async()=>{calls++;location.href='https://fh.dji.com/#/login';throw Error('navigation');}}));
+  assert.equal(calls,1);assert.equal(changed.state,'login_required');
+});

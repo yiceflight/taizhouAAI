@@ -470,7 +470,8 @@ impl Bridge {
                         Ok::<_, StatusCode>(Json(json!({"ok":true})))
                     }
                 }))
-                .layer(DefaultBodyLimit::max(36 * 1024 * 1024))
+                // One source image (16 MB base64) plus annotated PNG (48 MB), with metadata.
+                .layer(DefaultBodyLimit::max(68 * 1024 * 1024))
                 .layer(middleware::from_fn(cors))
                 .with_state(bridge.clone());
             if let Err(error) = axum::serve(listener, router).await {

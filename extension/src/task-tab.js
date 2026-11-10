@@ -22,8 +22,7 @@ export async function waitForTaskList(expectedUrl) {
 }
 
 // Only reuse a tab owned by task sync; never navigate a user's page.
-export function createTaskTabManager(chrome, { now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
-  const key = 'flight-task-sync-tab';
+export function createTaskTabManager(chrome, { now = Date.now, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), key = 'flight-task-sync-tab' } = {}) {
   let pending;
   const loginPage = url => /[/#](login|signin)([/?#]|$)/i.test(url || '');
   async function acquire() {

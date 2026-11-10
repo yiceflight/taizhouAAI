@@ -12,12 +12,13 @@
 
 **内置密码会随二进制分发，可被提取，不能依赖桌面包隐藏共享 SMTP 凭据。** 此模式用于已授权的当前部署；若面向不受信任用户分发，应改用服务端邮件网关。发信账号轮换后，需更新私有构建配置并重新发布，或在各安装实例的设置中更新密码。
 
-用户保存的地址和密码作为一个条目写入操作系统凭据存储，不写入监测数据库、前端持久化或运行日志。开发版与正式版使用各自应用标识隔离。界面只接收“已配置”状态，不读取保存的明文密码。密码留空保留当前密码，更改发信地址必须同时提供对应密码。
+用户保存的地址和密码以明文 JSON 写入应用数据目录下的 `email-settings.json`，不再访问系统钥匙串，不写入监测数据库、前端持久化或运行日志。保存采用临时文件原子替换，避免写入失败破坏已有配置。开发版与正式版使用各自应用标识隔离。界面只接收“已配置”状态，不读取保存的明文密码。密码留空保留当前密码，更改发信地址必须同时提供对应密码。
 
-“清空数据”也删除本机邮件配置，使收件邮箱恢复为空、发信账号恢复本版本构建默认值；“恢复默认”仅恢复监测策略，不改变独立保存的邮件设置。
+旧版本的钥匙串条目不自动读取、迁移或删除，以免触发授权弹窗。首次使用文件存储时沿用构建默认发信配置；之前自定义的收件人、发信地址或密码需要重新填写保存。macOS 开发版文件位于 `~/Library/Application Support/com.taizhou.aai.dev/email-settings.json`。
+
+“清空数据”也删除本机邮件配置文件，使收件邮箱恢复为空、发信账号恢复本版本构建默认值；“恢复默认”仅恢复监测策略，不改变独立保存的邮件设置。
 
 验证：
 
 - `pnpm exec vitest run tests/email-settings.test.tsx tests/settings-flight.test.tsx tests/data-reset-ui.test.tsx tests/patrol-tab.test.tsx`
-- `cargo test --manifest-path src-tauri/Cargo.toml email::tests`（默认不发信、不访问真实凭据存储）
-- `cargo test --manifest-path src-tauri/Cargo.toml email::tests::native_credential_round_trip -- --ignored`（写入并清除独立测试条目，不发送邮件）
+- `cargo test --manifest-path src-tauri/Cargo.toml email::tests`（默认不发信，仅使用临时目录验证文件存储）

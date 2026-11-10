@@ -52,12 +52,12 @@ export function DroneStatus({ data, ready, started, busy, action, onFlight, comp
 
   const status = flightSummary(data, started && ready, event?.status === 'countdown' ? now : Date.now());
   const djiWeatherBlocked = !!event && ['ready', 'uncertain', 'not_flown'].includes(event.status) && [event.statusCheckError, event.error].some(value => !!value?.includes('司空平台天气阻飞：') && value.includes('；未继续执行'));
-  const showStatus = !!status.handledCurrentHour || (event ? isCurrentFlightEvent(event) || djiWeatherBlocked : status.tone === 'danger' || !!status.needsManualLaunch);
+  const showStatus = !!status.handledCurrentHour || !!status.needsManualLaunch || (event ? isCurrentFlightEvent(event) || djiWeatherBlocked : status.tone === 'danger' || !!status.needsManualLaunch);
   const preview = !!event && (event.preview || event.source === 'preview');
   const checkable = event && !preview && (['ready', 'submitted', 'uncertain', 'flying', 'paused', 'flight_error'].includes(event.status) || djiWeatherBlocked);
   const resolvable = event && (['ready', 'flight_error'].includes(event.status) || (event.status === 'not_flown' && djiWeatherBlocked));
   const cancelable = event && ['countdown', 'preparing'].includes(event.status);
-  const active = event && !['dismissed', 'canceled', 'completed', 'restricted', 'not_flown'].includes(event.status);
+  const active = event && !['dismissed', 'canceled', 'completed', 'failed', 'restricted', 'not_flown'].includes(event.status);
   const changed = !!taskDialog && (taskDialog.event.id !== event?.id || event?.status !== taskDialog.event.status);
   const openDialog = () => {
     if (!event || !resolvable) return;

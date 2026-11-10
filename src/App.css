@@ -520,7 +520,9 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .task-policy-note p { flex: 1; min-width: 0; }
 .task-details .drone-status { background: transparent; border: 0; padding: 0; }
 .task-details .drone-status-copy { max-width: none; }
-.task-details > .drone-status, .task-details > .drone-actions { margin-top: 16px; padding-top: 16px; border-top: 1px solid #e2eae4; }
+.task-details > .drone-status, .task-details > .drone-actions { margin: 0 0 18px; padding: 12px 0; }
+.task-details > .drone-status-danger { padding: 18px; border: 1px solid #b44831; border-left: 5px solid #b44831; border-radius: 8px; background: #fff4f1; }
+.task-details > .drone-status-danger .drone-status-copy small { max-width: none; white-space: normal; overflow: visible; }
 .task-details-copy { margin-top: 12px; font-size: 12px; line-height: 1.7; }
 .task-details-copy p + p { margin-top: 6px; }
 .task-details details { margin-top: 10px; font-size: 12px; line-height: 1.6; }

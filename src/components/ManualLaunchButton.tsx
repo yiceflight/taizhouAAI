@@ -75,7 +75,7 @@ export function ManualLaunchButton({ data, ready, started, busy, action, classNa
   const close = () => { if (!lock.current) setOpen(false); };
 
   return <>
-    <button ref={trigger} className={className} disabled={blocked || submitting} title={restricted ? blockedReason : undefined} aria-haspopup={!retry && reading.exceeded ? undefined : 'dialog'} onClick={requestLaunch}>{restricted ? '禁飞时间 · 不执行起飞' : retry ? '重新发起任务' : '立即执行任务'}</button>
+    <button ref={trigger} className={className} disabled={blocked || submitting} title={restricted ? blockedReason : undefined} aria-haspopup={!retry && reading.exceeded ? undefined : 'dialog'} onClick={requestLaunch}>{restricted ? '禁飞时间 · 不执行起飞' : retry ? reading.exceeded ? '核验并重新执行' : '重新发起任务' : '立即执行任务'}</button>
     {open && <dialog ref={dialog} className="settings-dialog manual-launch-dialog" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`} onCancel={event => { event.preventDefault(); close(); }}>
       <header className="settings-header"><div><h2 id={`${id}-title`}>{retry ? '确认重新发起任务' : '确认执行任务'}</h2><p id={`${id}-description`}>{retry ? '原任务未发送起飞请求；确认后将创建新的手动任务，保留原失败记录，无需先归档。' : reading.valid ? reading.exceeded ? `当前${triggerLabel}已超标，请核对最新情况后确认。` : '当前已配置指标未超标，仍要立即执行巡查任务吗？' : '当前无有效监测预警判断，请核对数据后确认。'}</p></div></header>
       <div className="manual-launch-body">

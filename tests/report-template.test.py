@@ -23,11 +23,90 @@ def signature(el):
     return el.tag, sorted(el.attrib.items()), el.text, [signature(c) for c in el]
 def content(el): return ''.join(el.xpath('.//w:t/text()', namespaces=NS))
 
+def layout_signature(el):
+    """Compare retained design excluding the explicitly normalized typography."""
+    el = deepcopy(el)
+    if el is None: return None
+    for node in el.xpath('.//w:rFonts | .//w:sz | .//w:szCs | .//w:color | .//w:highlight | .//w:shd | .//w:b | .//w:bCs | .//w:jc | .//w:ind | .//w:spacing | .//w:snapToGrid | .//w:widowControl', namespaces=NS):
+        node.getparent().remove(node)
+    for node in el.xpath('.//w:rPr', namespaces=NS):
+        if not len(node) and not node.attrib: node.getparent().remove(node)
+    return signature(el)
+
 class TemplateFidelity(unittest.TestCase):
+    def test_masthead_rule_and_caption_table_adjacency(self):
+        with ZipFile(ROOT / 'src-tauri/assets/flight-report-template.docx') as z:
+            doc = E.fromstring(z.read('word/document.xml'))
+        body = doc.find('w:body', NS)
+        masthead = next(p for p in body if '{{ISSUED}}' in content(p))
+        border = masthead.find('w:pPr/w:pBdr/w:bottom', NS)
+        self.assertIsNotNone(border)
+        self.assertEqual(border.get('{'+NS['w']+'}color'), 'FF0000')
+        self.assertEqual(border.get('{'+NS['w']+'}val'), 'single')
+        caption = next(p for p in body if content(p) == '表1　巡航执行情况')
+        self.assertEqual(caption.getnext().tag, '{'+NS['w']+'}tbl')
+        spacing = caption.find('w:pPr/w:spacing', NS)
+        self.assertEqual(spacing.get('{'+NS['w']+'}before'), '240')
+        self.assertEqual(spacing.get('{'+NS['w']+'}after'), '0')
+        heading = next(p for p in body if content(p) == '三、大疆司空平台抓拍图片信息')
+        self.assertEqual(heading.find('w:pPr/w:spacing', NS).get('{'+NS['w']+'}before'), '240')
+
+    def test_government_typography_and_scientific_scripts(self):
+        with ZipFile(ROOT / 'src-tauri/assets/flight-report-template.docx') as z:
+            doc = E.fromstring(z.read('word/document.xml'))
+        val = '{'+NS['w']+'}val'
+        paragraphs = doc.findall('w:body/w:p', NS)
+        cases = [
+            ('周山河街区无人机机库智能巡飞监测快报', '方正小标宋_GBK', '44'),
+            ('污染过程总体特征', '黑体', '32'),
+            ('（一）综合结论', '楷体_GB2312', '32'),
+            ('（二）工作建议', '楷体_GB2312', '32'),
+            ('{{CONCLUSION}}', '方正仿宋_GBK', '32'),
+        ]
+        for label, font, size in cases:
+            p = next(p for p in paragraphs if content(p) == label)
+            for props in p.findall('w:r/w:rPr', NS):
+                self.assertEqual(props.find('w:rFonts', NS).get('{'+NS['w']+'}eastAsia'), font)
+                self.assertEqual(props.find('w:sz', NS).get(val), size)
+                self.assertEqual(props.find('w:szCs', NS).get(val), size)
+        for p in doc.findall('.//w:p', NS):
+            if not content(p) or content(p) == '环境监测信息快报': continue
+            for props in p.findall('w:r/w:rPr', NS):
+                self.assertEqual(props.find('w:color', NS).attrib, {val: '000000'})
+        original = next(p for p in self.ref.findall('w:body/w:p', NS) if content(p).startswith('近期监测显示'))
+        current = next(p for p in paragraphs if content(p).startswith('近期监测显示'))
+        self.assertEqual([signature(v) for v in original.findall('.//w:vertAlign', NS)],
+                         [signature(v) for v in current.findall('.//w:vertAlign', NS)])
+
     def setUp(self):
         self.reference = ZipFile(ROOT / 'src-tauri/assets/flight-report-reference.docx')
         self.addCleanup(self.reference.close)
         self.ref = E.fromstring(self.reference.read('word/document.xml'))
+
+    def test_conclusion_subsections_and_fixed_advice_formatting(self):
+        with ZipFile(ROOT / 'src-tauri/assets/flight-report-template.docx') as z:
+            doc = E.fromstring(z.read('word/document.xml'))
+        paragraphs = doc.findall('w:body/w:p', NS)
+        start = next(i for i, p in enumerate(paragraphs) if content(p) == '五、结论和对策建议')
+        ending = paragraphs[start + 1:]
+        self.assertEqual([content(p) for p in ending[:3]],
+                         ['（一）综合结论', '{{CONCLUSION}}', '（二）工作建议'])
+        leads = ['一是强化重点区域和重点时段精准管控。', '二是深化空地一体化智能巡查。',
+                 '三是广泛宣传，深化网格源头治理。', '四是预警联动，健全长效防控体系。']
+        for paragraph, lead in zip(ending[3:], leads):
+            runs = paragraph.findall('w:r', NS)
+            self.assertEqual(content(runs[0]), lead)
+            self.assertIsNotNone(runs[0].find('w:rPr/w:b', NS))
+            self.assertIsNone(runs[1].find('w:rPr/w:b', NS))
+        self.assertEqual(len(ending[3:7]), 4)
+        self.assertEqual([content(p) for p in ending[7:]], [
+            '江苏省泰州环境监测中心', '{{FLIGHT_DATE}}',
+            '分送：第一专员办泰州监察室、泰州市生态环境局。',
+            '签发：宋兴伟　审核：杨文武　编制：朱俊、彭婷、毛慧、王玉祥、赵美玲',
+        ])
+        for p in ending[7:9]:
+            self.assertEqual(p.find('w:pPr/w:jc', NS).get('{'+NS['w']+'}val'), 'right')
+        self.assertNotIn('{{RECOMMENDATION}}', content(doc))
 
     def test_first_paragraph_uses_local_slots_and_retains_run_formatting(self):
         with ZipFile(ROOT / 'src-tauri/assets/flight-report-template.docx') as z:
@@ -52,9 +131,9 @@ class TemplateFidelity(unittest.TestCase):
         for key in ['CITY_PM_START_TIME', 'CITY_PM_END_TIME', 'CITY_K_START_TIME',
                     'CITY_K_END_TIME', 'CITY_RATIO_START_TIME', 'CITY_RATIO_END_TIME']:
             self.assertNotIn('{{'+key+'}}', value)
-        self.assertEqual(signature(paragraph.find('w:pPr', NS)), signature(original.find('w:pPr', NS)))
-        self.assertEqual([signature(r.find('w:rPr', NS)) for r in paragraph.findall('w:r', NS)],
-                         [signature(r.find('w:rPr', NS)) for r in original.findall('w:r', NS)])
+        self.assertEqual(layout_signature(paragraph.find('w:pPr', NS)), layout_signature(original.find('w:pPr', NS)))
+        self.assertEqual([layout_signature(r.find('w:rPr', NS)) for r in paragraph.findall('w:r', NS)],
+                         [layout_signature(r.find('w:rPr', NS)) for r in original.findall('w:r', NS)])
         self.assertNotIn('【', value)
 
     def test_original_formatting_and_no_historical_material(self):
@@ -86,8 +165,9 @@ class TemplateFidelity(unittest.TestCase):
                         original=deepcopy(orig)
                         for tag in ['keepNext','pageBreakBefore']:
                             for el in original.findall('w:pPr/w:'+tag,NS): el.getparent().remove(el)
-                        self.assertEqual(signature(adjusted),signature(original),name)
-                    else: self.assertEqual(signature(out),signature(orig),name)
+                        self.assertEqual(layout_signature(adjusted),layout_signature(original),name)
+                    elif name == '环境监测信息快报': self.assertEqual(signature(out),signature(orig),name)
+                    else: self.assertEqual(layout_signature(out),layout_signature(orig),name)
                 self.assertEqual(signature(doc.find('.//w:sectPr', NS)), signature(self.ref.find('.//w:sectPr', NS)))
                 tables = doc.xpath('./w:body/w:tbl', namespaces=NS)
                 self.assertEqual(len(tables), 3)
@@ -97,7 +177,7 @@ class TemplateFidelity(unittest.TestCase):
                     self.assertIsNotNone(table.find('w:tr/w:trPr/w:tblHeader',NS))
                     for para in table.findall('.//w:p',NS):
                         self.assertEqual(para.find('w:pPr/w:snapToGrid',NS).get('{'+NS['w']+'}val'),'0')
-                        self.assertEqual(para.find('w:pPr/w:spacing',NS).get('{'+NS['w']+'}line'),'260')
+                        self.assertEqual(para.find('w:pPr/w:spacing',NS).get('{'+NS['w']+'}line'),'240' if table_index == 1 else '260')
                     for row in table.findall('w:tr', NS): self.assertEqual(len(row.findall('w:tc', NS)), cols)
                 text = content(doc)
                 for stale in ['2026-06-01', '举例：', '2026年6月18日', '巡飞监测记录', '附录  Immediate-Media']:

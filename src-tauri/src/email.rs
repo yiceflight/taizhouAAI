@@ -1,6 +1,5 @@
-//! Aliyun SMTP delivery; private build defaults and per-install OS credential storage.
+//! Aliyun SMTP delivery; private build defaults and per-install JSON settings.
 use chrono::{FixedOffset, TimeZone};
-use keyring::Entry;
 use lettre::{
     message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::authentication::Credentials,
@@ -9,6 +8,7 @@ use lettre::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -64,20 +64,19 @@ impl StoredEmailSettings {
     }
 }
 
-fn keychain(app: &tauri::AppHandle) -> Result<Entry, String> {
-    // Keep production and dev credentials independent.
-    Entry::new(
-        &format!("{}.smtp", app.config().identifier),
-        "email-settings",
-    )
-    .map_err(|_| "无法访问系统凭据存储".into())
+fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // Keep production and dev settings independent without accessing the OS keychain.
+    app.path()
+        .app_data_dir()
+        .map(|root| root.join("email-settings.json"))
+        .map_err(|_| "无法定位邮件配置文件".into())
 }
 
-fn load_settings(entry: &Entry) -> Result<StoredEmailSettings, String> {
-    match entry.get_password() {
-        Ok(value) => serde_json::from_str(&value).map_err(|_| "邮件配置损坏，请重新配置".into()),
-        Err(keyring::Error::NoEntry) => Ok(StoredEmailSettings::default()),
-        Err(_) => Err("无法读取系统凭据存储，请解锁后重试".into()),
+fn load_settings(path: &Path) -> Result<StoredEmailSettings, String> {
+    match fs::read(path) {
+        Ok(value) => serde_json::from_slice(&value).map_err(|_| "邮件配置损坏，请重新配置".into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(StoredEmailSettings::default()),
+        Err(_) => Err("无法读取邮件配置文件".into()),
     }
 }
 
@@ -130,10 +129,25 @@ fn updated_settings(
     })
 }
 
-fn persist_settings(entry: &Entry, next: &StoredEmailSettings) -> Result<(), String> {
-    entry
-        .set_password(&serde_json::to_string(next).map_err(|_| "邮件配置保存失败")?)
-        .map_err(|_| "无法保存邮件配置到系统凭据存储，请解锁后重试".into())
+fn persist_settings(path: &Path, next: &StoredEmailSettings) -> Result<(), String> {
+    let parent = path.parent().ok_or("邮件配置文件路径无效")?;
+    fs::create_dir_all(parent).map_err(|_| "无法创建邮件配置目录")?;
+    let bytes = serde_json::to_vec_pretty(next).map_err(|_| "邮件配置保存失败")?;
+    // Replace the complete file atomically; a failed write preserves the previous settings.
+    let mut file = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|_| "无法创建邮件配置临时文件")?;
+    file.write_all(&bytes).map_err(|_| "无法写入邮件配置文件")?;
+    file.as_file().sync_all().map_err(|_| "无法同步邮件配置文件")?;
+    file.persist(path).map_err(|_| "无法保存邮件配置文件")?;
+    Ok(())
+}
+
+fn clear_settings(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("无法清除邮件配置文件".into()),
+    }
 }
 
 #[tauri::command]
@@ -141,7 +155,7 @@ pub async fn get_email_settings(app: tauri::AppHandle) -> Result<EmailSettings, 
     tauri::async_runtime::spawn_blocking(move || {
         let _access = crate::data_reset::access(&app)?;
         let _lock = CONFIG_LOCK.lock().map_err(|_| "邮件配置忙，请重试")?;
-        Ok(load_settings(&keychain(&app)?)?.public())
+        Ok(load_settings(&settings_path(&app)?)?.public())
     })
     .await
     .map_err(|_| "无法读取邮件配置")?
@@ -157,11 +171,11 @@ pub async fn save_email_settings(
     tauri::async_runtime::spawn_blocking(move || {
         let _access = crate::data_reset::access(&app)?;
         let _lock = CONFIG_LOCK.lock().map_err(|_| "邮件配置忙，请重试")?;
-        let entry = keychain(&app)?;
-        let current = load_settings(&entry)?;
+        let path = settings_path(&app)?;
+        let current = load_settings(&path)?;
         let next = updated_settings(current, recipients, username, password)?;
-        // One credential-store write commits addresses and password together.
-        persist_settings(&entry, &next)?;
+        // One file replacement commits addresses and password together.
+        persist_settings(&path, &next)?;
         Ok(next.public())
     })
     .await
@@ -170,10 +184,7 @@ pub async fn save_email_settings(
 
 pub fn clear_email_settings(app: &tauri::AppHandle) -> Result<(), String> {
     let _lock = CONFIG_LOCK.lock().map_err(|_| "邮件配置忙，请重试")?;
-    match keychain(app)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err("无法清除邮件配置，请解锁系统凭据存储后重试".into()),
-    }
+    clear_settings(&settings_path(app)?)
 }
 
 fn report_path(root: &Path, id: &str) -> Result<PathBuf, String> {
@@ -305,7 +316,7 @@ pub async fn send_flight_report_email(
     let config = tauri::async_runtime::spawn_blocking(move || {
         let _access = crate::data_reset::access(&config_app)?;
         let _lock = CONFIG_LOCK.lock().map_err(|_| "邮件配置忙，请重试")?;
-        load_settings(&keychain(&config_app)?)
+        load_settings(&settings_path(&config_app)?)
     })
     .await
     .map_err(|_| "无法读取邮件配置")??;
@@ -378,8 +389,9 @@ mod tests {
 
     #[test]
     fn migrates_legacy_recipient_and_deduplicates_saved_addresses() {
-        let entry = Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
-        entry.set_password(r#"{"recipient":"first@example.com","username":"sender@example.com","password":"test-only"}"#).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let entry = directory.path().join("email-settings.json");
+        fs::write(&entry, r#"{"recipient":"first@example.com","username":"sender@example.com","password":"test-only"}"#).unwrap();
         let old = load_settings(&entry).unwrap();
         assert_eq!(old.public().recipients, ["first@example.com"]);
         let updated = updated_settings(old, vec!["first@example.com".into(), " FIRST@example.com ".into(), "second@example.com".into()], "sender@example.com".into(), String::new()).unwrap();
@@ -438,47 +450,41 @@ mod tests {
     }
 
     #[test]
-    fn settings_storage_is_atomic_and_missing_entry_uses_defaults() {
-        let entry = Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
-        let initial = load_settings(&entry).unwrap();
+    fn file_settings_round_trip_replace_clear_and_missing_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/email-settings.json");
+        let initial = load_settings(&path).unwrap();
         assert!(initial.recipients.is_empty());
         assert_eq!(initial.username, DEFAULT_USERNAME);
-        persist_settings(&entry, &dummy_config()).unwrap();
-        assert_eq!(
-            load_settings(&entry).unwrap().recipients,
-            ["first@example.com"]
-        );
-        entry
-            .get_credential()
-            .downcast_ref::<keyring::mock::MockCredential>()
-            .unwrap()
-            .set_error(keyring::Error::Invalid("test".into(), "injected".into()));
+        persist_settings(&path, &dummy_config()).unwrap();
+        let loaded = load_settings(&path).unwrap();
+        assert_eq!(loaded.recipients, ["first@example.com"]);
+        assert_eq!(loaded.password, "unit-test-secret");
         let mut changed = dummy_config();
         changed.recipients = vec!["second@example.com".into()];
-        assert!(persist_settings(&entry, &changed).is_err());
-        assert_eq!(
-            load_settings(&entry).unwrap().recipients,
-            ["first@example.com"]
-        );
-        entry.delete_credential().unwrap();
-        assert!(load_settings(&entry).unwrap().recipients.is_empty());
-        entry.set_password("invalid-json").unwrap();
-        assert!(load_settings(&entry).is_err());
+        persist_settings(&path, &changed).unwrap();
+        assert_eq!(load_settings(&path).unwrap().recipients, ["second@example.com"]);
+        clear_settings(&path).unwrap();
+        assert!(!path.exists());
+        clear_settings(&path).unwrap();
+        assert!(load_settings(&path).unwrap().recipients.is_empty());
     }
 
     #[test]
-    #[ignore = "Uses an isolated temporary entry in the operating system credential store"]
-    fn native_credential_round_trip() {
-        let service = format!("com.taizhou.aai.email-test.{}", uuid::Uuid::new_v4());
-        let entry = Entry::new(&service, "test-settings").unwrap();
-        persist_settings(&entry, &dummy_config()).unwrap();
-        let reopened = Entry::new(&service, "test-settings").unwrap();
-        let value = load_settings(&reopened);
-        entry.delete_credential().unwrap();
-        let value = value.unwrap();
-        assert_eq!(value.recipients, ["first@example.com"]);
-        assert_eq!(value.password, "unit-test-secret");
-        assert!(load_settings(&reopened).unwrap().recipients.is_empty());
+    fn file_settings_errors_preserve_data_and_do_not_leak_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("email-settings.json");
+        fs::write(&path, "invalid-json unit-test-secret").unwrap();
+        assert_eq!(load_settings(&path).err().unwrap(), "邮件配置损坏，请重新配置");
+        // A directory at the target path forces replacement to fail on all platforms.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("existing"), "keep").unwrap();
+        assert_eq!(persist_settings(&path, &dummy_config()).unwrap_err(), "无法保存邮件配置文件");
+        assert_eq!(fs::read_to_string(path.join("existing")).unwrap(), "keep");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(load_settings(&path).err().unwrap(), "无法读取邮件配置文件");
+        assert_eq!(clear_settings(&path).unwrap_err(), "无法清除邮件配置文件");
     }
 
     /// Explicit, opt-in live SMTP check. Password is read from stdin, never an env var or file.

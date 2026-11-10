@@ -21,6 +21,28 @@ const reading = (d: MonitorView, potassium: number | null, age = 1) => {
   return d;
 };
 describe('drone task display',()=>{
+  it('shows a fresh PM2.5 warning above policy even when a failed task remains', () => {
+    const d = data(); d.settings.requireManualConfirmation = true;
+    d.rows = [{ time: new Date(now + 7 * 3600000).toISOString().slice(0,19).replace('T',' '), potassium: 0.49, pm25: 31 }];
+    d.flight.event = { ...event('failed'), error: '准备失败' };
+    const before = JSON.stringify(d);
+    const doc = parseHTML(renderToStaticMarkup(<MonitoringPanel data={d} ready started busy={false} action={async()=>true} onPrepare={()=>{}} onFlight={()=>{}}/>)).document;
+    const warning = doc.querySelector('.drone-status-danger')!;
+    expect(warning.textContent).toContain('PM2.5 超过巡查阈值 · 需要人工处理');
+    expect(warning.textContent).toContain('PM2.5 31 > 30 μg/m³');
+    expect(warning.nextElementSibling?.className).toBe('task-policy-grid');
+    expect(button(doc, '核验并重新执行')?.disabled).toBe(false);
+    expect(button(render(d, false), '核验并重新执行')?.disabled).toBe(true);
+    expect(renderToStaticMarkup(<DroneStatus compact data={d} ready started busy={false} action={async()=>true} onFlight={()=>{}}/>)).toContain('需要人工处理');
+    expect(JSON.stringify(d)).toBe(before);
+    d.rows[0].pm25 = 30;
+    expect(render(d).querySelector('.drone-status-danger')).toBeNull();
+    d.rows[0].pm25 = 31; d.settings.pm25Enabled = false;
+    expect(render(d).querySelector('.drone-status-danger')).toBeNull();
+    d.settings.pm25Enabled = true; d.rows[0].time = '2020-01-01 00:00:00';
+    expect(render(d).querySelector('.drone-status-danger')).toBeNull();
+  });
+
   it.each(['completed', 'flight_error'] as const)('shows the archived %s receipt for the exceeding hour in both displays', status => {
     const d = data();
     const hour = new Date(now + 7 * 3600000).toISOString().slice(0, 13).replace('T', ' ') + ':00:00';
@@ -77,7 +99,7 @@ describe('drone task display',()=>{
     }
   });
   it.each(['completed', 'failed', 'canceled', 'dismissed', 'not_flown', 'flight_error'] as const)('hides %s from both current displays and leaves its receipt in task data without overview history', state => {
-    const d=reading(data(),2);
+    const d=reading(data(),state === 'failed' ? 0.2 : 2);
     d.flight.event={...event(state), error:'原始平台回执', statusCheckedAt:now};
     d.flight.records=[d.flight.event];
     const before=JSON.stringify(d);

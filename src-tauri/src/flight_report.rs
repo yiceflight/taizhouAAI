@@ -1335,6 +1335,7 @@ fn build_docx(
         ("ISSUE", issue_number.to_string()),
         ("SERIES_ISSUE", issue_number.to_string()),
         ("ISSUED", date(issued, "%Y年%-m月%-d日")),
+        ("FLIGHT_DATE", date(m.start_time, "%Y年%-m月%-d日")),
         ("ANALYSIS_WINDOW", evidence.trigger_hour_label()),
         ("FLIGHT_WINDOW", flight_window.clone()),
         ("PHOTO_COUNT", count.clone()),
@@ -1375,7 +1376,7 @@ fn build_docx(
         "TRIGGER",
         format!("由【{}】触发", m.mission_name),
     ));
-    fields.push(("PHOTO_REVIEW_SUMMARY", "经AI智能识别，发现异常情况【】处".into()));
+    fields.push(("PHOTO_REVIEW_SUMMARY", format!("经AI智能识别，发现异常情况{issue_count}处")));
 
     // A flight execution is a task/route, never one row per photograph.
     let execution = vec![vec![
@@ -1427,21 +1428,13 @@ fn build_docx(
         let s = stats.as_ref().unwrap();
         format!("统计时段为{flight_window}（北京时间，含起止时刻），共{}条记录，其中PM2.5有效{}条、缺测{}条。表4依次列出PM2.5、PM10、SO₂、NO₂、CO最高值所在记录及同一记录的其他指标，最高值加粗；并列最高值取最早记录，缺测不补0。时段外数据不参与统计，完整采样另行归档。气体浓度按可飞平台口径换算。", s.count+s.missing, s.count, s.missing)
     }));
-    let sampling_summary = stats.as_ref().map(|s| format!("实际执飞时段内PM2.5最高值{:.1} μg/m³，平均值{:.1} μg/m³；有效采样{}点、缺测{}点，最高值首次出现时间{}（北京时间）。{}", s.max, s.mean, s.count, s.missing, date(s.peak_time, "%m-%d %H:%M:%S"), warning)).unwrap_or_default();
+    let sampling_summary = stats.as_ref().map(|s| format!("实际执飞时段内PM2.5最高值{:.1} μg/m³，平均值{:.1} μg/m³；有效采样{}点、缺测{}点，最高值首次出现时间{}。{}", s.max, s.mean, s.count, s.missing, date(s.peak_time, "%m-%d %H:%M:%S"), warning)).unwrap_or_default();
     fields.push(("CONCLUSION", if !evidence.conclusion.is_empty() {
         format!("{}{}", evidence.conclusion, sampling_summary)
     } else if stats.is_some() {
         format!("本次巡航抓拍图片{count}张，影像异常及污染成因待判读、核实。{sampling_summary}")
     } else { blank.clone() }));
-    // Use only explicit, flight-bound editorial input for recommendations.
-    fields.push((
-        "RECOMMENDATION",
-        if evidence.recommendation.is_empty() {
-            blank.clone()
-        } else {
-            evidence.recommendation.clone()
-        },
-    ));
+    // Work recommendations are the approved fixed text in the Word template.
     let mut rels = String::from_utf8(
         parts
             .remove("word/_rels/document.xml.rels")
@@ -1475,14 +1468,14 @@ fn build_docx(
             (maximum_labels(p).is_empty(), p.name.clone())
         });
         // The template has 13040 twips of usable height. Reserve space for
-        // captions and inline baselines; scale the entire group proportionally.
+        // captions, 12 pt gaps and inline baselines; scale the group proportionally.
         const PHOTO_WIDTH: f64 = 5_600_000.0;
         const GROUP_HEIGHT: f64 = 7_800_000.0;
         let total_height: f64 = group_photos.iter().map(|name| {
             let (_, width, height) = photo_sizes[name.as_str()];
             PHOTO_WIDTH * height as f64 / width as f64
         }).sum();
-        let scale = ((GROUP_HEIGHT - group_photos.len() as f64 * 300_000.0).max(300_000.0)
+        let scale = ((GROUP_HEIGHT - group_photos.len() as f64 * 420_000.0).max(300_000.0)
             / total_height).min(1.0);
         for (photo_index, name) in group_photos.iter().enumerate() {
             let (id, width, height) = photo_sizes[name.as_str()];
@@ -1495,7 +1488,7 @@ fn build_docx(
             // Keep every picture and caption of a group on the same page,
             // releasing the chain at the final caption so groups can paginate.
             let keep = if photo_index + 1 < group_photos.len() { "1" } else { "0" };
-            photo_xml.push_str(&format!(r#"<w:p><w:pPr><w:keepNext w:val="{keep}"/><w:snapToGrid w:val="0"/><w:spacing w:before="0" w:after="80" w:line="240" w:lineRule="exact"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:color w:val="000000"/><w:sz w:val="20"/></w:rPr><w:t>{}-{}</w:t></w:r></w:p>"#,
+            photo_xml.push_str(&format!(r#"<w:p><w:pPr><w:keepNext w:val="{keep}"/><w:snapToGrid w:val="0"/><w:spacing w:before="0" w:after="240" w:line="240" w:lineRule="exact"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:color w:val="000000"/><w:sz w:val="20"/></w:rPr><w:t>{}-{}</w:t></w:r></w:p>"#,
                 group_index + 1, photo_index + 1));
         }
     }
@@ -2307,6 +2300,8 @@ mod tests {
         let mut doc = String::new();
         zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
         assert!(doc.contains("高温疑似问题1组"));
+        assert!(doc.contains("发现异常情况1处"));
+        assert!(!doc.contains("发现异常情况【】处"));
         assert!(doc.contains("最高温度: 76.7℃"));
         assert!(!doc.contains("最低温度:"));
         assert!(!doc.contains("同组辅助照片（不单独计为问题）"));
@@ -2497,6 +2492,68 @@ mod tests {
         assert!(!doc.contains("覆盖范围待核实"));
     }
     #[test]
+    fn photo_review_count_matches_table_and_badge_for_seven_groups_and_zero() {
+        let mut bytes = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 640, 480);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&vec![50; 640 * 480]).unwrap();
+        }
+        let image = format!("data:image/png;base64,{}", STANDARD.encode(bytes));
+        for expected in [0, 7] {
+            let mut data = photo_only_sample();
+            data.photos.clear();
+            data.media.files.clear();
+            for group in 0..7 {
+                for auxiliary in 0..2 {
+                    let name = format!("DJI_202609220701{:02}_0001_T.png", group * 5 + auxiliary);
+                    let labels = if expected > 0 && auxiliary == 0 {
+                        vec!["最高温度: 80℃".into()]
+                    } else {
+                        vec!["最低温度: 5℃".into()]
+                    };
+                    data.media.files.push(name.clone());
+                    data.photos.push(Photo {
+                        name, kind: String::new(), data_url: image.clone(),
+                        presentation: Some(presentation::Presentation {
+                            method: "dji-viewer-capture-v1".into(), width: 640, height: 480,
+                            image_rect: None, annotation_count: 1, labels,
+                            captured_at: data.mission.end_time, data_url: Some(image.clone()),
+                        }),
+                    });
+                }
+            }
+            let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            fs::create_dir_all(&root).unwrap();
+            let summary = persist(&root, &data, &[String::new(), String::new()], false).unwrap();
+            assert_eq!(summary.photo_count, 14);
+            assert_eq!(summary.issue_count, Some(expected));
+            let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&summary.path).unwrap())).unwrap();
+            let mut doc = String::new();
+            zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+            assert!(doc.contains(&format!("发现异常情况{expected}处")));
+            assert!(doc.contains(&format!("高温疑似问题{expected}组")));
+            assert!(!doc.contains("发现异常情况【】处"));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn closing_keeps_fixed_signatories_and_uses_beijing_flight_date() {
+        let data = sample(); // 09-21 UTC is already 09-22 in Beijing.
+        let issued = data.mission.start_time + 2 * 86400000;
+        let bytes = build_docx(&data, &[PNG.into(), PNG.into()], issued).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut doc = String::new();
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        let closing = doc.rsplit("江苏省泰州环境监测中心").next().unwrap();
+        assert!(closing.contains("2026年9月22日"));
+        assert!(!closing.contains("2026年9月24日"));
+        assert!(closing.contains("分送：第一专员办泰州监察室、泰州市生态环境局。"));
+        assert!(closing.contains("签发：宋兴伟　审核：杨文武　编制：朱俊、彭婷、毛慧、王玉祥、赵美玲"));
+        assert!(!doc.contains("{{FLIGHT_DATE}}"));
+    }
+    #[test]
     fn standard_template_preserves_editorial_text() {
         for without_air in [false, true] {
             let mut data = if without_air { photo_only_sample() } else { sample() };
@@ -2506,7 +2563,11 @@ mod tests {
             let mut doc = String::new();
             z.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
             assert!(doc.contains("人工结论&lt;&amp;&gt; {{CITY_PM_START}}"));
-            assert!(doc.contains("人工建议"));
+            assert!(!doc.contains("人工建议"));
+            for text in ["（一）综合结论", "（二）工作建议", "一是强化重点区域和重点时段精准管控。", "二是深化空地一体化智能巡查。", "三是广泛宣传，深化网格源头治理。", "四是预警联动，健全长效防控体系。"] {
+                assert!(doc.contains(text), "missing approved advice: {text}");
+            }
+            assert!(!doc.contains("2026年5月21日"));
             for required in ["近期监测显示", "为核实高值点位、锁定污染源头", "覆盖范围待核实", "高温疑似问题0组"] {
                 assert!(doc.contains(required), "missing restored content: {required}");
             }

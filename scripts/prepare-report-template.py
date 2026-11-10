@@ -88,6 +88,14 @@ p13 = findp('近期监测显示'); p16 = findp('周山河街区大气超级站')
 p24 = findp('通过大疆司空2平台')
 set_text(p7, '第{{ISSUE}}期（泰智飞  第{{SERIES_ISSUE}}期）')
 set_text(p8, '江苏省泰州环境监测中心                     {{ISSUED}}')
+# set_text removes the reference's floating line along with its date runs.
+# Use a paragraph border so the masthead rule survives Word/WPS/LibreOffice.
+masthead_props = p8.find(w('pPr'))
+borders = ET.Element(w('pBdr'))
+ET.SubElement(borders, w('bottom'), {
+    w('val'): 'single', w('sz'): '12', w('space'): '4', w('color'): 'FF0000',
+})
+masthead_props.insert(0, borders)
 # Keep the user's authored prose, paragraph properties and scientific subscripts.
 # Only dates, observations and evidence-dependent wording are runtime slots.
 replace_text(p13, '2026年11月03日08时', '{{ANALYSIS_WINDOW}}')
@@ -110,7 +118,69 @@ for old, new in [
     replace_text(p13, old, new)
 set_text(p16, '周山河街区大气超级站在东南风向下易出现K⁺浓度异常升高的现象，站点东侧、东南、南侧农田连片分布，泰州中心综合分析周山河街区大气超级站监测数据规律与区域地理特征，在站点周边布设无人机机库，划定东侧、东南、南侧三条常态化自主巡航航线。本次任务{{TRIGGER}}，巡航时段为{{FLIGHT_WINDOW}}。各巡航区段执行情况如下。')
 set_text(p24, '通过大疆司空2平台制定并执行无人机机库自动巡航任务，任务照片自动回传司空平台。本次巡航期间，司空平台共抓拍图片{{PHOTO_COUNT}}张，{{PHOTO_REVIEW_SUMMARY}}。主要抓拍图片信息如下：')
-set_text(conclusion, '{{CONCLUSION}}'); set_text(recommendation, '{{RECOMMENDATION}}')
+set_text(conclusion, '{{CONCLUSION}}')
+# Keep the flight-specific conclusion; the approved work advice is fixed prose.
+def conclusion_paragraph(value, bold_prefix=None, subheading=False):
+    p = deepcopy(conclusion)
+    p.attrib.clear()
+    set_text(p, value)
+    run = p.find(w('r'))
+    props = run.find(w('rPr'))
+    if props is None: props = ET.SubElement(run, w('rPr'))
+    for tag in ['b', 'bCs']:
+        for node in props.findall(w(tag)): props.remove(node)
+    if bold_prefix or subheading:
+        ET.SubElement(props, w('b'))
+        ET.SubElement(props, w('bCs'))
+    if bold_prefix:
+        run.find(w('t')).text = bold_prefix
+        rest = deepcopy(run)
+        for tag in ['b', 'bCs']:
+            rest.find(w('rPr')).remove(rest.find(w('rPr')).find(w(tag)))
+        rest.find(w('t')).text = value[len(bold_prefix):]
+        p.append(rest)
+    ppr = p.find(w('pPr'))
+    if ppr is None: ppr = ET.SubElement(p, w('pPr'))
+    for tag in ['keepNext', 'keepLines']:
+        for node in ppr.findall(w(tag)): ppr.remove(node)
+    if subheading: ET.SubElement(ppr, w('keepNext'))
+    return p
+body.insert(list(body).index(conclusion), conclusion_paragraph('（一）综合结论', subheading=True))
+body.insert(list(body).index(recommendation), conclusion_paragraph('（二）工作建议', subheading=True))
+advice = [
+    ('一是强化重点区域和重点时段精准管控。', '紧盯火点高发乡镇、凌晨夜间高发时段，加密巡查频次，加大流动值守与突击检查力度，整治错时焚烧、秸秆堆垛阴燃等隐蔽焚烧问题。'),
+    ('二是深化空地一体化智能巡查。', '持续优化无人机巡航航线、巡检时段与覆盖范围，重点覆盖田间地头、偏远村落等监管薄弱区域。依托 AI 智能识别系统，对疑似火点、黑斑第一时间落地核查，构建“智能发现、快速交办、及时处置”的高效工作链条。'),
+    ('三是广泛宣传，深化网格源头治理。', '落实乡镇村居网格化监管，对排查发现的焚烧点位逐一台账交办属地处置，层层压实属地管控责任；全方位开展秸秆禁烧宣传，普及秸秆综合利用政策，从源头降低焚烧隐患。'),
+    ('四是预警联动，健全长效防控体系。', '依托大气监测数据，紧盯K⁺、PM2.5等焚烧特征指标，结合气象开展常态化会商，异常浓度及时预警推送管控指令；坚持巡查常态化、监管全天候、处置规范化，持续巩固禁烧成效，降低生物质燃烧对区域空气质量的影响。'),
+]
+for lead, detail in advice:
+    body.insert(list(body).index(recommendation), conclusion_paragraph(lead + detail, bold_prefix=lead))
+# The closing date belongs to the flight, even when the report is regenerated later.
+closing = [
+    ('江苏省泰州环境监测中心', True),
+    ('{{FLIGHT_DATE}}', True),
+    ('分送：第一专员办泰州监察室、泰州市生态环境局。', False),
+    ('签发：宋兴伟　审核：杨文武　编制：朱俊、彭婷、毛慧、王玉祥、赵美玲', False),
+]
+for i, (value, right_aligned) in enumerate(closing):
+    p = conclusion_paragraph(value)
+    ppr = p.find(w('pPr'))
+    for tag in ['ind', 'jc', 'spacing']:
+        for node in ppr.findall(w(tag)): ppr.remove(node)
+    ET.SubElement(ppr, w('jc'), {w('val'): 'right' if right_aligned else 'left'})
+    ET.SubElement(ppr, w('spacing'), {
+        w('before'): '240' if i in (0, 2) else '0',
+        w('after'): '0', w('line'): '360' if right_aligned else '300', w('lineRule'): 'auto',
+    })
+    ET.SubElement(ppr, w('keepLines'))
+    if i < len(closing) - 1: ET.SubElement(ppr, w('keepNext'))
+    if not right_aligned:
+        props = p.find('w:r/w:rPr', NS)
+        for tag in ['sz', 'szCs']:
+            for node in props.findall(w(tag)): props.remove(node)
+            ET.SubElement(props, w(tag), {w('val'): '24'})
+    body.insert(list(body).index(recommendation), p)
+remove_child(recommendation)
 # Remove all authored figure paragraphs and leave runtime slots at the standard locations.
 for p in list(body.findall(w('p'))):
     if text(p).startswith(('图1　','图2　','图3　','图4　','图5　','图6　','图7　')): remove_child(p)
@@ -153,6 +223,14 @@ for row in table4.findall(w('tr')):
             if size is None: size = ET.SubElement(props, w('sz'))
             size.set(w('val'), '18')
 title1 = findp('表1　巡航执行情况'); title2 = findp('表2　大疆司空平台抓拍图片信息')
+# The reference includes an empty caption paragraph before table 1.
+# Spacing belongs above the caption, never in a blank paragraph below it.
+for child in list(body)[list(body).index(title1)+1:list(body).index(table1)]:
+    if child.tag == w('p') and not text(child).strip() and not child.xpath('.//w:drawing | .//w:pict', namespaces=NS):
+        remove_child(child)
+spacing = title1.find('w:pPr/w:spacing', NS)
+spacing.attrib.clear()
+spacing.attrib.update({w('before'): '240', w('after'): '0', w('line'): '480', w('lineRule'): 'exact'})
 body.insert(list(body).index(table1)+1, new_slot(title1, '{{SECTION_PHOTOS}}'))
 body.insert(list(body).index(table2)+1, new_slot(title2, '{{PHOTOS}}'))
 note_paragraph = next(p for p in body.findall(w('p')) if text(p).startswith('注：PM2.5'))
@@ -170,6 +248,81 @@ def prepare_table(table, index, total):
         for col, cell in enumerate(table.findall(w('tr'))[-1].findall(w('tc'))):
             if col: set_cell(cell, '{{TOTAL%d_%d}}' % (index, col))
 prepare_table(table1, 0, True); prepare_table(table2, 1, True); prepare_table(table4, 2, False)
+# Typography only: retain the authored masthead, red rule, page geometry,
+# numbering, table geometry, text, scientific scripts and emphasis.
+def property_node(parent, name, attrs):
+    node = parent.find(w(name))
+    if node is None: node = ET.SubElement(parent, w(name))
+    node.attrib.clear()
+    node.attrib.update({w(k): str(v) for k, v in attrs.items()})
+    return node
+
+def typography(p, font, size, bold=None):
+    ppr = p.find(w('pPr'))
+    if ppr is None: ppr = ET.SubElement(p, w('pPr'))
+    mark = ppr.find(w('rPr'))
+    if mark is None: mark = ET.SubElement(ppr, w('rPr'))
+    properties = [mark]
+    for run in p.findall('.//' + w('r')):
+        props = run.find(w('rPr'))
+        if props is None:
+            props = ET.Element(w('rPr')); run.insert(0, props)
+        properties.append(props)
+    for props in properties:
+        property_node(props, 'rFonts', {'eastAsia': font, 'ascii': 'Times New Roman',
+                                     'hAnsi': 'Times New Roman', 'cs': 'Times New Roman'})
+        property_node(props, 'sz', {'val': size})
+        property_node(props, 'szCs', {'val': size})
+        property_node(props, 'color', {'val': '000000'})
+        # Reference editing colors and theme attributes must not leak into reports.
+        for tag in ['highlight', 'shd']:
+            for node in props.findall(w(tag)): props.remove(node)
+        if bold is not None:
+            for tag in ['b', 'bCs']:
+                for node in props.findall(w(tag)): props.remove(node)
+                if bold: ET.SubElement(props, w(tag))
+    return ppr
+
+for p in body.findall(w('p')):
+    value = text(p)
+    if not value or value == '环境监测信息快报': continue
+    if value == '周山河街区无人机机库智能巡飞监测快报':
+        typography(p, '方正小标宋_GBK', 44, False)  # 二号，保留原居中及行距
+    elif value.startswith('第{{ISSUE}}'):
+        typography(p, '黑体', 32, False)
+    elif '{{ISSUED}}' in value:
+        typography(p, '方正仿宋_GBK', 28, False)
+    elif value.startswith(('表', '{{PHOTOS}}', '{{SECTION_PHOTOS}}')):
+        typography(p, '方正仿宋_GBK', 28, False)
+    elif value.startswith(('注：', '第1—5行', '分送：', '签发：')):
+        props = typography(p, '方正仿宋_GBK', 24, False)
+        if value.startswith(('注：', '第1—5行')):
+            property_node(props, 'snapToGrid', {'val': 0})
+            property_node(props, 'spacing', {'before': 40, 'after': 120, 'line': 320, 'lineRule': 'atLeast'})
+    else:
+        is_heading = value == '污染过程总体特征' or value.startswith(('二、', '三、', '四、', '五、'))
+        is_subheading = value.startswith(('（一）', '（二）'))
+        font = '黑体' if is_heading else '楷体_GB2312' if is_subheading else '方正仿宋_GBK'
+        props = typography(p, font, 32, False if is_heading or is_subheading else None)
+        if value not in ('江苏省泰州环境监测中心', '{{FLIGHT_DATE}}'):
+            property_node(props, 'jc', {'val': 'left' if is_heading or is_subheading else 'both'})
+            property_node(props, 'ind', {'firstLine': 640, 'firstLineChars': 200})
+            property_node(props, 'snapToGrid', {'val': 0})
+            # Separate the next section from the execution table without an empty paragraph.
+            before = 240 if value == '三、大疆司空平台抓拍图片信息' else 0
+            property_node(props, 'spacing', {'before': before, 'after': 0, 'line': 520, 'lineRule': 'exact'})
+            property_node(props, 'widowControl', {'val': 1})
+        if is_heading or is_subheading: property_node(props, 'keepNext', {})
+
+for table in (table1, table2, table4):
+    for row_index, row in enumerate(table.findall(w('tr'))):
+        # Five-parameter table retains its compact 9 pt size and existing widths.
+        for p in row.findall('.//' + w('p')):
+            typography(p, '宋体', 18 if table is table4 else 21, row_index == 0)
+            if table is table2:
+                # Compact metadata leading avoids a lone totals row on the next page.
+                property_node(p.find(w('pPr')), 'spacing',
+                              {'before': 0, 'after': 0, 'line': 240, 'lineRule': 'exact'})
 caption = deepcopy(title2); set_text(caption, '{{CAPTION}}'); parts['word/report-caption.xml'] = serialize(caption)
 # Remove unused image parts and comment parts; preserve all other standard package parts.
 used = set(doc.xpath('//@r:embed | //@r:id | //@r:link', namespaces=NS))

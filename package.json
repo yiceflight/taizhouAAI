@@ -1,7 +1,7 @@
 {
   "name": "taizhou-aai",
   "private": true,
-  "version": "0.2.17",
+  "version": "0.2.18",
   "type": "module",
   "scripts": {
     "dev": "node scripts/free-dev-ports.mjs && vite",

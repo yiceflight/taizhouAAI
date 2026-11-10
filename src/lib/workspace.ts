@@ -104,7 +104,15 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
       case 'uncertain': return { title: '无人机 · 起飞结果待核查', detail: event.error || event.statusCheckError || '请到司空核查 · 不会自动重试', tone: 'warning' };
       case 'not_flown': return { title: '无人机 · 司空天气阻飞', detail: event.error || event.statusCheckError || '请到司空页面核查阻飞原因', tone: 'warning' };
       case 'ready': return { title: event.preview ? '填写演练 · 已就绪' : event.statusCheckError?.startsWith('司空平台天气阻飞：') ? '无人机 · 司空天气阻飞' : '巡飞计划 · 待人工确认', detail: event.preview ? '仅演练填写 · 不会提交起飞请求' : event.statusCheckError?.startsWith('司空平台天气阻飞：') ? event.statusCheckError : '请到司空核对计划并确认起飞', tone: event.source === 'auto' && !event.preview ? 'danger' : 'warning' };
-      case 'failed': return { title: '起飞未完成 · 待人工核验', detail: '未发送起飞请求 · 请核验电量、设备与平台任务', tone: 'warning' };
+      case 'failed': {
+        const reading = triggerReading(data, now);
+        if (reading.exceeded && !noFlyPeriod(data.settings, now)) {
+          const metric = [reading.potassiumExceeded ? 'K⁺' : '', reading.pm25Exceeded ? 'PM2.5' : ''].filter(Boolean).join('、');
+          const values = [reading.potassiumExceeded ? `K⁺ ${reading.potassium!.potassium} > ${reading.potassiumThreshold} μg/m³` : '', reading.pm25Exceeded ? `PM2.5 ${reading.pm25!.pm25} > ${reading.pm25Threshold} μg/m³` : ''].filter(Boolean).join('；');
+          return { title: `${metric} 超过巡查阈值 · 需要人工处理`, detail: `${values} · 上次任务未发送起飞请求，请核验设备与平台任务后重新执行${!ready ? ' · 请先完成工作准备' : ''}`, tone: 'danger', needsManualLaunch: true };
+        }
+        return { title: '起飞未完成 · 待人工核验', detail: '未发送起飞请求 · 请核验电量、设备与平台任务', tone: 'warning' };
+      }
       case 'restricted': return { title: '禁飞时间 · 超标仅记录', detail: '未执行起飞', tone: 'muted' };
     }
   }

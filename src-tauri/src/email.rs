@@ -15,6 +15,24 @@ use std::{
 use tauri::Manager;
 
 const DEFAULT_USERNAME: &str = "report@dayialgo.com";
+const MAX_REPORT_BYTES: u64 = 14 * 1024 * 1024;
+// Provider limit applies to the complete MIME message, after base64 encoding.
+// Use decimal MB conservatively, as the provider does not specify MiB.
+const MAX_MAIL_BYTES: usize = 15_000_000;
+
+fn validate_report_size(size: u64) -> Result<(), String> {
+    if size > MAX_REPORT_BYTES {
+        return Err("报告超过 14 MB，请重新生成压缩后的报告再发送".into());
+    }
+    Ok(())
+}
+
+fn validate_mail_size(size: usize) -> Result<(), String> {
+    if size > MAX_MAIL_BYTES {
+        return Err("附件编码后的整封邮件超过阿里云 15 MB 限制（附件上限为 14 MB，但编码会增大体积），请重新生成压缩后的报告再发送".into());
+    }
+    Ok(())
+}
 // Generated from an ignored private build file; never expose this value to the frontend.
 const DEFAULT_PASSWORD: &str = include!(concat!(env!("OUT_DIR"), "/email-default-password.rs"));
 static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -215,6 +233,7 @@ fn message(
     bytes: Vec<u8>,
     summary: &crate::flight_report::Summary,
 ) -> Result<Message, String> {
+    validate_report_size(bytes.len() as u64)?;
     if recipients.is_empty()
         || recipients.iter().any(|r| r.contains(['\r', '\n']))
         || username.contains(['\r', '\n'])
@@ -231,10 +250,12 @@ fn message(
             .parse::<Mailbox>()
             .map_err(|_| "收件人邮箱地址无效")?);
     }
-    builder
+    let mail = builder
         .multipart(MultiPart::mixed().singlepart(SinglePart::plain(report_body(summary)))
         .singlepart(Attachment::new(filename).body(bytes, ContentType::parse("application/vnd.openxmlformats-officedocument.wordprocessingml.document").unwrap())))
-        .map_err(|_| "邮件内容构建失败".into())
+        .map_err(|_| "邮件内容构建失败".to_owned())?;
+    validate_mail_size(mail.formatted().len())?;
+    Ok(mail)
 }
 
 fn report_body(summary: &crate::flight_report::Summary) -> String {
@@ -347,9 +368,7 @@ pub async fn send_flight_report_email(
         &fs::read(root.join(&report_id).join("summary.json")).map_err(|_| "报告摘要不存在")?,
     )
     .map_err(|_| "报告摘要损坏")?;
-    if fs::metadata(&path).map_err(|_| "无法读取报告")?.len() > 10 * 1024 * 1024 {
-        return Err("报告超过 10 MB，请压缩报告后发送".into());
-    }
+    validate_report_size(fs::metadata(&path).map_err(|_| "无法读取报告")?.len())?;
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -378,6 +397,31 @@ pub async fn send_flight_report_email(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires explicit local DOCX path; builds MIME only, never sends"]
+    fn checks_real_report_mime_size_without_sending() {
+        let path = std::env::var("REPORT_EMAIL_SIZE_QA_PATH").unwrap();
+        let bytes = fs::read(path).unwrap();
+        let size = bytes.len();
+        let mail = message("report@example.com", &["recipient@example.com".into()],
+            "巡飞监测报告.docx".into(), bytes, &test_summary()).unwrap();
+        println!("Word: {size} bytes; MIME: {} bytes (limit {MAX_MAIL_BYTES})", mail.formatted().len());
+    }
+    #[test]
+    fn report_and_encoded_mail_have_separate_limits() {
+        assert!(validate_report_size(MAX_REPORT_BYTES).is_ok());
+        assert!(validate_report_size(MAX_REPORT_BYTES + 1).unwrap_err().contains("14 MB"));
+        assert!(validate_mail_size(MAX_MAIL_BYTES).is_ok());
+        assert!(validate_mail_size(MAX_MAIL_BYTES + 1).unwrap_err().contains("15 MB"));
+        // Binary DOCX data expands under base64: raw 11 MiB fits the local cap
+        // but cannot be delivered within the provider's complete-message cap.
+        let error = message("sender@example.com", &["to@example.com".into()],
+            "report.docx".into(), vec![255; 11 * 1024 * 1024], &test_summary()).unwrap_err();
+        assert!(error.contains("编码后的整封邮件"));
+        assert!(message("sender@example.com", &["to@example.com".into()],
+            "report.docx".into(), vec![255; 10 * 1024 * 1024], &test_summary()).is_ok());
+    }
+
     fn dummy_config() -> StoredEmailSettings {
         StoredEmailSettings {
             recipients: vec!["first@example.com".into()],
@@ -496,7 +540,7 @@ mod tests {
         let to = std::env::var("REPORT_EMAIL_TEST_TO").expect("recipient required");
         let username = std::env::var("REPORT_EMAIL_TEST_FROM").expect("sender required");
         let path = report_path(Path::new(&root), &id).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() <= 10 * 1024 * 1024);
+        assert!(validate_report_size(fs::metadata(&path).unwrap().len()).is_ok());
         let summary: crate::flight_report::Summary = serde_json::from_slice(
             &fs::read(Path::new(&root).join(&id).join("summary.json")).unwrap(),
         )

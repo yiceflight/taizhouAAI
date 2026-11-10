@@ -32,6 +32,13 @@ fn version(value: &str) -> [u16; 4] {
 }
 
 fn main() {
+    // Use the same bundled JPEG library on macOS and Windows; no external CLI.
+    println!("cargo:rerun-if-changed=src/flight_report/jpeg_lossless.c");
+    let includes = std::env::var_os("DEP_JPEG_INCLUDE").expect("bundled JPEG headers");
+    cc::Build::new()
+        .file("src/flight_report/jpeg_lossless.c")
+        .includes(std::env::split_paths(&includes))
+        .compile("report_jpeg_lossless");
     // Private release provisioning. Generate into ignored build output rather
     // than printing secrets as cargo:rustc-env (which would leak to build logs).
     let email_defaults = "../.secrets/email-defaults.json";

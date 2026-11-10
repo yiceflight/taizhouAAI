@@ -201,8 +201,9 @@ mod tests {
         assert_eq!(fs::read(dir.join("photo-1-annotated.png")).unwrap(), bytes);
         let mut zip = zip::ZipArchive::new(Cursor::new(fs::read(&summary.path).unwrap())).unwrap();
         let mut embedded = vec![];
-        zip.by_name("word/media/flight-1000.png").unwrap().read_to_end(&mut embedded).unwrap();
-        assert_eq!(embedded, bytes);
+        zip.by_name("word/media/flight-1000.jpeg").unwrap().read_to_end(&mut embedded).unwrap();
+        assert!(embedded.len() < bytes.len());
+        assert_eq!(image_dimensions(&embedded).unwrap(), (2048, 2048));
         let too_large = format!("data:image/png;base64,{}", "A".repeat(48_000_004));
         assert!(decode_presentation_image(&too_large).unwrap_err().contains("36 MB"));
     }

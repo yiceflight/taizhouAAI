@@ -22,3 +22,9 @@
 
 - `pnpm exec vitest run tests/email-settings.test.tsx tests/settings-flight.test.tsx tests/data-reset-ui.test.tsx tests/patrol-tab.test.tsx`
 - `cargo test --manifest-path src-tauri/Cargo.toml email::tests`（默认不发信，仅使用临时目录验证文件存储）
+
+## Word 附件大小与图片压缩
+
+新生成/重新生成 Word 时自动优化展示图片，保留像素尺寸；JPG 和 PNG 截图使用带全分辨率质量检查的 JPEGli 编码，JPG 另保留像素一致的无损优化候选。压缩失败或质量不达标则保留原图，原始归档不受影响。旧 Word 需重新生成。
+
+Word 文件上限为 14 MiB（界面显示 14 MB），另按实际编码后的 MIME 邮件检查阿里云 15 MB 总量上限。Base64 会增大体积，因此小于 14 MB 的附件也可能触发整封邮件限制。详见 [压缩方案和实测](reviews/report-image-compression-2026-11-10.md)。

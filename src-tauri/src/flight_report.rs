@@ -19,6 +19,7 @@ mod evidence;
 mod cache;
 mod presentation;
 mod air_chart;
+mod image_compression;
 use evidence::{photo_facts, Evidence};
 
 const TEMPLATE: &[u8] = include_bytes!("../assets/flight-report-template.docx");
@@ -1455,8 +1456,11 @@ fn build_docx(
     let mut photo_sizes = HashMap::new();
 
     for (i, p) in photos.iter().enumerate() {
+        // Unreferenced media still consumes space in the DOCX ZIP.
+        if !groups.iter().any(|group| group.contains(&p.name)) { continue; }
         let id = i + 1000; // avoid the reference masthead drawing's ID
         let (bytes, ext) = p.decode_display_image()?;
+        let (bytes, ext) = image_compression::compress(bytes, ext);
         let (width, height) = image_dimensions(&bytes)?;
         let name = format!("media/flight-{id}.{ext}");
         parts.insert(format!("word/{name}"), bytes);
@@ -2316,6 +2320,7 @@ mod tests {
         assert!(!doc.contains("最高温度标注照片"));
         assert!(!doc.contains("表2第2组"));
         assert!(!doc.contains("rIdFlight1002"));
+        assert_eq!(zip.file_names().filter(|name| name.starts_with("word/media/flight-")).count(), 2);
         assert!(!doc.contains("高温点坐标未取得"));
         assert!(!doc.contains("点位分布"));
         assert!(!doc.contains("rIdFlight20000"));

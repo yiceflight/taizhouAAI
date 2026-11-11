@@ -202,3 +202,22 @@ test('does not collapse an expanded group while opening its device detail', asyn
     : selector.includes('#real-time-app-container') ? opened ? [{ __vue__: f.component }] : [] : [{ __vue__: card }];
   assert.equal((await f.run()).airworthy, 1);
 });
+
+test('an hour of logged-out weather retries keeps the same redirected tab', async () => {
+  for (const pending of [false, true]) {
+    let saved, created = 0;
+    const tab = {id: 7, url: WEATHER_URL, status: 'complete'};
+    const chrome = {storage: {local: {
+      get: async () => ({weatherTabId: saved}), set: async value => {saved = value.weatherTabId;},
+    }}, tabs: {
+      create: async () => { created++; tab.url = 'https://fh.dji.com/#/login'; return tab; },
+      get: async () => tab,
+    }};
+    const capture = () => assert.fail('must not read weather while logged out');
+    await assert.rejects(openDjiWeather(chrome, capture), /登录/);
+    if (pending) { tab.url = WEATHER_URL; tab.pendingUrl = 'https://fh.dji.com/#/login'; }
+    for (let i = 0; i < 120; i++) await assert.rejects(openDjiWeather(chrome, capture), /登录/);
+    assert.equal(created, 1);
+    assert.equal(saved, 7);
+  }
+});

@@ -434,6 +434,32 @@ async fn complete(
     let _ = pending.result.send(result);
     Ok(Json(json!({ "ok": true })))
 }
+#[derive(Deserialize)]
+struct HealthProgressInput { session: String, id: String, stage: String }
+fn health_job(job: &Value) -> bool {
+    matches!(job["type"].as_str(), Some("site-health" | "jiangsu-health" | "airins-health-open" | "dji-health-open"))
+}
+fn health_stage(stage: &str) -> Option<&'static str> {
+    match stage {
+        "loading" => Some("正在等待网站页面加载"),
+        "waking" => Some("正在唤醒休眠页面，并等待页面恢复"),
+        "focus_wait" => Some("等待其他网站完成唤醒，即将激活此页面"),
+        "activating" => Some("正在短暂激活页面，恢复后台渲染"),
+        "reading" => Some("正在验证登录与业务访问"),
+        _ => None,
+    }
+}
+async fn health_progress(State(bridge): State<Bridge>, headers: HeaderMap, Json(input): Json<HealthProgressInput>) -> Result<Json<Value>, StatusCode> {
+    if !authorized(&headers) { return Err(StatusCode::FORBIDDEN); }
+    let message = health_stage(&input.stage).ok_or(StatusCode::BAD_REQUEST)?;
+    let mut inner = bridge.0.lock().unwrap();
+    let pending = inner.pending.get_mut(&input.id)
+        .filter(|p| p.session == input.session && p.sent && health_job(&p.job))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    pending.job["healthProgress"] = json!(message);
+    Ok(Json(json!({"ok":true})))
+}
+
 impl Bridge {
     pub fn start(&self, app: tauri::AppHandle) {
         use tauri::Manager;
@@ -462,6 +488,7 @@ impl Bridge {
                 .route("/diagnose", post(diagnose))
                 .route("/heartbeat", post(heartbeat))
                 .route("/complete", post(complete))
+                .route("/health-progress", post(health_progress))
                 .route("/cancel-flight", post(move |headers: HeaderMap, Json(input): Json<CancelFlight>| {
                     let app = app.clone();
                     async move {
@@ -470,7 +497,8 @@ impl Bridge {
                         Ok::<_, StatusCode>(Json(json!({"ok":true})))
                     }
                 }))
-                .layer(DefaultBodyLimit::max(36 * 1024 * 1024))
+                // One source image (16 MB base64) plus annotated PNG (48 MB), with metadata.
+                .layer(DefaultBodyLimit::max(68 * 1024 * 1024))
                 .layer(middleware::from_fn(cors))
                 .with_state(bridge.clone());
             if let Err(error) = axum::serve(listener, router).await {
@@ -577,12 +605,12 @@ impl Bridge {
         &self,
         event_id: &str,
         name: &str,
-        route: &str,
+        route: &crate::flight::FlightRoute,
         auto_submit: bool,
     ) -> Result<Value, String> {
         self.flight_job(event_id, name, route, false, auto_submit).await
     }
-    pub async fn submit_flight(&self, event_id: &str, name: &str, route: &str) -> Result<Value, String> {
+    pub async fn submit_flight(&self, event_id: &str, name: &str, route: &crate::flight::FlightRoute) -> Result<Value, String> {
         self.flight_job(event_id, name, route, true, false).await
     }
     pub async fn sync_flight_routes(&self) -> Result<Value, String> {
@@ -632,7 +660,7 @@ impl Bridge {
         &self,
         event_id: &str,
         name: &str,
-        route: &str,
+        route: &crate::flight::FlightRoute,
         submit: bool,
         auto_submit: bool,
     ) -> Result<Value, String> {
@@ -654,15 +682,35 @@ impl Bridge {
         self.request(
             session,
             -1,
-            json!({"type": if submit { "dji-submit" } else { "dji-prepare" }, "eventId":event_id, "name":name, "route":route, "submit":submit, "autoSubmit":auto_submit}),
+            json!({"type": if submit { "dji-submit" } else { "dji-prepare" }, "eventId":event_id, "name":name, "route":route.name, "routeId":route.route_id, "folderPath":route.folder_path, "submit":submit, "autoSubmit":auto_submit}),
         )
         .await
+    }
+    pub fn health_checks(&self) -> Vec<Value> {
+        let inner = self.0.lock().unwrap();
+        inner.pending.values().filter(|p| health_job(&p.job)).filter_map(|p| {
+            let site = match p.job["type"].as_str()? {
+                "jiangsu-health" => "map",
+                "airins-health-open" => "sniff",
+                "dji-health-open" => "dji",
+                _ => {
+                    let tab = inner.clients.get(&p.session)?.tabs.iter().find(|t| t.id == p.tab_id)?;
+                    match tauri::Url::parse(&tab.url).ok()?.host_str()? {
+                        "aai.airins.cn" => "sniff", "fh.dji.com" => "dji", "61.155.4.60" => "map", _ => return None,
+                    }
+                }
+            };
+            Some(json!({"id":site,"message":if p.sent { p.job["healthProgress"].as_str().unwrap_or("插件已接收，等待网站验证结果") } else { "等待浏览器插件接收验证任务" },
+                "elapsedSeconds":p.queued_at.elapsed().as_secs(),
+                "remainingSeconds":((p.job["expiresAt"].as_i64().unwrap_or(0) - chrono::Utc::now().timestamp_millis()).max(0) + 999) / 1000,
+                "dispatched":p.sent}))
+        }).collect()
     }
     pub async fn request(&self, session: String, tab_id: i64, job: Value) -> Result<Value, String> {
         let logger = self.0.lock().unwrap().logger.clone();
         let id = Uuid::new_v4().to_string();
         let started = Instant::now();
-        let metadata = json!({"requestId":id,"type":job["type"],"tabId":tab_id,"eventId":job["eventId"]});
+        let metadata = json!({"requestId":id,"type":job["type"],"tabId":tab_id,"eventId":job["eventId"],"parameters":job});
         if let Some(log) = &logger {
             log.record(
                 "info",
@@ -692,7 +740,9 @@ impl Bridge {
         result
     }
     async fn request_inner(&self, session: String, tab_id: i64, job: Value, id: String) -> Result<Value, String> {
-        let timeout = if job["type"] == "dji-weather" {
+        let timeout = if health_job(&job) {
+            120
+        } else if job["type"] == "dji-weather" {
             // 25s navigation + 50s page read + focus cleanup and bridge delivery.
             85
         } else if ["dji-tasks", "dji-routes", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open"]
@@ -738,7 +788,7 @@ impl Bridge {
                     .iter()
                     .find(|tab| tab.id == tab_id)
                     .ok_or("页面已关闭，请刷新数据源列表。")?;
-                if tab.status != "complete" {
+                if tab.status != "complete" && !(job["type"] == "site-health" && tab.status == "unloaded") {
                     return Err("页面尚未加载完成，请稍后重试。".into());
                 }
             } else if job["type"] == "open-business-site"
@@ -823,6 +873,40 @@ pub fn get_bridge_status(bridge: tauri::State<'_, Bridge>) -> BridgeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn health_progress_tracks_delivery_and_rejects_unrelated_receipts() {
+        tauri::async_runtime::block_on(async {
+            let bridge = Bridge::default();
+            let (tx, _rx) = oneshot::channel();
+            bridge.0.lock().unwrap().pending.insert("check".into(), Pending {
+                session:"session".into(), tab_id:-1, sent:false,
+                queued_at:Instant::now() - Duration::from_secs(16), dispatched:None,
+                execution_timeout:120,
+                job:json!({"type":"airins-health-open","expiresAt":chrono::Utc::now().timestamp_millis()+120_000}), result:tx,
+            });
+            let checks = bridge.health_checks();
+            assert_eq!(checks[0]["id"], "sniff");
+            assert_eq!(checks[0]["dispatched"], false);
+            assert_eq!(checks[0]["elapsedSeconds"], 16);
+            let mut headers = HeaderMap::new();
+            headers.insert("origin", ORIGIN.parse().unwrap());
+            headers.insert("host", ADDRESS.parse().unwrap());
+            headers.insert("x-taizhou-bridge", "1".parse().unwrap());
+            let input = |session:&str, stage:&str| Json(HealthProgressInput {session:session.into(), id:"check".into(), stage:stage.into()});
+            assert!(matches!(health_progress(State(bridge.clone()), headers.clone(), input("session","reading")).await, Err(StatusCode::NOT_FOUND)));
+            dispatch(&mut bridge.0.lock().unwrap(), "check".into());
+            assert!(matches!(health_progress(State(bridge.clone()), headers.clone(), input("wrong","reading")).await, Err(StatusCode::NOT_FOUND)));
+            assert!(matches!(health_progress(State(bridge.clone()), headers.clone(), input("session","arbitrary text")).await, Err(StatusCode::BAD_REQUEST)));
+            assert!(health_progress(State(bridge.clone()), headers, input("session","activating")).await.is_ok());
+            let checks = bridge.health_checks();
+            assert_eq!(checks[0]["dispatched"], true);
+            assert_eq!(checks[0]["message"], "正在短暂激活页面，恢复后台渲染");
+            assert!(checks[0]["remainingSeconds"].as_i64().unwrap() <= 120);
+            bridge.0.lock().unwrap().pending.clear();
+            assert!(bridge.health_checks().is_empty());
+        });
+    }
+
     #[test]
     fn reads_bypass_busy_serial_work_without_a_batch_limit_and_get_fresh_deadlines() {
         let mut inner = Inner::default();

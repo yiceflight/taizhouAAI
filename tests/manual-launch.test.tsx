@@ -146,10 +146,10 @@ describe('manual launch confirmation', () => {
     const d=data(2);
     d.flight.event={id:'failed-auto',observedAt:'2026-10-08 09:00:00',potassium:2,name:'原自动任务',status:'failed',error:'准备失败',preview:false,source:'auto'};
     const action=await render(d);
-    expect(document.querySelector('.drone-status-copy')).toBeNull();
+    expect(document.querySelector('.drone-status-danger')?.textContent).toContain('需要人工处理');
     expect(button('查看失败详情')).toBeUndefined();
     expect(button('更多 ⋯')).toBeUndefined();
-    await click('重新发起任务');
+    await click('核验并重新执行');
     expect(document.querySelector('dialog')).not.toBeNull();
     expect(action).not.toHaveBeenCalled();
   });
@@ -217,7 +217,7 @@ describe('manual launch confirmation', () => {
     d.weather!.allowed = false; d.weather!.level = 'unsafe';
     d.flight.event = { id: 'failed-auto', observedAt: '', potassium: 2, name: '原自动任务', status: 'failed', error: '天气读取超时', preview: false, source: 'auto' };
     const action = await render(d);
-    await click('重新发起任务');
+    await click('核验并重新执行');
     expect(document.querySelector('dialog')?.textContent).toContain('天气读取超时');
     expect(document.querySelector('dialog')?.textContent).toContain('是否允许起飞由大疆后台决定');
     await click('确认执行任务');
@@ -226,7 +226,7 @@ describe('manual launch confirmation', () => {
   it('restarts a failed task without a weather override after the weather recovers', async () => {
     const d = data(2);
     d.flight.event = { id: 'failed-auto', observedAt: '', potassium: 2, name: '原自动任务', status: 'failed', error: '天气条件未通过', preview: false, source: 'auto' };
-    const action = await render(d); await click('重新发起任务');
+    const action = await render(d); await click('核验并重新执行');
     expect(action).not.toHaveBeenCalled();
     expect(document.querySelector('dialog')?.textContent).toContain('原任务未发送起飞请求');
     expect(document.querySelector('.manual-launch-override')).toBeNull();
@@ -236,7 +236,7 @@ describe('manual launch confirmation', () => {
   it('rejects a stale retry confirmation when a different failed task replaces it', async () => {
     const d = data(2);
     d.flight.event = { id: 'original', observedAt: '', potassium: 2, name: '原任务', status: 'failed', error: '', preview: false };
-    const action = await render(d); await click('重新发起任务');
+    const action = await render(d); await click('核验并重新执行');
     d.flight.event = { ...d.flight.event, id: 'replacement' }; await render(d, action);
     expect(button('确认执行任务').hasAttribute('disabled')).toBe(true);
     await click('确认执行任务');

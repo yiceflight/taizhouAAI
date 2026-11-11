@@ -84,6 +84,17 @@ describe('workspace readiness and data truthfulness',()=>{
     expect(row?.textContent).toContain('验证中');
     expect(row?.textContent).not.toContain('待验证');
   });
+  it('shows real per-site progress, elapsed time and previous failure during a retry',()=>{
+    const r={...readiness(false),checking:true,checks:[{id:'dji',message:'正在短暂激活页面，恢复后台渲染',elapsedSeconds:21,remainingSeconds:45,dispatched:true}]};
+    const d=dom(<SetupPanel state={r} busy={false} onCheck={noop} openSite={noop}/>);
+    const row=d.querySelectorAll('.health-row')[2];
+    expect(row?.textContent).toContain('正在短暂激活页面');
+    expect(row?.textContent).toContain('本次已用 21 秒');
+    expect(row?.textContent).toContain('最多再等待 45 秒');
+    expect(row?.textContent).toContain('上次结果：fixture');
+    expect(row?.textContent).toContain('白屏');
+    expect(row?.textContent).toContain('验证中');
+  });
   it('keeps a previously verified site stable while the next readiness pass is running',()=>{
     const r={...readiness(true),checking:true};
     const d=dom(<SetupPanel state={r} busy={false} onCheck={noop} openSite={noop}/>);

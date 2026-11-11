@@ -6,6 +6,7 @@ export type ReportSummary = { id: string; createdAt: number; source: string; tit
 export const tabKey = (tab: BrowserTab) => `${tab.session}:${tab.id}`;
 export type SiteHealth = { id: string; state: 'blocked' | 'unchecked' | 'not_open' | 'ready' | 'login_required' | 'forbidden' | 'page_required' | 'error'; message: string; checkedAt: string | null; session: string | null; tabId: number | null; url: string | null };
 export type Readiness = {
+  checks?: { id: string; message: string; elapsedSeconds: number; remainingSeconds: number; dispatched: boolean }[];
   monitoringReady?: boolean; flightReady?: boolean; reportReady?: boolean; pluginReady: boolean; pluginMessage: string; pluginUpdateRequired: boolean; minimumExtensionVersion: string; checking: boolean; sites: SiteHealth[]; ready: boolean; started: boolean };
 export type HourRow = { time: string; potassium: number | null; pm25: number | null };
 export type NoFlyPeriod = { start: string; end: string };
@@ -13,7 +14,7 @@ export type NoFlyPeriod = { start: string; end: string };
 export type RouteSelectionMode = 'fixed' | 'wind';
 export type WindRouteRule = { startDegrees: number; endDegrees: number; route: string };
 export type WorkspaceSettings = { potassiumEnabled?: boolean; pm25Enabled?: boolean; potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[]; routeSelectionMode?: RouteSelectionMode; windRouteRules?: WindRouteRule[] };
-export type FlightRoute = { routeId: string; name: string; updateTime?: number };
+export type FlightRoute = { routeId: string; name: string; updateTime?: number; folderPath?: { id: string; name: string }[] };
 export const defaultSettings: WorkspaceSettings = { potassiumThreshold: 1.0, pm25Threshold: 30, takeoffDelayMinutes: 5, requireManualConfirmation: true, noFlyPeriods: [{ start: '05:00', end: '08:00' }], windRouteRules: [] };
 export type FlightEvent = { id: string; observedAt: string; sourceHour?: string | null; potassium: number | null; pm25?: number | null; route?: string | null; name: string; status: 'countdown' | 'preparing' | 'ready' | 'submitting' | 'submitted' | 'uncertain' | 'flying' | 'paused' | 'completed' | 'flight_error' | 'failed' | 'not_flown' | 'restricted' | 'canceled' | 'dismissed'; error: string | null; preview: boolean; source?: string; launchAt?: number | null; statusCheckError?: string | null; statusCheckedAt?: number | null; weatherOverrideConfirmedAt?: number | null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
 export type MonitorView = { weather?: WeatherView; enabled: boolean; syncing: boolean; lastAttempt: string | null; lastSuccess: string | null; error: string | null; total: number; rows: HourRow[]; queryThrough: string | null; settings: WorkspaceSettings; flight: { threshold: number; delayMinutes?: number; event: FlightEvent | null; records?: FlightEvent[]; tasksClearedAt?: number | null; routes?: FlightRoute[]; selectedRoute?: string; routesSyncedAt?: number | null } };
@@ -83,7 +84,7 @@ export function dataQuality(data: MonitorView | null) {
   return { tone: 'success', label: '数据正常', detail: `${[reading.potassiumValid ? 'K⁺' : '', reading.pm25Valid ? 'PM2.5' : ''].filter(Boolean).join('、')} 数据在有效时间内` };
 }
 
-type FlightSummary = { title: string; detail: string; tone: 'muted' | 'warning' | 'danger' | 'active' | 'ready'; needsManualLaunch?: boolean };
+type FlightSummary = { title: string; detail: string; tone: 'muted' | 'warning' | 'danger' | 'active' | 'ready'; needsManualLaunch?: boolean; handledCurrentHour?: boolean };
 export function flightSummary(data: MonitorView | null, ready: boolean, now = Date.now()): FlightSummary {
   const { event, records } = flightDisplay(data, now);
   if (!data) return { title: '无人机 · 状态待读取', detail: '等待客户端获取巡飞任务', tone: 'muted' };
@@ -104,7 +105,15 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
       case 'uncertain': return { title: '无人机 · 起飞结果待核查', detail: event.error || event.statusCheckError || '请到司空核查 · 不会自动重试', tone: 'warning' };
       case 'not_flown': return { title: '无人机 · 司空天气阻飞', detail: event.error || event.statusCheckError || '请到司空页面核查阻飞原因', tone: 'warning' };
       case 'ready': return { title: event.preview ? '填写演练 · 已就绪' : event.statusCheckError?.startsWith('司空平台天气阻飞：') ? '无人机 · 司空天气阻飞' : '巡飞计划 · 待人工确认', detail: event.preview ? '仅演练填写 · 不会提交起飞请求' : event.statusCheckError?.startsWith('司空平台天气阻飞：') ? event.statusCheckError : '请到司空核对计划并确认起飞', tone: event.source === 'auto' && !event.preview ? 'danger' : 'warning' };
-      case 'failed': return { title: '起飞未完成 · 待人工核验', detail: '未发送起飞请求 · 请核验电量、设备与平台任务', tone: 'warning' };
+      case 'failed': {
+        const reading = triggerReading(data, now);
+        if (reading.exceeded && !noFlyPeriod(data.settings, now)) {
+          const metric = [reading.potassiumExceeded ? 'K⁺' : '', reading.pm25Exceeded ? 'PM2.5' : ''].filter(Boolean).join('、');
+          const values = [reading.potassiumExceeded ? `K⁺ ${reading.potassium!.potassium} > ${reading.potassiumThreshold} μg/m³` : '', reading.pm25Exceeded ? `PM2.5 ${reading.pm25!.pm25} > ${reading.pm25Threshold} μg/m³` : ''].filter(Boolean).join('；');
+          return { title: `${metric} 超过巡查阈值 · 需要人工处理`, detail: `${values} · 上次任务未发送起飞请求，请核验设备与平台任务后重新执行${!ready ? ' · 请先完成工作准备' : ''}`, tone: 'danger', needsManualLaunch: true };
+        }
+        return { title: '起飞未完成 · 待人工核验', detail: '未发送起飞请求 · 请核验电量、设备与平台任务', tone: 'warning' };
+      }
       case 'restricted': return { title: '禁飞时间 · 超标仅记录', detail: '未执行起飞', tone: 'muted' };
     }
   }
@@ -117,6 +126,20 @@ export function flightSummary(data: MonitorView | null, ready: boolean, now = Da
   const { potassium, pm25, triggerHour, valid, potassiumExceeded, pm25Exceeded, exceeded, potassiumThreshold, pm25Threshold } = triggerReading(data, now);
   if (noFlyPeriod(data.settings, now)) return { title: '禁飞时间 · 不执行起飞', detail: '超标仅记录', tone: 'muted' };
   if (exceeded) {
+    // Finished platform tasks are archived and removed from flight.event.
+    // Match the source observation hour, not the task's manual creation time.
+    const handled = records.find(record => !record.preview && record.source !== 'preview'
+      && (record.sourceHour ?? (record.source === 'auto' ? record.observedAt : null)) === triggerHour
+      && (record.status === 'completed' || (record.status === 'flight_error' && record.error?.startsWith('司空任务已结束：'))));
+    if (handled) {
+      const metric = potassiumExceeded && pm25Exceeded ? 'K⁺、PM2.5' : potassiumExceeded ? 'K⁺' : 'PM2.5';
+      const completed = handled.status === 'completed';
+      return {
+        title: `${metric} 超标 · ${completed ? '本小时已完成巡飞' : '本小时任务已结束'}`,
+        detail: `${triggerHour?.slice(0, 16)} 数据已处理 · ${completed ? '巡飞已完成' : handled.error} · 同一小时不再自动触发，新小时数据重新判断`,
+        tone: completed ? 'ready' : 'warning', handledCurrentHour: true,
+      };
+    }
     if (!event && records.some(record => record.status === 'restricted' && record.observedAt === triggerHour)) {
       const metric = potassiumExceeded && pm25Exceeded ? 'K⁺、PM2.5' : potassiumExceeded ? 'K⁺' : 'PM2.5';
       return { title: `${metric} 超标 · 等待新小时数据`, detail: '本小时已记录，不自动补飞 · 可手动执行任务', tone: 'warning', needsManualLaunch: true };

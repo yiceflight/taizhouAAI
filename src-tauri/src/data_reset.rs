@@ -55,7 +55,7 @@ fn remove_child(path: &Path) -> Result<bool, String> {
 
 fn clear_known_files(app_data: &Path) -> Result<Vec<String>, String> {
     let mut removed = Vec::new();
-    for name in [REPORTS_DIR, RUNTIME_LOG_EXPORTS_DIR, PHOTO_REVIEWS] {
+    for name in [REPORTS_DIR, RUNTIME_LOG_EXPORTS_DIR, PHOTO_REVIEWS, "last-panic.txt"] {
         let path = app_data.join(name);
         if remove_child(&path)? {
             removed.push(name.to_owned());
@@ -108,6 +108,7 @@ pub fn clear_all_data(app: tauri::AppHandle, confirmed: bool) -> Result<ClearDat
     let flight = app.state::<Flight>();
     let _gate = flight.gate.lock().map_err(|_| "无法锁定巡查状态")?;
     crate::flight::require_clearable(&monitoring::database(&app)?)?;
+    crate::email::clear_email_settings(&app)?;
     // Invalidate pre-reset report previews even if a later file deletion fails.
     *access += 1;
     app.state::<Readiness>().reset_workspace();

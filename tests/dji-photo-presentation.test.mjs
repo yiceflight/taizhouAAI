@@ -205,3 +205,30 @@ test('keeps the shared zero-size SVG sprite visible so temperature point symbols
   assert.equal(f.document.querySelector('.banner').style.visibility,'hidden');
   await f.run({phase:'restore',captureId:uuid()});
 });
+
+test('full-resolution annotated PNGs over 12 MB survive capture and rounding correction', async () => {
+  const large = png() + 'A'.repeat(16_000_000);
+  const exact = await captureFixture({screenshot:large});
+  assert.equal((await exact.run()).dataUrl, `data:image/png;base64,${large}`);
+  const rounded = await captureFixture({screenshot:[png(1279,1024),png(1280,1025)],normalize:async()=>large});
+  assert.equal((await rounded.run()).dataUrl, `data:image/png;base64,${large}`);
+  const oversized = await captureFixture({screenshot:png()+'A'.repeat(48_000_000)});
+  await assert.rejects(oversized.run(), /捕获限制/);
+});
+
+test('canvas accepts a 13 MB PNG but retains the 36 MB resource limit and closes bitmaps', async () => {
+  for (const size of [13_000_000,36_000_001]) {
+    let closed = false;
+    const sandbox = {Uint8Array,Blob,atob,btoa,String,
+      createImageBitmap:async()=>({close(){closed=true;}}),
+      OffscreenCanvas:class {
+        getContext(){return {drawImage(){}};}
+        async convertToBlob(){return new Blob([new Uint8Array(size)]);}
+      },
+    };
+    const result = vm.runInNewContext(`(${normalizeDjiCapture.toString()})('${png()}',1280,1024)`,sandbox);
+    if(size > 36_000_000) await assert.rejects(result,/36 MB/);
+    else assert.equal(Buffer.from(await result,'base64').length,size);
+    assert.equal(closed,true);
+  }
+});

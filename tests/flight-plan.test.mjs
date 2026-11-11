@@ -1,3 +1,4 @@
+import { createTaskTabManager } from '../extension/src/task-tab.js';
 import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,7 +8,7 @@ import { evaluationValue } from '../extension/src/bridge-core.js';
 import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue } from '../extension/src/flight-plan.js';
 const TEST_ROUTE = '东南火点巡查航线-改';
 const TEST_RECIPE = { ...PLAN_RECIPE, route: TEST_ROUTE };
-const job = { type: 'dji-prepare', submit: false, eventId: '00000000-0000-4000-8000-000000000001', name: '钾离子超标巡查-20260922-09', route: TEST_ROUTE };
+const job = { type: 'dji-prepare', submit: false, eventId: '00000000-0000-4000-8000-000000000001', name: '钾离子超标巡查-20260922-09', route: TEST_ROUTE, routeId: '00000000-0000-4000-8000-000000000002', folderPath: [{id:'folder',name:'日常巡逻'}] };
 test('flight status reads the actual ended tab and progress-suffixed status', async () => {
   const { window, document } = parseHTML(`<html><body><button id="open">未完成</button><button id="done">已结束</button><table><tbody></tbody></table></body></html>`);
   window.HTMLElement.prototype.getClientRects = () => [1];
@@ -54,7 +55,7 @@ test('wrong project and login redirects fail before reading or changing the page
 });
 function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, baseRoute=false, submit=false, name=job.name,
   libraryRoute=TEST_ROUTE, libraryRoutes=null, selectedRoute=`${TEST_ROUTE}-副本(2)`, previewRoute=null, submissionDialog=null, dialogDelay=0,
-  receiptRows=1, deviceCard=false, fastClock=false }={}) {
+  receiptRows=1, deviceCard=false, fastClock=false, folderTest=false, missingFolder=false }={}) {
   const buttons = ['普通任务','高精度 RTK','立即','返航'].map(s=>`<button>${s}</button>`).join('');
   const switches = ['多模态识别','自动断点续飞','智能规划最佳返航路线'].map(s=>`<div><span>${s}</span><button role="switch" aria-checked="true"></button></div>`).join('');
   const { window, document } = parseHTML(`<html><body><main><section id="form"><h2>新建计划</h2><label>计划名称<input placeholder="请输入计划名称" value="新建计划30"></label><span>任务类型</span>${buttons}<button>选择航线</button><div id="selected-route"></div><span>选择设备</span><button>选择设备</button><div id="selected-device"></div>${switches}<div><span>最低返航高度（相对机场）</span><input type="number" value="0" id="height"></div><span>自动返航</span><span>媒体存储位置</span><span>全部文件</span><button>编辑</button><div id="subscriber">毛慧</div><button id="confirm">确定</button></section></main></body></html>`);
@@ -63,6 +64,12 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   window.HTMLElement.prototype.focus = function(){};
   window.HTMLElement.prototype.blur = function(){};
   let submissions=0; let followupExecutions=0; let chosenRoute=null;
+  class FakeXHR {
+    listeners=[];
+    open() {}
+    addEventListener(event, fn) { if(event==='load') this.listeners.push(fn); }
+    finish(rows) {this.responseText=JSON.stringify({code:0,data:{list:rows}});this.listeners.forEach(fn=>fn());}
+  }
   const location = {href:PLAN_URL+'/create-plan'};
   const btn = s => [...document.querySelectorAll('button')].find(e=>e.textContent===s);
   document.querySelector('#confirm').onclick=()=>{
@@ -84,6 +91,21 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   btn('选择航线').onclick=()=>{
     const names=libraryRoutes || (ambiguous ? [TEST_ROUTE+'-副本(98)',TEST_ROUTE+'-副本(99)'] : [libraryRoute]);
     const library=document.createElement('aside'); library.innerHTML=`<h2>航线库</h2><section>${names.map(name=>`<div class="route"><span>${name}</span></div>`).join('')}</section>`;document.body.append(library);
+    if (folderTest) {
+      const tree = document.createElement('div'); tree.className='wayline-folder-tree';
+      tree.innerHTML=`<div data-id="folder-other" class="uranus-tree-item-selected"><span>其他目录</span></div>${missingFolder?'':'<div data-id="folder-target"><span>日常巡逻航线</span></div>'}`;
+      library.prepend(tree);
+      const card=library.querySelector('.route');card.classList.add('component-plan-app-wayline-item');
+      card.__vueParentComponent={props:{item:{id:'wrong-route',parent_id:'folder-other'}}};
+      const target=tree.querySelector('[data-id="folder-target"]');
+      if(target) target.querySelector('span').onclick=()=>{
+        tree.firstElementChild.className='';target.className='uranus-tree-item-selected';
+        // Same name remains visible until the async list response arrives.
+        const xhr=new FakeXHR();xhr.open('GET','https://es-flight-api-cn.djigate.com/wayline/api/v1/workspaces/project/web-waylines?file_type=5&parent_id=folder-target&page=1');
+        setTimeout(()=>{card.__vueParentComponent.props.item={id:'correct-route',parent_id:'folder-target'};xhr.finish([{id:'correct-route',parent_id:'folder-target',name:TEST_ROUTE}]);},25);
+      };
+      card.querySelector('span').addEventListener('click',()=>assert.equal(card.__vueParentComponent.props.item.id,'correct-route'));
+    }
     if (previewRoute) { const preview=document.createElement('aside'); preview.textContent=previewRoute; preview.onclick=()=>{throw Error('must not click a preview title')}; document.body.append(preview); }
     for (const item of library.querySelectorAll('.route span')) item.onclick=()=>{chosenRoute=item.textContent;document.querySelector('input[placeholder]').value='新建计划30';document.querySelector('#selected-route').textContent=baseRoute?TEST_ROUTE:selectedRoute;library.remove()};
   };
@@ -98,13 +120,35 @@ function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, base
   if(confirmOnly) btn('普通任务').setAttribute('type','submit');
   if(changedHeight) document.querySelector('#height').addEventListener('change',e=>e.target.value='60');
   let clock=0;
-  const run=(commit)=>runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(name)},${JSON.stringify(PLAN_URL)},${commit},(${readFlightSubmissionIssue.toString()}))`, { document, location, HTMLInputElement:window.HTMLInputElement, Event:window.Event, Date:fastClock?{now:()=>clock}:Date, setTimeout:fastClock?(fn,ms)=>{clock+=ms;fn()}:setTimeout, getComputedStyle:()=>({visibility:'visible'}) });
+  const run=(commit)=>runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(folderTest ? {...TEST_RECIPE,routeId:'correct-route',folderPath:[{id:'folder-target',name:'日常巡逻航线'}]} : TEST_RECIPE)},${JSON.stringify(name)},${JSON.stringify(PLAN_URL)},${commit},(${readFlightSubmissionIssue.toString()}))`, { document, location, URL, XMLHttpRequest:FakeXHR, HTMLInputElement:window.HTMLInputElement, Event:window.Event, Date:fastClock?{now:()=>clock}:Date, setTimeout:fastClock?(fn,ms)=>{clock+=ms;fn()}:setTimeout, getComputedStyle:()=>({visibility:'visible'}) });
   const execute=async()=>{const draft=await run(false); return submit?run(true):draft;};
   return {execute,prepare:()=>run(false),commit:()=>run(true),document,chosenRoute:()=>chosenRoute,submissions:()=>submissions,followupExecutions:()=>followupExecutions};
 }
 test('video recipe fills and verifies the form without ever clicking final confirmation', async()=>{
   const f=fixture();const result=await f.execute();assert.equal(result.submitted,false);assert.equal(result.status,'ready');assert.equal(f.submissions(),0);assert.equal(f.document.querySelector('#height').value,'110');assert.equal(f.document.querySelector('input[placeholder]').value,job.name);
 });
+for (const notificationControls of [false, true]) {
+ test(`preparation and submission ignore ${notificationControls ? 'existing' : 'absent'} notification settings`,async()=>{
+  const f=fixture({submit:true});
+  const edit=[...f.document.querySelectorAll('button')].find(e=>e.textContent==='编辑');
+  if (notificationControls) {
+   edit.onclick=()=>{throw Error('notification settings must not be opened')};
+   const notice=f.document.createElement('aside');
+   notice.innerHTML='<h2>告警通知设置</h2><label><input type="checkbox" checked>邮件</label><label>告警频率<input type="number" value="15"></label><span>订阅人员</span><span>其他人员</span>';
+   for (const input of notice.querySelectorAll('input')) {
+    for (const event of ['click','input','change']) input.addEventListener(event,()=>{throw Error('notification settings must not be changed')});
+   }
+   f.document.body.append(notice);
+  } else {
+   edit.remove();f.document.querySelector('#subscriber').remove();
+  }
+  const result=await f.prepare();
+  assert.equal(result.status,'ready');assert.equal(f.submissions(),0);
+  assert.ok(!result.verified.some(label=>/通知|告警|订阅|短信|邮件/.test(label)));
+  if (notificationControls) assert.equal(f.document.querySelector('#subscriber').textContent,'毛慧');
+  assert.equal((await f.commit()).status,'submitted');assert.equal(f.submissions(),1);
+ });
+}
 test('original route name is accepted when the platform omits its temporary copy suffix',async()=>{const f=fixture({baseRoute:true});assert.equal((await f.execute()).status,'ready');assert.equal(f.submissions(),0)});
 test('route suffixes are ignored in the library, selected form and submission checks', async()=>{
   for (const suffix of ['-副本(6)', '-副本(27)', '-新版', '']) {
@@ -201,7 +245,7 @@ test('status polling recovers a matching draft weather reason without submitting
     }}};
     const released=[];
     const debuggerSession={acquire:async()=>true,release:async id=>released.push(id)};
-    const execute=runInNewContext(`${source}; watchFlight`,{chrome,debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue,evaluateBackgroundRead});
+    const execute=runInNewContext(`${source}; watchFlight`,{chrome,monitorTabFor:createTaskTabManager(chrome,{key:'flight-monitor-tab'}),debuggerSession,Date,JSON,PLAN_URL,readFlightSubmissionIssue,readFlightStatus,evaluationValue,evaluateBackgroundRead});
     if(name===job.name) {await assert.rejects(execute(job),/在线天气风速： 12\.75m\/s/);assert.deepEqual(calls,[42]);}
     else {assert.equal((await execute(job)).status,'执行中');assert.deepEqual(calls,[42,43]);}
     assert.deepEqual(released,calls);
@@ -384,4 +428,24 @@ test('status lookup stops waiting before the background read watchdog', async ()
     setTimeout: (fn, ms) => { elapsed += ms; fn(); },
   }), /状态查询未完成/);
   assert.ok(elapsed > 0 && elapsed < 25000);
+});
+
+test('switches folder before choosing a same-name card and waits for its identity',async()=>{
+ const f=fixture({folderTest:true});
+ assert.equal((await f.prepare()).status,'ready');
+ assert.equal(f.chosenRoute(),TEST_ROUTE);
+ assert.equal(f.submissions(),0);
+});
+test('missing folder stops preparation without choosing the visible same-name route',async()=>{
+ const f=fixture({folderTest:true,missingFolder:true,fastClock:true});
+ await assert.rejects(f.prepare(),/文件夹.*超时/);
+ assert.equal(f.chosenRoute(),null);
+ assert.equal(f.submissions(),0);
+});
+test('folder selection ignores an existing selected route card outside the library',async()=>{
+ const f=fixture({folderTest:true});
+ f.document.querySelector('#selected-route').innerHTML=`<div class="component-plan-app-wayline-item"><span>${TEST_ROUTE}-副本(19)</span></div>`;
+ assert.equal((await f.prepare()).status,'ready');
+ assert.equal(f.chosenRoute(),TEST_ROUTE);
+ assert.equal(f.submissions(),0);
 });

@@ -41,9 +41,9 @@ impl Monitor {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HourRow {
-    time: String,
-    potassium: Option<f64>,
-    pm25: Option<f64>,
+    pub(crate) time: String,
+    pub(crate) potassium: Option<f64>,
+    pub(crate) pm25: Option<f64>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -163,7 +163,7 @@ fn requested_window(range: &str) -> Result<(String, String), String> {
         end.format(FORMAT).to_string(),
     ))
 }
-fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str, advance_cursor: bool) -> Result<(), String> {
+fn validate_batch(batch: &Batch, start: &str, end: &str) -> Result<(), String> {
     if !source_page(&batch.url)
         || batch.city != "泰州市"
         || batch.city_code != "321200"
@@ -195,6 +195,10 @@ fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str, advance_cu
             return Err("小时数据包含重复时间、越界时间或非法浓度，整批未写入。".into());
         }
     }
+    Ok(())
+}
+fn persist(db: &mut Connection, batch: Batch, start: &str, end: &str, advance_cursor: bool) -> Result<(), String> {
+    validate_batch(&batch, start, end)?;
     let synced = now().format(FORMAT).to_string();
     let tx = db.transaction().map_err(|e| e.to_string())?;
     for row in batch.rows {
@@ -411,6 +415,22 @@ pub fn get_monitoring(
         settings: crate::settings::read(&db)?,
     })
 }
+/// Reports must use this response, including newly missing values, rather than
+/// the monitoring database's COALESCE merge or its incremental sync cursor.
+pub(crate) async fn report_hours(app: &tauri::AppHandle, end: &str) -> Result<(Vec<HourRow>, String, String), String> {
+    crate::readiness::require_monitoring(app, false)?;
+    let start = (parse(end)? - Duration::days(7)).format(FORMAT).to_string();
+    let bridge = app.state::<Bridge>();
+    let readiness = crate::readiness::view(app);
+    let verified = readiness.sites.iter().find(|site| site.id == "map" && site.state == "ready")
+        .ok_or("江苏大气站尚未通过 API 验证，请重新验证登录状态。")?;
+    let (session, tab) = bridge.hourly_target(verified)?;
+    let raw = bridge.request(session, tab, json!({"type":"jiangsu-hourly", "startTime":start, "endTime":end})).await?;
+    let batch: Batch = serde_json::from_value(raw).map_err(|_| "小时采集数据格式不正确".to_string())?;
+    validate_batch(&batch, &start, end)?;
+    Ok((batch.rows, batch.url, now().format(FORMAT).to_string()))
+}
+
 pub async fn verify_first_sync(app: &tauri::AppHandle) -> Result<(), String> {
     sync(app, false, None).await
 }
@@ -464,6 +484,21 @@ mod tests {
     fn save(db: &mut Connection, data: Batch) -> Result<(), String> {
         persist(db, data, "2026-09-16 00:00:00", "2026-09-17 00:00:00", true)
     }
+    #[test]
+    fn fresh_report_batch_preserves_revised_and_missing_values() {
+        let start = "2026-09-21 07:00:00";
+        let end = "2026-09-22 07:00:00";
+        let batch: Batch = serde_json::from_value(json!({
+            "url": SOURCE_URL, "city":"泰州市", "cityCode":"321200", "unit":"μg/m³",
+            "dataSource":"A_6", "commonSiteType":"30", "startTime":start, "endTime":end,
+            "rows":[{"time":end,"potassium":null,"pm25":0.0}]
+        })).unwrap();
+        validate_batch(&batch, start, end).unwrap();
+        assert!(batch.rows[0].potassium.is_none());
+        assert_eq!(batch.rows[0].pm25, Some(0.0));
+        assert!(validate_batch(&batch, "2026-09-20 07:00:00", end).is_err());
+    }
+
     #[test]
     fn api_batches_accept_map_and_reject_login_and_foreign_origins() {
         let mut db = connect(Path::new(":memory:")).unwrap();

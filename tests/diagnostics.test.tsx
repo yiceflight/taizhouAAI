@@ -1,0 +1,32 @@
+import { afterEach, expect, it, vi } from 'vitest';
+const ipc = vi.hoisted(() => ({ invoke: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@tauri-apps/api/core', () => ipc);
+import { installFrontendDiagnostics, recordFrontendError } from '../src/lib/diagnostics';
+afterEach(() => { vi.unstubAllGlobals(); ipc.invoke.mockClear(); });
+it('retains original stack, location, rejection context and removes handlers on cleanup', () => {
+  const window = new EventTarget();
+  vi.stubGlobal('window', window);
+  vi.stubGlobal('location', { href: 'tauri://localhost/report?task=123' });
+  vi.stubGlobal('navigator', { userAgent: 'WebView test' });
+  const cleanup = installFrontendDiagnostics();
+  const error = new Error('original error');
+  const event = new Event('error');
+  Object.assign(event, { error, filename: 'app.js', lineno: 12, colno: 34 });
+  window.dispatchEvent(event);
+  expect(ipc.invoke).toHaveBeenCalledWith('record_frontend_error', { kind: 'window.error', details: expect.objectContaining({message:'original error', stack:error.stack, filename:'app.js', line:12, column:34, url:'tauri://localhost/report?task=123'}) });
+  const rejection = new Event('unhandledrejection');
+  Object.assign(rejection, { reason: { requestId:'abc', error:'raw failure' } });
+  window.dispatchEvent(rejection);
+  expect(ipc.invoke).toHaveBeenLastCalledWith('record_frontend_error', {kind:'unhandledrejection', details:expect.objectContaining({value:{requestId:'abc',error:'raw failure'}})});
+  cleanup(); window.dispatchEvent(event);
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+});
+it('does not create a new unhandled rejection when logging IPC fails', async () => {
+  vi.stubGlobal('location', { href: 'tauri://localhost' });
+  vi.stubGlobal('navigator', { userAgent: 'test' });
+  ipc.invoke.mockRejectedValueOnce(new Error('IPC unavailable'));
+  const circular: Record<string, unknown> = {}; circular.self = circular;
+  recordFrontendError('react.uncaught', circular, {componentStack:'App > Panel'});
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(ipc.invoke).toHaveBeenCalledWith('record_frontend_error', {kind:'react.uncaught', details:expect.objectContaining({value:'[object Object]',componentStack:'App > Panel'})});
+});

@@ -74,6 +74,7 @@ fn connect(path: &Path) -> Result<Connection, String> {
     )
     .map_err(|e| e.to_string())?;
     prune(&db, Utc::now().timestamp_millis())?;
+    crate::diagnostics::initialize(&db)?;
     Ok(db)
 }
 fn prune(db: &Connection, now: i64) -> Result<(), String> {
@@ -81,103 +82,6 @@ fn prune(db: &Connection, now: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn sensitive_key(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    [
-        "authorization",
-        "bearer",
-        "cookie",
-        "password",
-        "accesstoken",
-        "refreshtoken",
-        "apikey",
-        "secret",
-        "token",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-// Only operational metadata is passed by callers, never browser payloads or page contents.
-// Redact credential-bearing errors too, and strip URL query/fragment parameters.
-fn clean_text(text: &str) -> String {
-    let lower = text.to_lowercase();
-    if [
-        "authorization",
-        "bearer ",
-        "cookie",
-        "password",
-        "access_token",
-        "refresh_token",
-        "accesstoken",
-        "refreshtoken",
-        "api_key",
-        "api-key",
-        "apikey",
-        "token=",
-        "secret=",
-    ]
-    .iter()
-    .any(|key| lower.contains(key))
-    {
-        return "[已隐藏可能包含凭据的内容]".into();
-    }
-    text.split_whitespace()
-        .map(|part| {
-            let lower_part = part.to_lowercase();
-            if let Some(start) = lower_part
-                .find("http://")
-                .or_else(|| lower_part.find("https://"))
-            {
-                let end = part[start..]
-                    .find(['?', '#'])
-                    .map(|i| start + i)
-                    .unwrap_or(part.len());
-                format!(
-                    "{}{}",
-                    &part[..end],
-                    if end < part.len() {
-                        "[参数已隐藏]"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                part.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(2000)
-        .collect()
-}
-fn sanitize(value: &Value) -> Value {
-    match value {
-        Value::String(text) => json!(clean_text(text)),
-        Value::Array(items) => Value::Array(items.iter().take(100).map(sanitize).collect()),
-        Value::Object(items) => Value::Object(
-            items
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        if sensitive_key(k) {
-                            json!("[已隐藏]")
-                        } else {
-                            sanitize(v)
-                        },
-                    )
-                })
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
-}
 impl RuntimeLog {
     fn initialize(&self, app: &tauri::AppHandle) {
         let result = app
@@ -201,14 +105,20 @@ impl RuntimeLog {
         };
         let at = Utc::now().timestamp_millis();
         let result = db.execute("INSERT INTO runtime_logs(at,session,level,category,event,message,details) VALUES (?,?,?,?,?,?,?)",
-            params![at, store.session, level, category, event, clean_text(message), sanitize(&details).to_string()])
+            params![at, store.session, level, category, event, message, details.to_string()])
             .map_err(|e| e.to_string()).and_then(|_| prune(db, at));
         store.error = result.err();
+    }
+
+    pub(crate) fn with_db<T>(&self, action: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        let store = self.0.lock().map_err(|_| "运行日志锁已损坏")?;
+        action(store.db.as_ref().ok_or("运行日志尚未初始化")?)
     }
 
     pub(crate) fn clear(&self) -> Result<(), String> {
         let mut store = self.0.lock().unwrap();
         let db = store.db.as_ref().ok_or("运行日志尚未初始化")?;
+        crate::diagnostics::clear(db)?;
         db.execute("DELETE FROM runtime_logs", [])
             .map_err(|e| e.to_string())?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
@@ -308,7 +218,7 @@ fn window_state(app: &tauri::AppHandle) -> Value {
 pub fn start(app: &tauri::AppHandle) {
     let log = app.state::<RuntimeLog>().inner().clone();
     log.initialize(app);
-    log.record("info", "app", "app.started", "客户端已启动", json!({"version":app.package_info().version.to_string(),"platform":std::env::consts::OS,"channel":crate::environment::CHANNEL,"pid":std::process::id()}));
+    log.record("info", "app", "app.started", "客户端已启动", json!({"version":app.package_info().version.to_string(),"platform":std::env::consts::OS,"channel":crate::environment::CHANNEL,"pid":std::process::id(),"commit":env!("DIAGNOSTIC_COMMIT"),"dirty":env!("DIAGNOSTIC_DIRTY"),"builtAt":env!("DIAGNOSTIC_BUILD_TIME"),"architecture":std::env::consts::ARCH}));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut previous = HashMap::new();
@@ -593,38 +503,16 @@ mod tests {
         assert_eq!(query(&db, &Filter::default(), 1).unwrap()[0].id, 20004);
     }
     #[test]
-    fn redacts_sensitive_errors_and_keeps_actionable_metadata() {
+    fn preserves_full_error_text_and_structured_context() {
         let log = logger(connect(Path::new(":memory:")).unwrap());
-        log.record("error", "bridge", "job.finished", "请求失败", json!({"requestId":"abc","apiKey":"private-api-key","accessToken":"private-access-token","token":"secret-value","error":"Authorization: Bearer private-value", "url":"HTTPS://example.test/path?session=private-query#private-fragment"}));
+        let message = format!("request failed\n{}", "stack frame\n".repeat(400));
+        let details = json!({"requestId":"abc", "url":"https://example.test/path?task=123#step", "rows":(0..150).collect::<Vec<_>>()});
+        log.record("error", "bridge", "job.finished", &message, details.clone());
         let entry = log.read(&Filter::default(), 1).unwrap().entries.remove(0);
-        let text = serde_json::to_string(&entry).unwrap();
-        for secret in [
-            "private-api-key",
-            "private-access-token",
-            "secret-value",
-            "private-value",
-            "private-query",
-            "private-fragment",
-        ] {
-            assert!(!text.contains(secret));
-        }
-        assert!(text.contains("abc"));
-        assert!(text.contains("HTTPS://example.test/path"));
+        assert_eq!(entry.message, message);
+        assert_eq!(entry.details, details);
     }
 
-    #[test]
-    fn sensitive_key_matching_handles_common_camel_case_and_separator_variants() {
-        for key in [
-            "apiKey",
-            "access_token",
-            "refresh-token",
-            "x-authorization",
-            "clientSecret",
-        ] {
-            assert!(sensitive_key(key), "{key} should be redacted");
-        }
-        assert!(!sensitive_key("requestId"));
-    }
     #[test]
     fn unchanged_state_is_not_repeated_and_storage_failure_is_visible() {
         let log = logger(connect(Path::new(":memory:")).unwrap());

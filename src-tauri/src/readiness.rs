@@ -73,6 +73,7 @@ pub struct View {
     pub plugin_update_required: bool,
     pub minimum_extension_version: &'static str,
     pub checking: bool,
+    pub checks: Vec<serde_json::Value>,
     pub sites: Vec<SiteHealth>,
     pub ready: bool,
     pub monitoring_ready: bool,
@@ -145,12 +146,14 @@ pub fn view(app: &tauri::AppHandle) -> View {
     let state = app.state::<Readiness>();
     let bridge = app.state::<Bridge>().status();
     let cache = state.sites.lock().unwrap();
-    evaluate(
+    let mut result = evaluate(
         &bridge,
         &cache,
         state.started.load(Ordering::SeqCst),
         state.checking.load(Ordering::SeqCst),
-    )
+    );
+    result.checks = app.state::<Bridge>().health_checks();
+    result
 }
 fn evaluate(
     bridge: &crate::bridge::BridgeStatus,
@@ -210,6 +213,7 @@ fn evaluate(
         minimum_extension_version: MIN_VERSION,
         plugin_message,
         checking,
+        checks: vec![],
         started,
         sites,
     }
@@ -328,7 +332,7 @@ async fn check_site(
     let mut tabs: Vec<_> = snapshot
         .tabs
         .iter()
-        .filter(|t| same_origin(&t.tab.url, origin) && t.tab.status == "complete")
+        .filter(|t| same_origin(&t.tab.url, origin) && (t.tab.status == "complete" || t.tab.status == "unloaded"))
         .collect();
     tabs.sort_by_key(|t| {
         (
@@ -380,9 +384,7 @@ async fn check_site(
         health.url = expected_url.clone();
         health.tab_id = (tab_id >= 0).then_some(tab_id);
         if let Err(error) = &result {
-            if error.starts_with("浏览器任务排队超时") || error.starts_with("采集超时") || error == "采集连接已中断。" {
-                health.message = error.clone();
-            }
+            health.message = error.chars().take(300).collect();
         }
         if let Ok(raw) = result {
             let actual_url = raw["url"].as_str();

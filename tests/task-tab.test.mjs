@@ -66,3 +66,19 @@ test('waits for SPA table loading and accepts a loaded empty list', async () => 
   context.document.querySelector = () => null;
   await assert.rejects(vm.runInContext(`(${waitForTaskList.toString()})(${JSON.stringify(PLAN_URL)})`, context), /尚未加载完成/);
 });
+
+test('waits past keyed date separators until a real task row is rendered', async () => {
+  let time = 0;
+  const dateRow = { querySelector: () => null, querySelectorAll: () => [] };
+  const taskRow = { querySelector: () => (time >= 200 ? {} : null), querySelectorAll: () => [] };
+  const context = vm.createContext({
+    Date: { now: () => time }, location: { href: PLAN_URL }, localStorage: { getItem: () => 'test' },
+    document: {
+      querySelector: selector => selector.includes('spin') ? null : null,
+      querySelectorAll: () => time >= 200 ? [dateRow, taskRow] : [dateRow],
+    },
+    setTimeout: resolve => { time += 200; resolve(); },
+  });
+  await vm.runInContext(`(${waitForTaskList.toString()})(${JSON.stringify(PLAN_URL)})`, context);
+  assert.equal(time, 200);
+});

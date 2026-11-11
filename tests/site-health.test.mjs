@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
-import { checkSiteHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from '../extension/src/site-health.js';
+import { checkSiteHealth, captureHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from '../extension/src/site-health.js';
 import { findJiangsuApi } from '../extension/src/jiangsu.js';
 const run = (url, extra = {}) => runInNewContext(`(${checkSiteHealth.toString()})((${findJiangsuApi.toString()}))`, {
   location: new URL(url), document: { querySelectorAll: () => [], querySelector: () => null }, AbortSignal, ...extra,
@@ -9,6 +9,34 @@ const run = (url, extra = {}) => runInNewContext(`(${checkSiteHealth.toString()}
 const map = 'http://61.155.4.60:18080/#/particle-analysis/feature-analysis/time-series';
 const dji = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan';
 const air = 'https://aai.airins.cn/sniff/HistoryCloud';
+test('health recovers from a replaced execution context in the same page without waiting for the next cycle', async () => {
+  let elapsed = 0, calls = 0;
+  const chrome = { tabs: { get: async () => ({url:dji,status:elapsed === 200 ? 'loading' : 'complete'}) } };
+  const result = await captureHealth(chrome, async () => {
+    if (++calls === 1) throw Error('Inspected target navigated or closed');
+    return {url:dji,state:'ready'};
+  }, 1, {now:()=>elapsed,pause:async()=>{elapsed+=200;}});
+  assert.equal(result.state,'ready');
+  assert.equal(calls,2);
+  assert.equal(elapsed,400);
+});
+test('health retry is bounded and never follows navigation, retries network failures or retries auth results', async () => {
+  for (const mode of ['changed','pending','loading','twice','network','auth']) {
+    let elapsed=0,calls=0;
+    const chrome={tabs:{get:async()=>({url:elapsed && mode==='changed' ? 'https://fh.dji.com/#/login' : dji,
+      pendingUrl:elapsed && mode==='pending' ? 'https://evil.test' : undefined,
+      status:elapsed && mode==='loading' ? 'loading' : 'complete'})}};
+    const task=captureHealth(chrome,async()=>{
+      calls++;
+      if(mode==='auth') return {state:'login_required'};
+      throw Error(mode==='network' ? 'network failure' : 'Inspected target navigated or closed');
+    },1,{now:()=>elapsed,pause:async()=>{elapsed+=200;}});
+    if(mode==='auth') assert.equal((await task).state,'login_required');
+    else await assert.rejects(task);
+    assert.equal(calls,mode==='twice' ? 2 : 1);
+    assert.ok(elapsed<=2000);
+  }
+});
 test('health never treats an open login page as authenticated or touches credential values', async () => {
   assert.equal((await run('https://fh.dji.com/#/login')).state, 'login_required');
   assert.equal((await run(air, { document: { querySelectorAll: () => [{ getClientRects: () => [1], get value() { throw Error('credential read'); } }] } })).state, 'login_required');
@@ -189,4 +217,88 @@ test('Jiangsu launcher on the login route requests business verification without
   assert.equal((await run(url)).state, 'login_required');
   assert.equal((await run(url, { document: { ...document, querySelectorAll: () => [{ getClientRects: () => [1] }] } })).state, 'login_required');
   assert.equal((await run('https://fh.dji.com/#/login', { document })).state, 'login_required');
+});
+
+test('DJI retries one transient failure with a shared deadline, never auth failures or changed pages', async () => {
+  for (const failure of ['network',502,503,504,401,403]) {
+    let calls = 0, signal;
+    const result = await run(dji,djiSession({fetch:async(_url,options)=>{
+      calls++;
+      if(signal) assert.equal(options.signal,signal);
+      signal=options.signal;
+      if(calls===1) {
+        if(failure==='network') throw Error('offline');
+        return {status:failure,ok:false};
+      }
+      return {status:200,ok:true,json:async()=>({code:0,data:{user_id:'fixture'}})};
+    }}));
+    assert.equal(calls,[401,403].includes(failure)?1:2);
+    assert.equal(result.state,failure===401?'login_required':failure===403?'forbidden':'ready');
+  }
+  let calls=0;
+  const result=await run(dji,djiSession({fetch:async()=>{if(++calls===1)throw Error('offline');return {status:503,ok:false};}}));
+  assert.equal(calls,2);assert.equal(result.state,'error');
+  const location=new URL(dji);calls=0;
+  const changed=await run(dji,djiSession({location,fetch:async()=>{calls++;location.href='https://fh.dji.com/#/login';throw Error('navigation');}}));
+  assert.equal(calls,1);assert.equal(changed.state,'login_required');
+});
+
+function wakeFixture(extra = {}) {
+  let elapsed = 0;
+  const tabs = new Map([[1, {id:1,windowId:7,url:air,status:'complete',active:false,...extra}], [2,{id:2,windowId:7,url:'https://example.test',active:true}]]);
+  const activations = [], stages = [];
+  const chrome = {tabs:{
+    get:async id => { if (!tabs.has(id)) throw Error('closed'); return {...tabs.get(id)}; },
+    query:async () => [...tabs.values()].filter(tab=>tab.active),
+    update:async (id, update) => { activations.push(id); for (const tab of tabs.values()) tab.active=false; Object.assign(tabs.get(id),update,{discarded:false,frozen:false}); return {...tabs.get(id)}; },
+  }};
+  return {chrome,tabs,activations,stages,timing:{now:()=>elapsed,pause:async ms=>{elapsed+=ms;},progress:async stage=>{stages.push(stage);}}};
+}
+test('discarded and frozen health pages wake before reading and restore the previous tab', async () => {
+  for (const flag of ['discarded','frozen']) {
+    const f=wakeFixture({[flag]:true}); let reads=0;
+    const result=await captureHealth(f.chrome,async()=>{reads++; assert.equal(f.tabs.get(1).active,true); return {state:'ready'};},1,f.timing);
+    assert.equal(result.state,'ready'); assert.equal(reads,1);
+    assert.deepEqual(f.activations,[1,2]); assert.ok(f.stages.includes('waking'));
+  }
+});
+test('Airins background failure activates once, retries, and preserves a user tab switch', async () => {
+  for (const switched of [false,true]) {
+    const f=wakeFixture(); let reads=0;
+    const result=await captureHealth(f.chrome,async()=>{
+      if (++reads===1) return {state:'error',message:'blank'};
+      if (switched) { f.tabs.get(1).active=false; f.tabs.get(2).active=true; }
+      return {state:'ready'};
+    },1,f.timing);
+    assert.equal(result.state,'ready'); assert.equal(reads,2);
+    assert.deepEqual(f.activations,switched?[1]:[1,2]);
+    assert.ok(f.stages.includes('activating'));
+  }
+});
+test('Airins auth and permission results never trigger activation; recovery never loops', async () => {
+  for (const state of ['login_required','forbidden','ready','error']) {
+    const f=wakeFixture(); let reads=0;
+    const result=await captureHealth(f.chrome,async()=>{reads++; return {state};},1,f.timing);
+    assert.equal(result.state,state); assert.equal(reads,state==='error'?2:1);
+    assert.deepEqual(f.activations,state==='error'?[1,2]:[]);
+  }
+});
+test('Airins recovery refuses changed pages and restores focus after a failed read', async () => {
+  for (const changed of [true,false]) {
+    const f=wakeFixture(); let reads=0;
+    await assert.rejects(captureHealth(f.chrome,async()=>{
+      reads++; if (changed) f.tabs.get(1).url='https://evil.test/';
+      throw Error('read failed');
+    },1,f.timing));
+    assert.equal(reads,changed?1:2);
+    assert.deepEqual(f.activations,changed?[]:[1,2]);
+  }
+});
+test('concurrent discarded health pages activate sequentially', async () => {
+  const f=wakeFixture({discarded:true});
+  f.tabs.set(3,{id:3,windowId:7,url:dji,status:'complete',active:false,discarded:true});
+  await Promise.all([1,3].map(id=>captureHealth(f.chrome,async tabId=>{
+    assert.equal(f.tabs.get(tabId).active,true); return {state:'ready'};
+  },id,f.timing)));
+  assert.deepEqual(f.activations,[1,2,3,2]);
 });

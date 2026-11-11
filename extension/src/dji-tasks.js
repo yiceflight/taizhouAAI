@@ -50,15 +50,19 @@ export async function readDjiTasks(expectedUrl, options = {}) {
       return Number.isFinite(parsed) ? parsed : 0;
     };
     for (const row of document.querySelectorAll('tbody tr, tr[role="row"]')) {
-      const key = row.getAttribute('data-row-key');
-      if (!key) {
+      const cells = [...(row.children || [])].filter(cell => cell.tagName === 'TD');
+      const groups = [...(row.querySelectorAll?.('.duration-box .time-content') || [])];
+      // A date separator is a keyed row too, but it has no execution cells.
+      // Do not let it overwrite the current date or enter the visible-row map.
+      const isTaskRow = groups.length > 0 || !!row.querySelector?.('.plan-name-wrapper, .action-box');
+      if (!isTaskRow) {
         const heading = clean(row.textContent);
         const match = heading.match(/^(\d{4}-\d{2}-\d{2})(?:今天|昨天)?$/);
         if (match) date = match[1];
         continue;
       }
-      const cells = [...row.children].filter(cell => cell.tagName === 'TD');
-      const groups = [...row.querySelectorAll('.duration-box .time-content')];
+      const key = row.getAttribute('data-row-key');
+      if (!key) continue;
       const planned = groups[0] ? [...groups[0].querySelectorAll('.start-time,.end-time')].map(clean) : [];
       const actual = groups[1] ? [...groups[1].querySelectorAll('.start-time,.end-time')].map(clean) : [];
       const mediaCell = row.querySelector?.('.media-td') || cells.find(cell => /上传结束|上传中|无媒体文件|媒体/.test(clean(cell.textContent)));
@@ -75,8 +79,12 @@ export async function readDjiTasks(expectedUrl, options = {}) {
         actualStartTime: timestamp(date, actual[0]),
         actualEndTime: timestamp(date, actual[1]),
         taskType: clean(cells[3]?.textContent),
-        planName: clean(cells[4]?.textContent),
-        routeName: clean(cells[5]?.textContent),
+        planName: clean(cells.find(cell => cell.querySelector?.('.plan-name-wrapper'))?.textContent || cells[4]?.textContent),
+        // The route is a link in the current FlightHub table. Prefer that
+        // semantic cell so an added checkbox/device column cannot shift it;
+        // retain the historical index fallback for older page revisions and
+        // the lightweight test DOM.
+        routeName: clean(cells.find(cell => cell.querySelector?.('a'))?.textContent || cells[5]?.textContent),
         media,
       });
     }
@@ -145,7 +153,15 @@ export async function readDjiTasks(expectedUrl, options = {}) {
       || apiExplicitEmpty
       || (!renderedMedia && !mediaFolderId && !hasCounts && row.media_upload_status === 0);
     const uploadedAll = !noMedia && (renderedMedia?.ready === true || (hasCounts && count > 0 && uploaded >= count) || (!hasCounts && row.media_upload_status === 2));
-    const routeName = String(rendered?.routeName || row.route_name || row.flight_route_name || row.template_name || '').trim();
+    // FlightHub's task table reads wayline.name from this same list response.
+    // Multi-wayline executions display the ordered progress names joined by 、.
+    // Read every API page, independent of the visible tab's filters/pagination.
+    const text = value => typeof value === 'string' ? value.trim() : '';
+    const progressNames = row.wayline_count > 1 && Array.isArray(row.wayline_progress)
+      ? row.wayline_progress.map(item => text(item?.name)).filter(Boolean) : [];
+    const routeName = progressNames.join('、') || text(row.wayline?.name)
+      || text(row.route_name) || text(row.flight_route_name) || text(row.template_name)
+      || text(rendered?.routeName);
     const taskType = String(rendered?.taskType || row.task_type || row.taskType || row.flight_task_type || '').trim();
     const missionName = String(rendered?.planName || row.name).trim();
     return { taskId: row.uuid, mediaFolderId, plannedStartTime, actualTimeMissing,

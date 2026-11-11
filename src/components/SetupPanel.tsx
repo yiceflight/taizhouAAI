@@ -22,7 +22,26 @@ export function SetupPanel({ bridge, state, busy, onCheck, openSite }: Props) {
       </>}
       {message && <p className="notice" role="status">{message}</p>}<BridgeDiagnostics />
     </section>;
-  const siteRows = <>{targetSites.map((site, index) => { const health = state?.sites.find(s => s.id === site.id); const checking = state?.checking === true && (!health || health.state === 'unchecked' || health.state === 'not_open'); const label = checking ? '验证中' : health ? siteLabels[health.state] : '待验证'; const message = checking ? '正在验证登录与业务访问' : health?.message || '等待检测'; return <article className="health-row" key={site.id}><span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 2}</span><div className="health-copy"><h4>{site.name}</h4><p>{message}</p><small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small></div><span className={`badge ${health?.state === 'ready' ? 'success' : 'warning'}`}>{label}</span><button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button></article>; })}</>;
+  const siteRows = <>{targetSites.map((site, index) => {
+    const health = state?.sites.find(s => s.id === site.id);
+    const progress = pluginReady ? state?.checks?.find(check => check.id === site.id) : undefined;
+    const checking = !!progress || state?.checking === true && (!health || health.state === 'unchecked' || health.state === 'not_open');
+    const label = checking ? health?.state === 'ready' ? '复查中' : '验证中' : health ? siteLabels[health.state] : '待验证';
+    const message = progress?.message || (checking ? '正在验证登录与业务访问' : health?.message || '等待检测');
+    const purpose = site.id === 'sniff' ? '检查可飞历史任务列表是否可读取' : site.id === 'dji' ? '检查司空账号登录与泰州项目访问' : '检查泰州市监测指标目录是否可读取';
+    return <article className="health-row" key={site.id}>
+      <span className={`site-number ${health?.state === 'ready' ? 'success' : ''}`}>{health?.state === 'ready' ? '✓' : index + 2}</span>
+      <div className="health-copy"><h4>{site.name}</h4><p>{message}</p>
+        {checking && <small>{purpose}</small>}
+        {progress && <small>本次已用 {progress.elapsedSeconds} 秒 · {progress.dispatched ? '本轮验证' : '接收任务'}最多再等待 {progress.remainingSeconds} 秒</small>}
+        {progress && progress.elapsedSeconds >= 15 && <small className="health-wait-hint">等待较久，可打开网站查看是否白屏或要求登录；超时后会显示原因并自动复查。</small>}
+        {checking && health?.checkedAt && <small>上次结果：{health.message}</small>}
+        <small>{health?.checkedAt ? `上次验证 ${health.checkedAt}` : site.description}</small>
+      </div>
+      <span className={`badge ${health?.state === 'ready' && !checking ? 'success' : 'warning'}`}>{label}</span>
+      <button className="secondary-button" onClick={() => openSite(site)}>{health?.state === 'ready' ? '打开网站 ↗' : health?.state === 'login_required' ? '前往登录 ↗' : '打开并处理 ↗'}</button>
+    </article>;
+  })}</>;
   return <section className="setup-card required-environment-list" aria-label="必需的运行环境">
     <div className="health-list">
       <article className="health-row">

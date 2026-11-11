@@ -64,7 +64,10 @@ test('retains failed flights without fabricating their actual finish time or gen
 });
 test('copies visible DJI type, route, date and partial actual time into the task identity', async()=>{
   const item = domTaskRow(1);
-  const document = { querySelectorAll: () => [{ getAttribute: () => null, textContent: '2026-09-22' }, item.row] };
+  // Current FlightHub keys the date separator row as well as task rows.
+  // The separator must not be treated as a task or erase the active date;
+  // keep it separate from the UUID-keyed task.
+  const document = { querySelectorAll: () => [{ getAttribute: () => 'date-row', textContent: '2026-09-22', children: [], querySelectorAll: () => [] }, item.row] };
   const f = fixture({ total: 1, document, map: r => ({ ...r, status: 1, completed_at: null, folder_id: 0, folder_info: null, media_upload_status: 0 }) });
   const task = (await f.run()).tasks[0];
   assert.equal(task.taskType, '自动任务'); assert.equal(task.routeName, '南侧火点巡查航线-副本');
@@ -220,4 +223,29 @@ test('does not declare a short final page complete', async () => {
   const result=await f.run();
   assert.equal(result.historyComplete,false);assert.equal(result.cursor.page,2);
   assert.match(result.historyError,/不完整/);
+});
+
+// Field contract verified against FlightHub plan-app index.c58c6fa0.js.
+test('reads API wayline names for all historical pages without visible rows', async () => {
+  const f = fixture({ total: 76, map: r => ({ ...r, wayline: { name: `航线-${r.name}` } }) });
+  const result = await f.run();
+  assert.equal(result.tasks.length, 76);
+  assert.ok(result.tasks.every(t => t.routeName === `航线-${t.mission.missionName}`));
+});
+test('uses authoritative API route over DOM and joins multi-wayline progress in platform order', async () => {
+  const item = domTaskRow(1, { route: '旧页面航线' });
+  const document = { querySelectorAll: () => [item.row] };
+  const single = fixture({ total: 1, document, map: r => ({ ...r, wayline: { name: '实际执行航线' } }) });
+  assert.equal((await single.run()).tasks[0].routeName, '实际执行航线');
+  const multi = fixture({ total: 1, map: r => ({ ...r, wayline_count: 2, wayline: { name: '首条航线' },
+    wayline_progress: [{ name: '东侧航线' }, { name: '南侧航线' }] }) });
+  assert.equal((await multi.run()).tasks[0].routeName, '东侧航线、南侧航线');
+});
+test('does not borrow DOM route or execution times from another task with the same plan name', async () => {
+  const item = domTaskRow(2);
+  const document = { querySelectorAll: () => [item.row] };
+  const f = fixture({ total: 1, document });
+  const task = (await f.run()).tasks[0];
+  assert.equal(task.routeName, undefined);
+  assert.equal(task.mission.endTime, Date.parse('2026-09-22T01:25:00Z'));
 });

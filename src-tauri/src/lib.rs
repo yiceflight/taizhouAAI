@@ -2,6 +2,7 @@ use std::process::Command;
 use tauri::Manager;
 
 mod data_reset;
+mod diagnostics;
 
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -176,6 +177,16 @@ pub fn run() {
     let mut context = tauri::generate_context!();
     environment::configure(&mut context);
     let mut builder = tauri::Builder::default();
+    // Must be registered first. A second launch (e.g. double-clicking the desktop
+    // icon while the app is hidden in the tray) restores the running window
+    // instead of starting another process that cannot bind the bridge port.
+    // The plugin keys on the app identifier, so test and release builds stay isolated.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            window_lifecycle::show_main_window(app);
+        }));
+    }
     if !environment::IS_TEST {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
@@ -192,6 +203,7 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             runtime_log::start(app.handle());
+            diagnostics::start(app.handle());
             runtime_log::record(
                 app.handle(),
                 "info",
@@ -235,6 +247,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             environment::is_test_environment,
             runtime_log::get_runtime_logs,
+            diagnostics::record_frontend_error,
             runtime_log::export_runtime_logs,
             runtime_log::open_runtime_log_exports,
             open_chrome_extensions,
@@ -274,6 +287,9 @@ pub fn run() {
             reports::list_reports,
             reports::open_report,
             reports::open_reports_directory,
+            email::send_flight_report_email,
+            email::get_email_settings,
+            email::save_email_settings,
             updates::check_update_channel
         ])
         .build(context)
@@ -313,6 +329,7 @@ mod bridge;
 mod bridge_diagnostics;
 mod reports;
 mod updates;
+mod email;
 
 mod monitoring;
 mod settings;

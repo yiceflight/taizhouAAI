@@ -10,6 +10,11 @@ export const WEATHER_URL = PLAN_URL.replace('#/plan', '#/team');
 export async function openDjiWeather(chrome, capture) {
   const { weatherTabId } = await chrome.storage.local.get('weatherTabId');
   let tab = weatherTabId && await chrome.tabs.get(weatherTabId).catch(() => null);
+  // Retain ownership across login/other redirects. A failed background read
+  // must not abandon its tab and create another one every 30 seconds.
+  if (tab && (tab.pendingUrl || tab.url) !== WEATHER_URL) {
+    throw new Error('司空气象页面已跳转，请在现有页面完成登录后打开泰州项目天气页，或关闭该页面后刷新天气');
+  }
   if (tab?.url === WEATHER_URL) {
     // reload() resolves when navigation is requested, not when the new document
     // is ready. tabs.get() can still report the old document as complete then.

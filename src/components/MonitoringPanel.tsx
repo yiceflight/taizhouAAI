@@ -188,6 +188,7 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
     {data?.error && <div className="notice warning" role="alert"><strong>最近一次同步未完成</strong><p>{data.error}</p>{!ready && <button className="text-button" onClick={onPrepare}>重新检查环境</button>}</div>}
     <section id="monitoring-task-details" className={`task-details ${pending ? 'task-callout' : 'data-card'}`} aria-label="巡查任务详情">
       <div className="task-panel-heading"><div><h3>巡查任务</h3><p>当前策略、触发条件和执行状态</p></div><button type="button" className="text-button monitoring-route-summary" onClick={onSettings} aria-label="去设置：巡查策略">去设置 →</button></div>
+      <DroneStatus data={data} ready={flightReady} started={started} busy={busy} action={action} onFlight={onFlight} />
       <div className="task-policy-grid" role="table" aria-label="巡查策略">
         <div className="task-policy-row task-policy-header" role="row">
           <span role="columnheader">规则项</span>
@@ -233,7 +234,6 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
         </div>
       </div>
       <div className="task-policy-note"><span aria-hidden="true">i</span><p>{manualConfirmation ? '执行流程：已配置指标任一项超过阈值 → 填写巡查计划 → 工作人员确认 → 执行起飞。' : `执行流程：已配置指标任一项超过阈值 → 填写巡查计划 → 延迟 ${settings.takeoffDelayMinutes} 分钟 → 自动起飞。`} 天气用于任务记录和风向选线，是否允许起飞由大疆后台决定；禁飞时段不提交起飞请求。</p></div>
-      <DroneStatus data={data} ready={flightReady} started={started} busy={busy} action={action} onFlight={onFlight} />
       {pending && plan && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>{plan.sourceHour && <p>绑定小时数据：{plan.sourceHour.slice(0, 16)}（北京时间）</p>}
         {plan.status === 'uncertain' && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
       </div>}

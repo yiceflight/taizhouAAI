@@ -305,7 +305,7 @@ test('a canceled browser review cannot reach the final confirmation', async()=>{
   assert.equal(evaluations,0);
 });
 
-test('a missing review panel cannot reach the final confirmation', async()=>{
+test('a missing review panel does not block automatic final confirmation', async()=>{
   const { readFile }=await import('node:fs/promises');
   const worker=await readFile(new URL('../extension/src/service-worker.js',import.meta.url),'utf8');
   const source=worker.slice(worker.indexOf('async function submitFlight(job)'),worker.indexOf('async function openPreparedFlight(job)'));
@@ -317,13 +317,13 @@ test('a missing review panel cannot reach the final confirmation', async()=>{
   const chrome={
     storage:{local:{get:async keys=>Object.fromEntries(keys.map(k=>[k,stored[k]])),set:async values=>Object.assign(stored,values)}},
     tabs:{get:async()=>({id:42,url:PLAN_URL+'/create-plan'}),update:async()=>{},sendMessage:async(_tab,message)=>({ok:message.type==='flight.review.close'})},
-    debugger:{attach:async()=>{},detach:async()=>{},sendCommand:async()=>{evaluations++;throw Error('must not submit')}},
+    debugger:{attach:async()=>{},detach:async()=>{},sendCommand:async()=>{evaluations++;return {status:'submitted',submitted:true,name:job.name,url:PLAN_URL}}},
   };
   const debuggerSession={acquire:async tabId=>{await chrome.debugger.attach({tabId},'1.3');return true},release:async(tabId,attached)=>{if(attached)await chrome.debugger.detach({tabId})}};
   const execute=runInNewContext(`let capturing=false; ${source}; submitFlight`,{chrome,debuggerSession,Date,JSON,PLAN_URL,PLAN_RECIPE,validateSubmitJob,fillFlightPlan,readFlightSubmissionIssue,evaluationValue:v=>v});
-  await assert.rejects(execute({...job,type:'dji-submit',submit:true}),/面板已消失/);
-  assert.equal(evaluations,0);
-  assert.equal(stored[`flight-submit-${job.eventId}`],undefined);
+  await execute({...job,type:'dji-submit',submit:true});
+  assert.equal(evaluations,1);
+  assert.ok(stored[`flight-submit-${job.eventId}`]);
 });
 
 test('completed flight reads actual minute times, ignores planned times, and handles midnight', async () => {

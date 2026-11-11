@@ -1,7 +1,7 @@
 import { createManagedChrome } from './managed-tabs.js';
 const chrome = createManagedChrome(globalThis.chrome);
 import { readOnlyJob, createReadScheduler } from './read-scheduler.js';
-import { collectDjiWeather, openDjiWeather, WEATHER_READ_TIMEOUT_MS } from './dji-weather.js';
+import { collectDjiWeather, openDjiWeather, WEATHER_READ_TIMEOUT_MS, WEATHER_URL } from './dji-weather.js';
 import { checkSiteHealth, captureHealth, openAirinsForHealth, openDjiForHealth, prioritizeHealthJobs } from './site-health.js';
 import { readDjiTasks } from './dji-tasks.js';
 import { createTaskTabManager, waitForTaskList } from './task-tab.js';
@@ -147,6 +147,35 @@ async function cleanupExpiredReportTabs() {
   }
 }
 
+// Tabs created by older workers can outlive their storage record when Chrome
+// updates/restarts the extension.  Keep only the tabs that are still owned by
+// a live operation and close known background pages that are otherwise
+// impossible to distinguish from the report/plan pages left by the worker.
+async function cleanupOrphanTabs() {
+  const all = await chrome.storage.local.get(null).catch(() => ({}));
+  const keep = new Set();
+  for (const [key, value] of Object.entries(all)) {
+    if (key === 'weatherTabId' || key === 'flight-task-sync-tab' || key === 'flight-monitor-tab'
+      || /^flight-[a-f0-9-]{36}$/.test(key)) {
+      if (Number.isInteger(value)) keep.add(value);
+    }
+    if (key.startsWith(REPORT_TAB_PREFIX)) {
+      const id = Number.isInteger(value) ? value : value?.tabId;
+      if (Number.isInteger(id)) keep.add(id);
+    }
+  }
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  const isOwnedBackgroundPage = url => {
+    if (!url) return false;
+    return (url.startsWith(`${PLAN_URL}/create-plan`) || url === PLAN_URL
+      || (url.startsWith('https://fh.dji.com/') && url.includes('#/media'))
+      || url.startsWith(WEATHER_URL)
+      || /^https:\/\/aai\.airins\.cn\/sniff\/HistoryCloud\?missionId=/.test(url));
+  };
+  await Promise.all(tabs.filter(tab => !keep.has(tab.id) && isOwnedBackgroundPage(tab.url))
+    .map(tab => chrome.tabs.remove(tab.id).catch(() => {})));
+}
+
 async function capture(tabId, job) {
   if (job?.type === 'flight-dji-list' && job.closeOnly === true) return closeCachedReportTab(job);
   if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId, {progress:job.healthProgress, deadline:job.expiresAt, canReload: () => !capturing});
@@ -256,8 +285,10 @@ async function prepareFlight(job) {
     ].map(([label, value, check]) => ({ label, value, check: check || label }));
     if (job.autoSubmit) {
       await chrome.storage.local.set({ [reviewKey]: { tabId, startedAt: null, canceled: false } });
-      const panel = await chrome.tabs.sendMessage(tabId, { type: 'flight.review.start', eventId: job.eventId, name: job.name, autoSubmit: true, fields });
-      if (!panel?.ok) throw new Error('司空核对面板无法显示，已停止自动确认');
+      // The overlay is informational. Existing plan tabs can still contain an
+      // older content script after a Chrome extension update; that must never
+      // turn an automatic flight into a manual intervention.
+      await chrome.tabs.sendMessage(tabId, { type: 'flight.review.start', eventId: job.eventId, name: job.name, autoSubmit: true, fields }).catch(() => {});
     }
     const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
       expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route, routeId: job.routeId, folderPath: job.folderPath})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)})`,
@@ -271,8 +302,7 @@ async function prepareFlight(job) {
       if (review?.canceled) throw new Error('用户已取消本次作业');
       if (!fields.every(field => result.verified?.includes(field.check))) throw new Error('司空核对面板字段未全部通过');
       await chrome.storage.local.set({ [reviewKey]: { ...review, startedAt: Date.now() } });
-      const panel = await chrome.tabs.sendMessage(tabId, { type: 'flight.review.verified', eventId: job.eventId, verified: result.verified });
-      if (!panel?.ok) throw new Error('司空核对面板无法更新，已停止自动确认');
+      await chrome.tabs.sendMessage(tabId, { type: 'flight.review.verified', eventId: job.eventId, verified: result.verified }).catch(() => {});
     }
     prepared = true;
     return result;
@@ -300,7 +330,6 @@ async function submitFlight(job) {
     attached = await debuggerSession.acquire(tabId);
     const reviewKey = `flight-review-${job.eventId}`;
     const review = (await chrome.storage.local.get([reviewKey]))[reviewKey];
-    if (!review?.startedAt || review.tabId !== tabId) throw new Error('司空核对面板状态缺失，未自动确认');
     if (review?.canceled) throw new Error('用户已取消本次作业');
     if (review?.startedAt) {
       const remaining = Math.max(0, 30000 - (Date.now() - review.startedAt));
@@ -308,8 +337,9 @@ async function submitFlight(job) {
       const afterWait = (await chrome.storage.local.get([reviewKey]))[reviewKey];
       if (afterWait?.canceled) throw new Error('用户已取消本次作业');
     }
-    const panel = await chrome.tabs.sendMessage(tabId, { type: 'flight.review.check', eventId: job.eventId });
-    if (!panel?.ok) throw new Error('司空核对面板已消失，未自动确认');
+    // Automatic submission is governed by the native scheduler and the
+    // verified form receipt. The content-script overlay may be absent on a
+    // pre-update tab and is deliberately not a submission gate.
     // Persist BEFORE any potentially executing script. A lost receipt or worker
     // restart must never cause another click for the same event.
     await chrome.storage.local.set({ [claim]: { attemptedAt: Date.now() } });
@@ -511,7 +541,7 @@ async function heartbeat() {
     }
   }
 }
-function start() { void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 }); void cleanupExpiredReportTabs(); void heartbeat(); }
+function start() { void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 }); void cleanupExpiredReportTabs(); void cleanupOrphanTabs(); void heartbeat(); }
 chrome.runtime.onInstalled.addListener(start);
 chrome.runtime.onStartup.addListener(start);
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === "desktop-heartbeat") void heartbeat(); });

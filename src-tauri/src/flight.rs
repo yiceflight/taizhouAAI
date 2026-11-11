@@ -397,6 +397,9 @@ fn restrict(db: &Connection, event: &mut Event, reason: String) -> Result<(), St
     save(db, event)
 }
 fn auto_handled_for_hour(db: &Connection, hour: &str) -> Result<bool, String> {
+    if setting(db, &format!("flight_retry_allowed:{hour}"))?.is_some() {
+        return Ok(false);
+    }
     if setting(db, &format!("flight_handled:{hour}"))?.is_some() {
         return Ok(true);
     }
@@ -560,6 +563,27 @@ fn observe_with_weather(
     // Failed means no launch request was sent. All sources, including manual
     // and preview attempts, release their slot on the next valid source hour.
     // Keep the original receipt and handled-hour guards in the same transaction.
+    // Older extension workers could leave an automatic event failed solely
+    // because their review overlay was missing after an update. The form was
+    // never submitted in that case, so a compatible automatic configuration
+    // can safely release that same hour once and let the current worker retry.
+    if let Some(event) = current(&tx)?.filter(|e| {
+        !settings.require_manual_confirmation
+            && e.status == "failed"
+            && e.source == "auto"
+            && e.source_hour.as_deref() == Some(time.as_str())
+            && (e.potassium.is_some_and(|value| value > settings.potassium_threshold)
+                || e.pm25.is_some_and(|value| value > settings.pm25_threshold))
+            && e.error.as_deref().is_some_and(|message| message.contains("核对面板"))
+    }) {
+        archive(&tx, &event)?;
+        tx.execute("DELETE FROM monitor_settings WHERE key='flight_event'", [])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM monitor_settings WHERE key=?1", [format!("flight_handled:{time}")])
+            .map_err(|e| e.to_string())?;
+        put(&tx, &format!("flight_retry_allowed:{time}"), "true")?;
+        put(&tx, "flight_episode", "")?;
+    }
     if let Some(event) = current(&tx)?.filter(|e| e.status == "failed") {
         // Manual creation timestamps include minutes/seconds; monitoring::parse
         // deliberately accepts only whole-hour observation timestamps.
@@ -640,6 +664,8 @@ fn observe_with_weather(
     );
     put(&tx, "flight_episode", &time)?;
     put(&tx, &format!("flight_handled:{time}"), &event.id)?;
+    tx.execute("DELETE FROM monitor_settings WHERE key=?1", [format!("flight_retry_allowed:{time}")])
+        .map_err(|e| e.to_string())?;
     replace_current(&tx, &event)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(Some(event))
@@ -2392,6 +2418,19 @@ mod tests {
             Some(next.id.as_str())
         );
         assert!(observe(&mut db, at, true).unwrap().is_none());
+    }
+    #[test]
+    fn automatic_mode_recovers_same_hour_failure_from_old_review_overlay() {
+        let mut db = db();
+        let mut failed = failed_automatic(&mut db);
+        failed.error = Some("司空核对面板状态缺失，未自动确认".into());
+        save(&db, &failed).unwrap();
+        let at = parse("2026-10-08 19:00:00").unwrap();
+        let next = observe(&mut db, at, true).unwrap().unwrap();
+        assert_ne!(next.id, failed.id);
+        assert_eq!(next.status, "countdown");
+        assert!(setting(&db, &format!("flight_history:{}", failed.id)).unwrap().is_some());
+        assert_eq!(setting(&db, "flight_episode").unwrap().as_deref(), Some(next.source_hour.as_deref().unwrap()));
     }
     #[test]
     fn released_failure_creates_next_hour_even_when_weather_is_unavailable() {

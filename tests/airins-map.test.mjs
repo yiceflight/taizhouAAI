@@ -29,3 +29,10 @@ test('serialized map capture does not depend on module scope helpers',()=>{
  assert.match(source,/const historyRouteMatches/);
  assert.doesNotMatch(source,/airinsHistoryRouteMatches\(/);
 });
+test('serialized map capture automatically retries clipped trajectories',()=>{
+ const source=airinsMap.toString();
+ assert.match(source,/const zoomOut = async \(steps\)/);
+ assert.match(source,/for \(let attempt = 0; attempt < 4; attempt\+\+\)/);
+ assert.match(source,/recoveryAttempt:attempt/);
+ assert.match(source,/finally \{\s*\/\/ Also clean up malformed/);
+});

@@ -25,6 +25,7 @@ let prepare: ReturnType<typeof vi.fn>;
 const button = (text: string) => [...document.querySelectorAll('button')].find(b => b.textContent === text)!;
 const click = async (text: string) => { await act(async () => button(text).click()); };
 const render = async (ready = true, browserTabs = tabs) => { await act(async () => root.render(<FlightReportPanel tabs={browserTabs} ready={ready} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />)); };
+const useStableTestClock = () => vi.useFakeTimers({ now: Date.parse('2026-11-12T12:00:00+08:00') });
 beforeEach(() => {
   const { window } = parseHTML('<html><body><div id="root"></div></body></html>');
   window.HTMLElement.prototype.showModal = function () { this.setAttribute('open', ''); };
@@ -582,9 +583,16 @@ it('keeps cleared missions and reports hidden after reload while showing new tas
 
 describe('DJI scheduled flight automation', () => {
   afterEach(() => vi.useRealTimers());
-  const external = (offset = 0) => ({ mission: { ...first, missionId: 0, missionName: '每日7时南侧火点巡飞', startTime: first.startTime - offset, endTime: first.endTime - offset }, status: '执行成功', mediaReady: true });
+  // Keep the fixture on the current Beijing date even when the suite runs
+  // across midnight. The production rule is intentionally date-based, so a
+  // module-level `Date.now() - 2h` fixture would become yesterday after 00:00
+  // and make these timer tests fail intermittently.
+  const external = (offset = 0) => {
+    const endTime = Date.now() - 60 * 60 * 1000 - offset;
+    return { mission: { ...first, missionId: 0, missionName: '每日7时南侧火点巡飞', startTime: endTime - 60 * 60 * 1000, endTime }, status: '执行成功', mediaReady: true };
+  };
   it('limits automatic report generation to today while keeping older tasks manual', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const today = external();
     const yesterday = external(86400000);
     expect(isTodayPatrolTask({ key: 'today', mission: today.mission, report: null, djiTask: today }, Date.now())).toBe(true);
@@ -604,7 +612,7 @@ describe('DJI scheduled flight automation', () => {
     expect(document.body.textContent).toContain('生成报告');
   });
   it('emails each automatically generated report and reports delivery errors on its task', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const today = external();
     const settings = { recipients: ['first@example.com', 'second@example.com'], username: 'report@dayialgo.com', configured: true };
     const original = ipc.invoke.getMockImplementation()!;
@@ -623,7 +631,7 @@ describe('DJI scheduled flight automation', () => {
     expect(document.querySelector('tbody tr')?.textContent).toContain('报告已生成，但邮件发送失败：SMTP 发送失败或结果未确认');
   });
   it('synchronizes older Airins pages to associate historical DJI executions', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const task = external(7 * 86400000);
     const sampling = { ...task.mission, missionId: 88, startTime: task.mission.startTime + 78000 };
     const original = ipc.invoke.getMockImplementation()!;
@@ -638,7 +646,7 @@ describe('DJI scheduled flight automation', () => {
     expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
   });
   it('serializes automatic DJI collection because all jobs share one media tab', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const firstTask = external();
     const secondTask = { ...external(15 * 60000), mission: { ...external(15 * 60000).mission, missionName: '每日8时南侧火点巡飞' } };
     let active = 0;
@@ -660,7 +668,7 @@ describe('DJI scheduled flight automation', () => {
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
   });
   it.each([false, true])('generates an external flight without Airins (noMedia=%s), then reuses the report', async noMedia => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
       if (command === 'sync_dji_report_tasks') return { tasks: [{ ...external(), noMedia }], skipped: 0, mediaTabId: 2 };
@@ -679,7 +687,7 @@ describe('DJI scheduled flight automation', () => {
     expect(document.querySelector('dialog')).toBeNull();
   });
   it('retries failed collection and waits for upload completion, without stopping other flights', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     let fail = true;
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
@@ -699,7 +707,7 @@ describe('DJI scheduled flight automation', () => {
   });
   it.each(['司空媒体无照片：已完整解析 2 个视频文件，本航次未发现照片', '司空媒体解析失败：文件数量未核对完整', '照片尚未上传'])(
     'stops automatic retries after completed-upload media outcome: %s', async failure => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     let task = { ...external(), mediaFolderId: 123, mediaUploadedCount: 2, mediaExpectedCount: 2 };
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
@@ -737,7 +745,7 @@ describe('DJI scheduled flight automation', () => {
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(3);
   });
   it('explains a media-ready partial execution retry as a media-page switch issue', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const original = ipc.invoke.getMockImplementation()!;
     const partial = { ...external(), status: '部分执行', partialReason: '2026-10-17 15:25:04 飞行器执行飞行任务过程中低电量返航，无法完成航线飞行（错误码：321773）' };
     ipc.invoke.mockImplementation(async (command, args) => {
@@ -753,7 +761,7 @@ describe('DJI scheduled flight automation', () => {
     expect(document.querySelector('tbody')?.textContent).not.toContain('等待媒体上传结束');
   });
   it('upgrades a partial report when sampling recovers, retries failures, and stops once complete', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     const task = external();
     let failUpgrade = true;
     const original = ipc.invoke.getMockImplementation()!;
@@ -783,7 +791,7 @@ describe('DJI scheduled flight automation', () => {
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(2);
   });
   it('recovers automatic reports after initial saved-report loading fails', async () => {
-    vi.useFakeTimers(); reports = []; missions = [];
+    useStableTestClock(); reports = []; missions = [];
     let firstRead = true;
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => {
@@ -882,7 +890,7 @@ describe('report interaction during background work', () => {
     await click('生成并保存 Word 快报');
   });
   it('pauses automatic collection when the user opens the dialog during synchronization', async () => {
-    vi.useFakeTimers();
+    useStableTestClock();
     const sync = deferred<unknown>();
     const original = ipc.invoke.getMockImplementation()!;
     ipc.invoke.mockImplementation(async (command, args) => command === 'sync_dji_report_tasks' ? sync.promise : original(command, args));
@@ -914,8 +922,11 @@ describe('report interaction during background work', () => {
     expect(ipc.invoke).toHaveBeenLastCalledWith('open_flight_report', { id: 'new-version' });
   });
   it.each([false, true])('gives a queued manual report priority and supports canceling its wait (cancel=%s)', async cancel => {
-    vi.useFakeTimers(); reports = []; missions = [];
-    const task = (name: string, offset: number) => ({ taskId: name, mission: { ...first, missionId: 0, missionName: name, startTime: first.startTime - offset, endTime: first.endTime - offset }, status: '执行成功', mediaReady: true });
+    useStableTestClock(); reports = []; missions = [];
+    const task = (name: string, offset: number) => {
+      const endTime = Date.now() - 60 * 60 * 1000 - offset;
+      return { taskId: name, mission: { ...first, missionId: 0, missionName: name, startTime: endTime - 60 * 60 * 1000, endTime }, status: '执行成功', mediaReady: true };
+    };
     const tasks = [task('后台首份报告', 0), task('手动选择的报告', 15 * 60000), task('下一份自动报告', 30 * 60000)];
     const collected = deferred<unknown>();
     const original = ipc.invoke.getMockImplementation()!;

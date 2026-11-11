@@ -65,36 +65,86 @@ export async function airinsMap(job, crop) {
   const palette = [...(gradient || '').matchAll(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/g)].map(m=>m.slice(1).map(Number));
   const labels = [...(legend?.querySelectorAll('.value') || [])].map(e=>e.textContent.trim());
   if (palette.length < 2 || labels.length !== 2) throw new Error('未取得平台浓度色标');
-  // Parameter labels update before the WebGL layer; wait for rendered pixels.
-  let previous = '', stable = 0;
-  await wait(() => {
-    const map = document.querySelector('canvas.mapboxgl-canvas');
-    if (!map?.width || !map.height) return false;
-    const current = map.toDataURL('image/png');
-    stable = current === previous ? stable + 1 : 0; previous = current;
-    return stable >= 3;
-  });
-  document.querySelector('button.image-preview-control')?.click();
-  const img = await wait(()=>{const e=document.querySelector('.image-preview-content img');return visible(e)&&e.complete&&e.naturalWidth>0&&e;});
-  const source = img.src;
-  if (!source.startsWith('data:image/png;base64,')) throw new Error('平台导出图像格式无效');
-  const canvas = document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
-  if(canvas.width*canvas.height>20000000)throw new Error('平台地图图像过大');
-  const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0);
-  const rect=crop(ctx.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,palette);
-  const out=document.createElement('canvas');out.width=Math.max(600,rect.width);out.height=Math.round(rect.height*out.width/rect.width)+100;
-  const c=out.getContext('2d');c.fillStyle='white';c.fillRect(0,0,out.width,out.height);
-  c.drawImage(canvas,rect.x,rect.y,rect.width,rect.height,0,0,out.width,out.height-100);
-  // Reproduce the actual platform legend (including its bounds), not a new scale.
-  const bar=c.createLinearGradient(160,0,out.width-50,0);
-  palette.slice().reverse().forEach((rgb,i)=>bar.addColorStop(i/(palette.length-1),`rgb(${rgb.join(',')})`));
-  c.fillStyle=bar;c.fillRect(160,out.height-70,out.width-210,14);
-  c.fillStyle='#222';c.font='20px sans-serif';c.fillText('PM2.5 (µg/m³)',16,out.height-55);
-  c.fillText(labels[0],160,out.height-28);c.textAlign='right';c.fillText(labels[1],out.width-50,out.height-28);
-  document.querySelector('.image-preview-close')?.dispatchEvent(new MouseEvent('click',{bubbles:true}));
-  return {method:'airins-export-crop-v1',missionId:job.missionId,sourceChannel:'ad_9',capturedAt:Date.now(),width:out.width,height:out.height,
-    crop:rect,originalWidth:canvas.width,originalHeight:canvas.height,paddingRatio:0.1,legendLabels:labels,
-    dataUrl:out.toDataURL('image/png'),originalDataUrl:source};
+  const waitMapStable = async () => {
+    // Parameter labels update before the WebGL layer; wait for rendered pixels.
+    let previous = '', stable = 0;
+    await wait(() => {
+      const map = document.querySelector('canvas.mapboxgl-canvas');
+      if (!map?.width || !map.height) return false;
+      const current = map.toDataURL('image/png');
+      stable = current === previous ? stable + 1 : 0; previous = current;
+      return stable >= 3;
+    });
+  };
+  const closePreview = async () => {
+    document.querySelector('.image-preview-close')?.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+    // Let the modal teardown finish before the next zoom or export. Without
+    // this small yield some platform builds leave the old image node visible.
+    await new Promise(resolve => setTimeout(resolve, 250));
+  };
+  const zoomOut = async (steps) => {
+    // Airins has shipped several map-control DOMs. Prefer its own zoom-out
+    // control, then fall back to the Mapbox canvas wheel handler. This keeps
+    // the recovery inside the page and avoids asking the operator to resize
+    // the map by hand.
+    const controls = ['.mapboxgl-ctrl-zoom-out','button[aria-label="Zoom out"]','button[title*="缩小"]','button[aria-label*="缩小"]'];
+    let clicked = 0;
+    for (const selector of controls) {
+      const button = [...document.querySelectorAll(selector)].find(visible);
+      if (!button) continue;
+      for (let i = 0; i < steps; i++) { button.click(); clicked++; await new Promise(resolve => setTimeout(resolve, 180)); }
+      break;
+    }
+    if (!clicked) {
+      const map = document.querySelector('canvas.mapboxgl-canvas');
+      if (!map) throw new Error('未找到浓度地图缩放控件');
+      for (let i = 0; i < steps; i++) {
+        map.dispatchEvent(new WheelEvent('wheel', {bubbles:true,cancelable:true,deltaY:800,deltaMode:0}));
+        await new Promise(resolve => setTimeout(resolve, 180));
+      }
+    }
+    await waitMapStable();
+  };
+  const exportMap = async (attempt) => {
+    await waitMapStable();
+    document.querySelector('button.image-preview-control')?.click();
+    try {
+      const img = await wait(()=>{const e=document.querySelector('.image-preview-content img');return visible(e)&&e.complete&&e.naturalWidth>0&&e;});
+      const source = img.src;
+      if (!source.startsWith('data:image/png;base64,')) throw new Error('平台导出图像格式无效');
+      const canvas = document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
+      if(canvas.width*canvas.height>20000000)throw new Error('平台地图图像过大');
+      const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0);
+      const rect=crop(ctx.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,palette);
+      const out=document.createElement('canvas');out.width=Math.max(600,rect.width);out.height=Math.round(rect.height*out.width/rect.width)+100;
+      const c=out.getContext('2d');c.fillStyle='white';c.fillRect(0,0,out.width,out.height);
+      c.drawImage(canvas,rect.x,rect.y,rect.width,rect.height,0,0,out.width,out.height-100);
+      // Reproduce the actual platform legend (including its bounds), not a new scale.
+      const bar=c.createLinearGradient(160,0,out.width-50,0);
+      palette.slice().reverse().forEach((rgb,i)=>bar.addColorStop(i/(palette.length-1),`rgb(${rgb.join(',')})`));
+      c.fillStyle=bar;c.fillRect(160,out.height-70,out.width-210,14);
+      c.fillStyle='#222';c.font='20px sans-serif';c.fillText('PM2.5 (µg/m³)',16,out.height-55);
+      c.fillText(labels[0],160,out.height-28);c.textAlign='right';c.fillText(labels[1],out.width-50,out.height-28);
+      return {method:'airins-export-crop-v1',missionId:job.missionId,sourceChannel:'ad_9',capturedAt:Date.now(),width:out.width,height:out.height,
+        crop:rect,originalWidth:canvas.width,originalHeight:canvas.height,paddingRatio:0.1,recoveryAttempt:attempt,legendLabels:labels,
+        dataUrl:out.toDataURL('image/png'),originalDataUrl:source};
+    } finally {
+      // Also clean up malformed, oversized, and timeout failures before the
+      // next automatic attempt so a stale preview cannot be captured again.
+      await closePreview();
+    }
+  };
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { return await exportMap(attempt); }
+    catch (error) {
+      lastError = error;
+      const message = error?.message || String(error);
+      if (!/浓度轨迹触及地图边缘|未可靠识别完整浓度轨迹/.test(message) || attempt === 3) throw error;
+      await zoomOut(attempt + 1);
+    }
+  }
+  throw lastError || new Error('浓度轨迹图导出失败');
 }
 
 export async function captureAirinsMap(debuggerApi, tabId, missionId) {

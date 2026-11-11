@@ -26,7 +26,8 @@ export function SetupPanel({ bridge, state, busy, onCheck, openSite }: Props) {
     const health = state?.sites.find(s => s.id === site.id);
     const progress = pluginReady ? state?.checks?.find(check => check.id === site.id) : undefined;
     const checking = !!progress || state?.checking === true && (!health || health.state === 'unchecked' || health.state === 'not_open');
-    const label = checking ? health?.state === 'ready' ? '复查中' : '验证中' : health ? siteLabels[health.state] : '待验证';
+    const pageBroken = health?.reason === 'blank_page' || health?.reason === 'renderer_timeout';
+    const label = checking ? health?.state === 'ready' ? '复查中' : '验证中' : pageBroken ? '页面异常' : health ? siteLabels[health.state] : '待验证';
     const message = progress?.message || (checking ? '正在验证登录与业务访问' : health?.message || '等待检测');
     const purpose = site.id === 'sniff' ? '检查可飞历史任务列表是否可读取' : site.id === 'dji' ? '检查司空账号登录与泰州项目访问' : '检查泰州市监测指标目录是否可读取';
     return <article className="health-row" key={site.id}>

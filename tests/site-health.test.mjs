@@ -335,6 +335,17 @@ test('all three sites reload after wake timeout and verify recovery', async () =
     assert.deepEqual(f.activations,[1,2]);
   }
 });
+
+test('renderer timeout triggers an immediate page recovery and reports a useful state', async () => {
+  const f = wakeFixture({url:dji, active:true}); let reloads = 0;
+  f.chrome.tabs.reload = async () => { reloads++; f.tabs.get(1).status = 'complete'; };
+  const result = await captureHealth(f.chrome, async () => {
+    throw Error('后台页面读取超时，请检查网站或网络后重试');
+  }, 1, f.timing);
+  assert.equal(reloads, 1);
+  assert.equal(result.reason, 'renderer_timeout');
+  assert.match(result.message, /白屏|重新登录/);
+});
 test('recovery does not reload transient blank, auth, permission or service errors', async () => {
   for (const url of [air,dji,map]) for (const state of ['ready','login_required','forbidden','error']) {
     const f=wakeFixture({url,active:true});let calls=0;

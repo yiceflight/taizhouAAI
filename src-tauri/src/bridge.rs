@@ -52,6 +52,11 @@ fn test_session_error(total: usize, compatible: usize) -> String {
 }
 
 const TTL: Duration = Duration::from_secs(75);
+// Keep background browser reads bounded. Each read owns a renderer/CDP
+// evaluation, and an unbounded batch can exhaust memory on low-spec Windows
+// machines and leave Chrome tabs blank or unresponsive.
+const MAX_PARALLEL_READS: usize = 3;
+const MAX_PARALLEL_REPORTS: usize = 1;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -327,11 +332,11 @@ fn claim_parallel_reads(inner: &mut Inner, session: &str, worker_busy: bool) -> 
         .map(|(id, p)| (id.clone(), job_priority(&p.job), p.queued_at, read_job(&p.job), report_job(&p.job)))
         .collect();
     candidates.sort_by_key(|(_, priority, queued, _, _)| (*priority, *queued));
-    let mut selected: Vec<_> = candidates.iter().filter(|c| c.3).map(|c| c.0.clone()).collect();
+    let mut selected: Vec<_> = candidates.iter().filter(|c| c.3).take(MAX_PARALLEL_READS).map(|c| c.0.clone()).collect();
     if !serial_busy {
         let serial: Vec<_> = candidates.iter().filter(|c| !c.3).collect();
         if let Some(first) = serial.first() {
-            if first.4 { selected.extend(serial.iter().filter(|c| c.4).take(3).map(|c| c.0.clone())); }
+            if first.4 { selected.extend(serial.iter().filter(|c| c.4).take(MAX_PARALLEL_REPORTS).map(|c| c.0.clone())); }
             else { selected.push(first.0.clone()); }
         }
     }
@@ -368,7 +373,7 @@ fn claim_jobs(inner: &mut Inner, session: &str, single: bool, parallel_reports: 
         let active_reports = inner.pending.values()
             .filter(|pending| pending.session == session && pending.sent && report_job(&pending.job))
             .count();
-        let available_reports = 3usize.saturating_sub(active_reports);
+        let available_reports = MAX_PARALLEL_REPORTS.saturating_sub(active_reports);
         if available_reports == 0 || active_reports > 0 {
             return vec![];
         }
@@ -908,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_bypass_busy_serial_work_without_a_batch_limit_and_get_fresh_deadlines() {
+    fn reads_bypass_busy_serial_work_with_a_small_batch_and_get_fresh_deadlines() {
         let mut inner = Inner::default();
         let mut receivers = Vec::new();
         for i in 0..42 {
@@ -922,13 +927,14 @@ mod tests {
             });
         }
         let reads = claim_parallel_reads(&mut inner, "a", true);
-        assert_eq!(reads.len(), 40);
+        assert_eq!(reads.len(), MAX_PARALLEL_READS);
         assert!(reads.iter().all(|job| read_job(job) && job["expiresAt"].as_i64().unwrap() > chrono::Utc::now().timestamp_millis() + 30_000));
         assert!(!inner.pending["1"].sent, "a second submit must wait");
         assert!(receivers[2].try_recv().is_ok(), "execution timer starts on delivery");
-        assert!(claim_parallel_reads(&mut inner, "a", false).is_empty());
+        assert_eq!(claim_parallel_reads(&mut inner, "a", false).len(), MAX_PARALLEL_READS);
         inner.pending.remove("0");
-        assert_eq!(claim_parallel_reads(&mut inner, "a", false)[0]["type"], "dji-submit");
+        let next = claim_parallel_reads(&mut inner, "a", false);
+        assert!(next.iter().any(|job| job["type"] == "dji-submit"));
     }
 
     #[test]
@@ -977,7 +983,7 @@ mod tests {
         assert!(!inner.pending["expired-weather"].sent);
     }
     #[test]
-    fn parallel_report_dispatch_claims_three_media_jobs_only_after_serial_work() {
+    fn report_dispatch_claims_one_media_job_only_after_serial_work() {
         let mut inner = Inner::default();
         let future = chrono::Utc::now().timestamp_millis() + 100000;
         for (id, kind) in [("one", "flight-dji-list"), ("two", "flight-dji-image"), ("three", "flight-dji-image"), ("four", "flight-dji-image"), ("history", "dji-tasks")] {
@@ -992,9 +998,27 @@ mod tests {
         assert_eq!(serial[0]["type"], "dji-tasks");
         inner.pending.remove("history");
         let batch = claim_jobs(&mut inner, "a", true, true);
-        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.len(), 1);
         assert!(batch.iter().all(|job| report_job(job)));
         assert!(claim_jobs(&mut inner, "a", true, true).is_empty());
+    }
+
+    #[test]
+    fn parallel_read_dispatch_is_bounded_for_low_spec_browsers() {
+        let mut inner = Inner::default();
+        let future = chrono::Utc::now().timestamp_millis() + 100000;
+        for id in 0..12 {
+            let (tx, _) = oneshot::channel();
+            inner.pending.insert(id.to_string(), Pending {
+                session: "a".into(), tab_id: id, sent: false, queued_at: Instant::now(),
+                dispatched: None, execution_timeout: 35,
+                job: json!({"type":"capture", "expiresAt": future}), result: tx,
+            });
+        }
+        let batch = claim_parallel_reads(&mut inner, "a", false);
+        assert_eq!(batch.len(), MAX_PARALLEL_READS);
+        assert!(batch.iter().all(|job| read_job(job)));
+        assert_eq!(inner.pending.values().filter(|pending| pending.sent).count(), MAX_PARALLEL_READS);
     }
 
     #[test]
@@ -1031,6 +1055,7 @@ mod tests {
         });
         let mut verified = crate::readiness::SiteHealth {
             id: "map".into(), state: "ready".into(), message: "fixture".into(),
+            reason: None,
             checked_at: None, session: Some("session".into()), tab_id: Some(2), url: Some(url.into()),
         };
         assert_eq!(bridge.hourly_target(&verified).unwrap(), ("session".into(), 2));

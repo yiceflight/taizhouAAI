@@ -21,6 +21,8 @@ pub struct SiteHealth {
     pub id: String,
     pub state: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub checked_at: Option<String>,
     pub session: Option<String>,
     pub tab_id: Option<i64>,
@@ -125,6 +127,7 @@ fn empty(id: &str, state: &str, message: &str) -> SiteHealth {
         id: id.into(),
         state: state.into(),
         message: message.into(),
+        reason: None,
         checked_at: None,
         session: None,
         tab_id: None,
@@ -411,6 +414,7 @@ async fn check_site(
                     {
                         health.state = status.into();
                         health.message = message.chars().take(180).collect();
+                        health.reason = raw["reason"].as_str().map(str::to_owned);
                     }
                 }
                 health.url = actual_url.map(str::to_owned);

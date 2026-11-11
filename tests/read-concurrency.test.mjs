@@ -5,7 +5,7 @@ import { createDebuggerSession } from '../extension/src/debugger-session.js';
 import { evaluateBackgroundRead } from '../extension/src/background-read.js';
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const tick = () => new Promise(resolve => setImmediate(resolve));
-test('more than eight reads run while serial work is blocked, including later arrivals', async () => {
+test('background reads stay bounded while serial work is blocked', async () => {
   const gate = deferred(), started = [], done = [];
   const scheduler = createReadScheduler(async job => {
     started.push(job.id);
@@ -17,8 +17,8 @@ test('more than eight reads run while serial work is blocked, including later ar
   const jobs = Array.from({ length: 40 }, (_, id) => ({ id, type: 'site-health' }));
   scheduler.dispatch(jobs); scheduler.dispatch(jobs);
   await tick();
-  assert.equal(started.length, 42);
-  assert.equal(done.length, 40);
+  assert.equal(started.length, 4);
+  assert.equal(done.length, 2);
   assert.equal(scheduler.busy(), true);
   gate.resolve(); await tick();
   assert.equal(scheduler.active(), false);

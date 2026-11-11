@@ -41,7 +41,26 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
   };
   const read = async () => {
     await report('reading');
-    return captureStableHealth(chrome, capture, tabId, timing);
+    try {
+      return await captureStableHealth(chrome, capture, tabId, timing);
+    } catch (error) {
+      // A wedged/white renderer never returns the normal blank-page result;
+      // CDP only reports a read timeout. Recover it in this same health pass
+      // so the UI can distinguish a broken page from an expired login instead
+      // of waiting for the next 30–45 second poll cycle.
+      if (!/后台页面读取超时/.test(error?.message || '')) throw error;
+      try {
+        if (await reload()) return await captureStableHealth(chrome, capture, tabId, timing);
+      } catch (recoveryError) {
+        if (/页面已切换|验证期间页面已切换/.test(recoveryError?.message || '')) throw recoveryError;
+      }
+      return {
+        url: original.url,
+        state: 'error',
+        reason: 'renderer_timeout',
+        message: '页面读取超时，已检查页面并尝试刷新；请确认是否白屏或需要重新登录',
+      };
+    }
   };
   // Persist the cooldown across service-worker suspension. Only recover the
   // business page, never a login page or a page the user navigated to.

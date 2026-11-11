@@ -34,8 +34,10 @@ const readScheduler = createReadScheduler(executeJob, () => void heartbeat());
 const taskTabFor = createTaskTabManager(chrome);
 const monitorTabFor = createTaskTabManager(chrome, { key: 'flight-monitor-tab' });
 const reportTabs = new Map();
+const reportTabInflight = new Map();
 const REPORT_MEDIA_ROOT = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/media?page=1&size=50';
 const REPORT_TAB_PREFIX = 'flight-report-tab:';
+const REPORT_TAB_TTL_MS = 2 * 60 * 60 * 1000;
 
 const reportKey = job => typeof job?.mediaKey === 'string' && /^[\w:.-]{1,240}$/.test(job.mediaKey) ? job.mediaKey : null;
 async function waitTab(tabId, timeout = 20000) {
@@ -51,16 +53,27 @@ async function waitTab(tabId, timeout = 20000) {
 async function reportTabFor(job) {
   const key = reportKey(job);
   if (!key) throw new Error('巡飞报告媒体任务缺少有效任务标识');
+  const inflight = reportTabInflight.get(key);
+  if (inflight) return inflight;
+  const task = (async () => {
   const savedKey = REPORT_TAB_PREFIX + key;
-  const existing = reportTabs.get(key) || (await chrome.storage.local.get(savedKey))[savedKey];
+  const stored = (await chrome.storage.local.get(savedKey))[savedKey];
+  const existing = reportTabs.get(key) || (Number.isInteger(stored) ? stored : stored?.tabId);
   if (Number.isInteger(existing)) {
     const tab = await chrome.tabs.get(existing).catch(() => null);
     if (tab?.url?.startsWith('https://fh.dji.com/') && tab.url.includes('#/media')) {
       await waitTab(tab.id);
       reportTabs.set(key, existing);
+      await chrome.storage.local.set({ [savedKey]: { tabId: existing, lastUsedAt: Date.now() } });
       return { key, tab };
     }
+    // The persisted id belongs to a report tab that was navigated away from
+    // the media page. It is still ours, so remove it instead of accumulating
+    // another hidden renderer on every retry.
+    await chrome.tabs.remove(existing).catch(() => {});
   }
+  reportTabs.delete(key);
+  await chrome.storage.local.remove(savedKey);
   const tab = await chrome.tabs.create({ url: REPORT_MEDIA_ROOT, active: false });
   try {
     await waitTab(tab.id);
@@ -69,8 +82,12 @@ async function reportTabFor(job) {
     throw error;
   }
   reportTabs.set(key, tab.id);
-  await chrome.storage.local.set({ [savedKey]: tab.id });
+  await chrome.storage.local.set({ [savedKey]: { tabId: tab.id, lastUsedAt: Date.now() } });
   return { key, tab };
+  })();
+  reportTabInflight.set(key, task);
+  try { return await task; }
+  finally { if (reportTabInflight.get(key) === task) reportTabInflight.delete(key); }
 }
 async function closeReportTab(key, tabId) {
   if (!key) return;
@@ -105,10 +122,29 @@ async function enterJiangsuBusiness(tabId) {
 async function closeCachedReportTab(job) {
   const key = reportKey(job);
   if (!key) throw new Error('巡飞报告媒体任务缺少有效任务标识');
-  const saved = reportTabs.get(key) || (await chrome.storage.local.get(REPORT_TAB_PREFIX + key))[REPORT_TAB_PREFIX + key];
+  const stored = (await chrome.storage.local.get(REPORT_TAB_PREFIX + key))[REPORT_TAB_PREFIX + key];
+  const saved = reportTabs.get(key) || (Number.isInteger(stored) ? stored : stored?.tabId);
   const tab = Number.isInteger(saved) ? await chrome.tabs.get(saved).catch(() => null) : null;
   await closeReportTab(key, tab?.url?.startsWith('https://fh.dji.com/') && tab.url.includes('#/media') ? saved : undefined);
   return { closed: true };
+}
+
+async function cleanupExpiredReportTabs() {
+  const all = await chrome.storage.local.get(null).catch(() => ({}));
+  const now = Date.now();
+  for (const [key, value] of Object.entries(all)) {
+    if (!key.startsWith(REPORT_TAB_PREFIX) || !value) continue;
+    // Integer records are from the pre-TTL implementation. They have no
+    // reliable age, so treat them as orphan candidates during the next worker
+    // start; an in-flight report can safely be requeued with a fresh tab.
+    const legacy = Number.isInteger(value);
+    const tabId = legacy ? value : value?.tabId;
+    if (!Number.isInteger(tabId)) continue;
+    if (!legacy && (!Number.isFinite(value.lastUsedAt) || now - value.lastUsedAt <= REPORT_TAB_TTL_MS)) continue;
+    await chrome.tabs.remove(tabId).catch(() => {});
+    await chrome.storage.local.remove(key).catch(() => {});
+    for (const [mediaKey, current] of reportTabs) if (current === tabId) reportTabs.delete(mediaKey);
+  }
 }
 
 async function capture(tabId, job) {
@@ -475,12 +511,21 @@ async function heartbeat() {
     }
   }
 }
-function start() { void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 }); void heartbeat(); }
+function start() { void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 }); void cleanupExpiredReportTabs(); void heartbeat(); }
 chrome.runtime.onInstalled.addListener(start);
 chrome.runtime.onStartup.addListener(start);
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === "desktop-heartbeat") void heartbeat(); });
 chrome.tabs.onUpdated.addListener((_id, change) => { if (change.status || change.url) void heartbeat(); });
-chrome.tabs.onRemoved.addListener(() => void heartbeat());
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void (async () => {
+    for (const [key, current] of reportTabs) {
+      if (current !== tabId) continue;
+      reportTabs.delete(key);
+      await chrome.storage.local.remove(REPORT_TAB_PREFIX + key).catch(() => {});
+    }
+  })();
+  void heartbeat();
+});
 chrome.debugger.onDetach.addListener((source, reason) => { if (source.tabId !== undefined) debuggerSession.detached(source.tabId, reason); });
 chrome.action.onClicked.addListener(() => { debuggerSession.resume(); void heartbeat(); });
 // Only the extension's own pages can request status. Content scripts cannot request arbitrary CDP evaluation.

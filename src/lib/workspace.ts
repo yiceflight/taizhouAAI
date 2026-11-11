@@ -4,7 +4,7 @@ export type BrowserTab = { session: string; id: number; title: string; url: stri
 export type BridgeStatus = { connected: boolean; clients: number; versions: string[]; tabs: BrowserTab[]; error: string | null };
 export type ReportSummary = { id: string; createdAt: number; source: string; title: string; truncated: boolean };
 export const tabKey = (tab: BrowserTab) => `${tab.session}:${tab.id}`;
-export type SiteHealth = { id: string; state: 'blocked' | 'unchecked' | 'not_open' | 'ready' | 'login_required' | 'forbidden' | 'page_required' | 'error'; message: string; checkedAt: string | null; session: string | null; tabId: number | null; url: string | null };
+export type SiteHealth = { id: string; state: 'blocked' | 'unchecked' | 'not_open' | 'ready' | 'login_required' | 'forbidden' | 'page_required' | 'error'; message: string; reason?: string; checkedAt: string | null; session: string | null; tabId: number | null; url: string | null };
 export type Readiness = {
   checks?: { id: string; message: string; elapsedSeconds: number; remainingSeconds: number; dispatched: boolean }[];
   monitoringReady?: boolean; flightReady?: boolean; reportReady?: boolean; pluginReady: boolean; pluginMessage: string; pluginUpdateRequired: boolean; minimumExtensionVersion: string; checking: boolean; sites: SiteHealth[]; ready: boolean; started: boolean };

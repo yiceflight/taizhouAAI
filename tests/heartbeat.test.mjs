@@ -112,7 +112,7 @@ test('a frozen background read expires while heartbeats continue, then the next 
 });
 
 
-test('new protocol polls and completes unlimited reads while a serial browser job is still running', async () => {
+test('new protocol polls and completes bounded reads while a serial browser job is still running', async () => {
   const held = deferred(), entered = deferred();
   const completed = [], executed = [];
   let claims = 0;
@@ -131,9 +131,9 @@ test('new protocol polls and completes unlimited reads while a serial browser jo
   await run(); await entered.promise;
   await run();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(executed.length, 41);
-  assert.equal(completed.length, 40);
+  assert.equal(executed.length, 4);
+  assert.equal(completed.length, 3);
   held.resolve();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(completed.length, 41);
+  assert.equal(completed.length, 4);
 });

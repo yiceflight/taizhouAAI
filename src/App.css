@@ -710,3 +710,18 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 }
 
 .nav-unread-dot { position: absolute; top: 8px; right: -7px; width: 8px; height: 8px; border-radius: 50%; background: #d33b3b; pointer-events: none; }
+
+/* Folder and route levels share the existing monitoring palette. */
+.route-tree-popup { position: fixed; z-index: 20; overflow: auto; box-sizing: border-box; max-width: calc(100vw - 24px); border: 1px solid #cbdcd1; border-radius: 8px; background: #fff; color: #243d33; box-shadow: 0 8px 24px #203e3026; padding: 6px; font-size: 13px; }
+.route-tree, .route-tree-children { list-style: none; margin: 0; padding: 0; }
+.route-tree-children { margin-left: 18px; padding-left: 10px; border-left: 1px solid #d8e6dc; }
+.route-tree-folder, .route-tree-route { position: relative; display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; text-align: left; padding: 8px 10px; cursor: pointer; overflow-wrap: anywhere; }
+.route-tree-folder { font-weight: 600; }
+.route-tree-route { padding-right: 34px; }
+.route-tree-folder:hover, .route-tree-route:hover, .route-tree-route[aria-selected="true"] { background: #e3f0e8; }
+.route-tree-route[aria-selected="true"] { color: #226b4c; font-weight: 600; }
+.route-tree-folder:focus-visible, .route-tree-route:focus-visible { outline: 2px solid #5a9b7c; outline-offset: -2px; }
+.route-tree-arrow, .route-tree-folder-icon { display: flex; flex: 0 0 16px; width: 16px; height: 16px; color: #48735a; }
+.route-tree-arrow svg, .route-tree-folder-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.route-tree-folder[aria-expanded="false"] .route-tree-arrow { transform: rotate(-90deg); }
+.route-tree-notice { margin: 4px 8px 8px; color: #756346; font-size: 12px; line-height: 1.5; }

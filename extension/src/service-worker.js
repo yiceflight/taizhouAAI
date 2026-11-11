@@ -8,6 +8,7 @@ import { createTaskTabManager, waitForTaskList } from './task-tab.js';
 import { readDjiRoutes } from './dji-routes.js';
 import { airinsReport, djiReport } from './flight-report.js';
 import { captureAirinsChart } from './airins-chart.js';
+import { captureAirinsMap } from './airins-map.js';
 import { djiPhotoPresentation, captureDjiPresentation } from './dji-photo-presentation.js';
 import { SITE_PATTERNS, allowedUrl, evaluationValue, pageSnapshot } from "./bridge-core.js";
 import { queryJiangsuHourly, normalizeHourly, prepareJiangsuForHealth, findJiangsuApi, enterJiangsuAnalysis } from "./jiangsu.js";
@@ -82,10 +83,10 @@ async function closeReportTab(key, tabId) {
 }
 const debuggerSession = createDebuggerSession(chrome.debugger, allowedUrl);
 
-async function post(path, body) {
+async function post(path, body, timeoutMs = 8000) {
   const response = await fetch(`${ENDPOINT}/${path}`, {
     method: "POST", headers: { "Content-Type": "application/json", "X-Taizhou-Bridge": "1" },
-    body: JSON.stringify({ session: await sessionReady, ...body }), signal: AbortSignal.timeout(8000),
+    body: JSON.stringify({ session: await sessionReady, ...body }), signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`客户端连接失败 (${response.status})`);
   return response.json();
@@ -112,7 +113,7 @@ async function closeCachedReportTab(job) {
 
 async function capture(tabId, job) {
   if (job?.type === 'flight-dji-list' && job.closeOnly === true) return closeCachedReportTab(job);
-  if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId);
+  if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId, {progress:job.healthProgress, deadline:job.expiresAt});
   return captureOnce(tabId, job);
 }
 async function captureOnce(tabId, job) {
@@ -154,6 +155,7 @@ async function captureOnce(tabId, job) {
     if (flight) {
       if (airChartTab) {
         data.chart = await captureAirinsChart(chrome.debugger, targetTabId, data);
+        data.chart.map = await captureAirinsMap(chrome.debugger, targetTabId, data.missionId);
         if ((await chrome.tabs.get(targetTabId)).url !== data.url) throw new Error('可飞截图期间页面发生跳转');
       }
       if (job.type === 'flight-dji-image' && !data.dataUrl) throw new Error('未取得照片原图，请关闭照片预览后重试；若持续失败，请更新司空适配器');
@@ -225,7 +227,7 @@ async function prepareFlight(job) {
       if (!panel?.ok) throw new Error('司空核对面板无法显示，已停止自动确认');
     }
     const response = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-      expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)})`,
+      expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route, routeId: job.routeId, folderPath: job.folderPath})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)})`,
       awaitPromise: true, returnByValue: true,
     });
     const result = evaluationValue(response);
@@ -279,7 +281,7 @@ async function submitFlight(job) {
     // restart must never cause another click for the same event.
     await chrome.storage.local.set({ [claim]: { attemptedAt: Date.now() } });
     const response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-      expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)}, true, (${readFlightSubmissionIssue.toString()}))`,
+      expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route, routeId: job.routeId, folderPath: job.folderPath})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)}, true, (${readFlightSubmissionIssue.toString()}))`,
       awaitPromise: true, returnByValue: true,
     });
     const result = evaluationValue(response);
@@ -419,13 +421,17 @@ async function executeJob(job) {
   if (Number.isFinite(job.expiresAt) && Date.now() >= job.expiresAt) return null;
   if (!["open-business-site", "dji-tasks", "dji-routes", "dji-weather", "dji-submit", "dji-open-prepared", "dji-status", "site-health", "jiangsu-health", "airins-health-open", "dji-health-open", "capture", "jiangsu-hourly", "dji-prepare", "flight-missions", "flight-airins", "flight-dji-list", "flight-dji-image", "airins-realtime"].includes(job.type) || !Number.isInteger(job.tabId)) return null;
   let result;
+  const healthProgress = async stage => {
+    try { await post('health-progress', {id:job.id,stage}, 1000); } catch { /* Diagnostics must not block validation. */ }
+  };
+  const healthCapture = (tabId, innerJob) => capture(tabId, {...innerJob, healthProgress, expiresAt:job.expiresAt});
   try {
     if (job.type === 'open-business-site') {
       if (!allowedUrl(job.url)) throw new Error('不支持的业务网站');
       const tab = await chrome.tabs.create({ url: job.url, active: true });
       await chrome.windows.update(tab.windowId, { focused: true });
       result = { data: { opened: true } };
-    } else result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, capture) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, capture) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, capture, {}, enterJiangsuBusiness) : await capture(job.tabId, job) };
+    } else result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, healthCapture, {}, enterJiangsuBusiness) : await capture(job.tabId, {...job, healthProgress}) };
   } catch (error) {
     result = { error: (error.message || String(error)).split("\n")[0].slice(0, 300) };
   }

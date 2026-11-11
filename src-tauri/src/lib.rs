@@ -2,6 +2,7 @@ use std::process::Command;
 use tauri::Manager;
 
 mod data_reset;
+mod diagnostics;
 
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -202,6 +203,7 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             runtime_log::start(app.handle());
+            diagnostics::start(app.handle());
             runtime_log::record(
                 app.handle(),
                 "info",
@@ -245,6 +247,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             environment::is_test_environment,
             runtime_log::get_runtime_logs,
+            diagnostics::record_frontend_error,
             runtime_log::export_runtime_logs,
             runtime_log::open_runtime_log_exports,
             open_chrome_extensions,

@@ -7,6 +7,8 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(() => ({
   plugins: [react()],
+  // Keep mappings for diagnosing production React/WebView stack traces.
+  build: { sourcemap: "hidden" },
   // Scan actual dev entry points, not generated packages or saved QA pages.
   optimizeDeps: { entries: ["index.html", "tests/fixtures/*.html"] },
 

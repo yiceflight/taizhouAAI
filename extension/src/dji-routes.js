@@ -3,10 +3,6 @@
 export async function readDjiRoutes(expectedUrl) {
   const projectId = 'c7ea6bbc-110d-4dc9-ac75-4653ebbbca49';
   const orgId = 'b9fb201d-b230-433d-a1d5-e47736ca06f0';
-  // The web wayline library is scoped to the project's root folder. This is
-  // the parent id used by the FlightHub web client for the fixed TaiZhou
-  // project; the old OpenAPI route endpoint does not expose this library.
-  const parentId = '3f4c4581-41e6-4a1c-b426-3770687470d1';
   const projectPath = `/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/${projectId}`;
   const origin = 'https://es-flight-api-cn.djigate.com';
   if (location.href !== expectedUrl || location.origin !== 'https://fh.dji.com' || location.pathname.replace(/\/$/, '') !== projectPath) throw new Error('司空航线项目不匹配');
@@ -52,54 +48,89 @@ export async function readDjiRoutes(expectedUrl) {
   for (const credential of credentials) addAttempt({ [credential.key === 'x-auth-token' ? 'X-Auth-Token' : 'X-User-Token']: credential.value }, 'include');
   if (user && auth) addAttempt({ 'X-User-Token': user, 'X-Auth-Token': auth }, 'include');
   if (!credentials.length) addAttempt({}, 'include');
-  const query = new URLSearchParams({ parent_id: parentId, size: '20', key: '', order_by: 'update_time desc', file_type: '5', page: '1' });
-  let result;
-  let lastAuthMessage = '';
-  for (let index = 0; index < attempts.length; index += 1) {
-    let response;
-    try {
-      response = await fetch(`${origin}/wayline/api/v1/workspaces/${projectId}/web-waylines?${query}`, {
-        method: 'GET', credentials: attempts[index].credentials, cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(8000),
-        headers: {
-          ...attempts[index].headers,
-          'x-org-id': orgId,
-          'x-language-code': 'zh',
-          'X-Request-Id': crypto.randomUUID(),
-        },
-      });
-    } catch { throw new Error('司空航线接口暂时无法连接，请稍后重试'); }
-    const authFailure = response.status === 401;
-    if (authFailure) {
-      lastAuthMessage = `HTTP ${response.status}`;
-      if (index + 1 < attempts.length) continue;
-      throw new Error(`司空登录已过期，请重新登录后同步航线（${lastAuthMessage}）`);
+  const deadline = Date.now() + 22000;
+  const request = async params => {
+    if (Date.now() >= deadline) throw new Error('航线目录同步超时，请重试');
+    const query = new URLSearchParams(params);
+    let result;
+    let lastAuthMessage = '';
+    for (let index = 0; index < attempts.length; index += 1) {
+      let response;
+      try {
+        response = await fetch(`${origin}/wayline/api/v1/workspaces/${projectId}/web-waylines?${query}`, {
+          method: 'GET', credentials: attempts[index].credentials, cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(8000),
+          headers: {
+            ...attempts[index].headers,
+            'x-org-id': orgId,
+            'x-language-code': 'zh',
+            'X-Request-Id': crypto.randomUUID(),
+          },
+        });
+      } catch { throw new Error('司空航线接口暂时无法连接，请稍后重试'); }
+      const authFailure = response.status === 401;
+      if (authFailure) {
+        lastAuthMessage = `HTTP ${response.status}`;
+        if (index + 1 < attempts.length) continue;
+        throw new Error(`司空登录已过期，请重新登录后同步航线（${lastAuthMessage}）`);
+      }
+      if (!response.ok) throw new Error(`司空航线接口 HTTP ${response.status}，请检查登录和项目权限`);
+      result = await response.json().catch(() => { throw new Error('司空航线响应格式无效'); });
+      if ([200401, 401, 44001].includes(result.code)) {
+        lastAuthMessage = typeof result.message === 'string' && result.message.trim() ? result.message.trim().slice(0, 160) : `业务码 ${result.code}`;
+        if (index + 1 < attempts.length) continue;
+        throw new Error(`司空登录已过期，请重新登录后同步航线（${lastAuthMessage}）`);
+      }
+      if (result.code !== 0) throw new Error('司空航线接口拒绝访问，请检查项目权限');
+      break;
     }
-    if (!response.ok) throw new Error(`司空航线接口 HTTP ${response.status}，请检查登录和项目权限`);
-    result = await response.json().catch(() => { throw new Error('司空航线响应格式无效'); });
-    if ([200401, 401, 44001].includes(result.code)) {
-      lastAuthMessage = typeof result.message === 'string' && result.message.trim() ? result.message.trim().slice(0, 160) : `业务码 ${result.code}`;
-      if (index + 1 < attempts.length) continue;
-      throw new Error(`司空登录已过期，请重新登录后同步航线（${lastAuthMessage}）`);
+    const data = result.data?.data ?? result.data;
+    // FlightHub serializes an empty directory as list:null, total:0.
+    // Require the explicit zero total; missing/nonempty lists remain errors.
+    if (data?.list === null && data.pagination?.total === 0) return { ...data, list: [] };
+    if (!Array.isArray(data?.list)) throw new Error('司空航线响应格式已变化');
+    return data;
+  };
+  // FlightHub's folder tree uses the same endpoint with file_type=1.
+  const folderData = await request({ file_type: '1' });
+  const folders = new Map(folderData.list.map(row => [row.id, row]));
+  if (folders.size !== folderData.list.length || (folderData.pagination?.total > folders.size)) throw new Error('航线文件夹列表不完整');
+  const pathFor = id => {
+    const path = [], seen = new Set();
+    while (id) {
+      const folder = folders.get(id);
+      if (!folder || seen.has(id)) throw new Error('航线文件夹层级无效');
+      seen.add(id);
+      const name = folder.sub_file_type === 4 ? '默认文件夹' : folder.name;
+      if (typeof id !== 'string' || !id || typeof name !== 'string' || !name.trim()) throw new Error('航线文件夹身份无效');
+      path.unshift({ id, name: name.trim() });
+      id = folder.parent_id;
     }
-    if (result.code !== 0) throw new Error('司空航线接口拒绝访问，请检查项目权限');
-    break;
+    return path;
+  };
+  const routes = [];
+  const seenRoutes = new Set();
+  for (const folderId of folders.keys()) {
+    const folderPath = pathFor(folderId);
+    let count = 0;
+    for (let page = 1; ; page += 1) {
+      const data = await request({ parent_id: folderId, size: '20', key: '', order_by: 'update_time desc', file_type: '5', page: String(page) });
+      for (const row of data.list) {
+        const routeId = row?.id ?? row?.uuid ?? row?.wayline_id;
+        const name = row?.name ?? row?.file_name ?? row?.filename;
+        if (typeof routeId !== 'string' || !/^[a-f0-9-]{36}$/.test(routeId) || typeof name !== 'string' || !name.trim()) throw new Error('司空航线身份无效');
+        if (seenRoutes.has(routeId) || (row.parent_id && row.parent_id !== folderId)) throw new Error('航线分页或文件夹归属发生变化，请重新同步');
+        seenRoutes.add(routeId);
+        const rawUpdateTime = row.update_time ?? row.updated_at ?? row.updateTime;
+        const updateTime = Number.isFinite(Number(rawUpdateTime)) ? Number(rawUpdateTime) : 0;
+        routes.push({ routeId, name: name.trim(), updateTime, folderPath });
+      }
+      count += data.list.length;
+      const total = data.pagination?.total;
+      if (total !== undefined ? count >= total : data.list.length < 20) break;
+      if (!data.list.length || page >= 500) throw new Error('航线分页不完整');
+    }
   }
-  const list = result.data?.list ?? result.data?.data?.list;
-  if (!Array.isArray(list)) throw new Error('司空航线响应格式已变化');
-  const routes = list.map(row => {
-    const routeId = row?.id ?? row?.uuid ?? row?.wayline_id;
-    const name = row?.name ?? row?.file_name ?? row?.filename;
-    if (!row || typeof routeId !== 'string' || !/^[a-f0-9-]{36}$/.test(routeId) || typeof name !== 'string' || !name.trim()) throw new Error('司空航线身份无效');
-    const rawUpdateTime = row.update_time ?? row.updated_at ?? row.updateTime;
-    const updateTime = Number.isSafeInteger(rawUpdateTime) ? rawUpdateTime : Number.isFinite(Number(rawUpdateTime)) ? Number(rawUpdateTime) : 0;
-    return { routeId, name: name.trim(), updateTime };
-  });
-  const unique = new Map();
-  for (const route of routes) {
-    const previous = unique.get(route.name);
-    if (!previous || route.updateTime > previous.updateTime) unique.set(route.name, route);
-  }
-  const sorted = [...unique.values()].sort((a, b) => b.name.replace(/\s+/g, '').length - a.name.replace(/\s+/g, '').length || b.updateTime - a.updateTime || a.name.localeCompare(b.name, 'zh-CN'));
+  const sorted = routes.sort((a, b) => b.name.replace(/\s+/g, '').length - a.name.replace(/\s+/g, '').length || b.updateTime - a.updateTime || a.name.localeCompare(b.name, 'zh-CN'));
   if (location.href !== expectedUrl) throw new Error('航线读取期间页面已切换，请重试');
-  return { apiVersion: 1, url: `https://fh.dji.com${projectPath}#/plan`, routes: sorted };
+  return { apiVersion: 2, url: `https://fh.dji.com${projectPath}#/plan`, routes: sorted };
 }

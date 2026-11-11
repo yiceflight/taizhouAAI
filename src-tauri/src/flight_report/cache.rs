@@ -39,7 +39,7 @@ fn read(path: &Path) -> Option<Collected> {
 pub(super) fn air(root: &Path, mission: &Mission, now: i64) -> Option<AirData> {
     candidates(root, mission, "air").into_iter().find_map(|p| {
         let data = read(&p)?;
-        if !same_flight(&data.mission, mission) || data.without_air_data || data.air.chart.is_none() { return None; }
+        if !same_flight(&data.mission, mission) || data.without_air_data || data.air.chart.as_ref().is_none_or(|c| c.map.is_none()) { return None; }
         let candidate = air_only(mission, data.air);
         validate(&candidate, now).ok()?;
         Some(candidate.air)
@@ -105,6 +105,13 @@ mod tests {
         }
         let url = format!("data:image/png;base64,{}", STANDARD.encode(bytes));
         data.air.chart = Some(air_chart::AirChart {
+            map: Some(air_chart::AirMap {
+                method: "airins-export-crop-v1".into(), mission_id: 1, source_channel: "ad_9".into(),
+                captured_at: Utc::now().timestamp_millis(), width: 600, height: 400,
+                original_width: 600, original_height: 400,
+                crop: air_chart::MapCrop {x:0,y:0,width:600,height:400}, padding_ratio: 0.1,
+                legend_labels: vec!["0".into(),"50".into()], data_url:url.clone(),original_data_url:url.clone(),
+            }),
             method: "airins-page-screenshot".into(), source_channel: "ad_9".into(),
             mission_id: 1, start_time: data.air.points[0].time, end_time: data.air.points[1].time,
             point_count: 2, maximum: 65.0, minimum: 31.0, captured_at: Utc::now().timestamp_millis(),

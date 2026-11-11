@@ -4,7 +4,7 @@ import { PLAN_URL } from './flight-plan.js';
 // A SPA can replace its execution context during a read. Retry only this
 // transport failure, on the same loaded URL, rather than waiting for the next
 // 30-second readiness cycle. Never retry auth results or arbitrary failures.
-export async function captureHealth(chrome, capture, tabId, timing = {}) {
+async function captureStableHealth(chrome, capture, tabId, timing = {}) {
   const original = await chrome.tabs.get(tabId);
   const now = timing.now || Date.now;
   const pause = timing.pause || (() => new Promise(resolve => setTimeout(resolve, 200)));
@@ -23,6 +23,71 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
   }
 }
 
+// Actual tab activation is serialized across concurrent site checks. Do not
+// focus the browser window, and do not undo a tab switch made by the user.
+let activationTail = Promise.resolve();
+export async function captureHealth(chrome, capture, tabId, timing = {}) {
+  const report = timing.progress || (async () => {});
+  const pause = timing.pause || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const now = timing.now || Date.now;
+  const original = await chrome.tabs.get(tabId);
+  const origin = new URL(original.url).origin;
+  if (!['http://61.155.4.60:18080', 'https://fh.dji.com', 'https://aai.airins.cn'].includes(origin)) throw Error('非授权网站');
+  const samePage = async () => {
+    if (Number.isFinite(timing.deadline) && now() >= timing.deadline) throw Error('本轮验证已超时，请重新验证');
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.url !== original.url || (tab.pendingUrl && tab.pendingUrl !== original.url)) throw Error('验证期间页面已切换，请重新验证');
+    return tab;
+  };
+  const read = async () => {
+    await report('reading');
+    return captureStableHealth(chrome, capture, tabId, timing);
+  };
+  const activate = async () => {
+    await report('focus_wait');
+    const previous = activationTail;
+    let release;
+    activationTail = new Promise(resolve => { release = resolve; });
+    await previous;
+    let active, activated = false;
+    try {
+      const tab = await samePage();
+      [active] = await chrome.tabs.query({active:true,windowId:tab.windowId});
+      await report(tab.discarded || tab.frozen ? 'waking' : 'activating');
+      await chrome.tabs.update(tabId, {active:true});
+      activated = true;
+      const deadline = now() + 20000;
+      while (true) {
+        await pause(250);
+        const current = await samePage();
+        if (current.status === 'complete' && !current.discarded && !current.frozen) break;
+        if (now() >= deadline) throw Error('页面唤醒超时，请打开网站检查白屏或登录状态');
+      }
+      // Allow the visible SPA a render turn before reading its login/API state.
+      await pause(750);
+      return await read();
+    } finally {
+      try {
+        if (activated && active && active.id !== tabId) {
+          const current = await chrome.tabs.get(tabId).catch(() => null);
+          if (current?.active && await chrome.tabs.get(active.id).catch(() => null)) await chrome.tabs.update(active.id, {active:true});
+        }
+      } catch { /* The user may close or move either tab during recovery. */ }
+      finally { release(); }
+    }
+  };
+  if (original.discarded || original.frozen) return activate();
+  let result;
+  try { result = await read(); }
+  catch (error) {
+    if (origin !== 'https://aai.airins.cn' || original.active) throw error;
+    await samePage();
+    return activate();
+  }
+  if (origin === 'https://aai.airins.cn' && !original.active && result.state === 'error') return activate();
+  return result;
+}
+
 // Fixed read-only checks in the site's own context. Platform credentials are
 // sent only to their fixed platform endpoint, never returned to the bridge.
 export function prioritizeHealthJobs(jobs, tabs) {
@@ -39,6 +104,7 @@ async function openForHealth(chrome, capture, url, name, timing) {
   const now = timing.now || Date.now;
   const pause = timing.pause || (() => new Promise(resolve => setTimeout(resolve, 200)));
   const origin = new URL(url).origin;
+  await timing.progress?.('loading');
   const tabs = (await chrome.tabs.query({ url: `${origin}/*` }))
     .filter(tab => new URL(tab.url).origin === origin);
   // The user may have opened a tab since the client's last heartbeat. Reuse it,
@@ -49,7 +115,7 @@ async function openForHealth(chrome, capture, url, name, timing) {
   while (now() < deadline) {
     const current = await chrome.tabs.get(tab.id);
     if (new URL(current.url).origin !== origin) throw new Error(`${name}跳转到非授权网站，已停止验证`);
-    if (current.status === 'complete') {
+    if (current.status === 'complete' || current.discarded || current.frozen) {
       const health = await capture(tab.id, { type: 'site-health' });
       if (new URL(health.url).origin !== origin) throw new Error(`${name}验证页面来源不匹配`);
       return { ...health, tabId: tab.id };
@@ -99,6 +165,7 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     }
     if (origin === 'https://aai.airins.cn') {
       if (!location.pathname.startsWith('/sniff')) return result('page_required', '请打开可飞历史任务页面');
+      if (document.body && !document.body.innerText?.trim() && !document.body.querySelector?.('canvas, iframe')) return result('error', '可飞页面仍为空白，请检查页面加载或网络');
       const response = await fetch('https://api-aai.airins.cn/api/met/sniff/mission_based/historical_data/mission/list', { credentials: 'include', signal: AbortSignal.timeout(12000) });
       if (response.status === 401) return result('login_required', '登录已过期，请重新登录可飞');
       if (response.status === 403) return result('forbidden', '当前账号无权读取可飞任务');
@@ -154,6 +221,6 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     const status = error?.response?.status;
     if (status === 401) return result('login_required', '登录已过期，请重新登录');
     if (status === 403) return result('forbidden', '当前账号无访问权限');
-    return result('error', '验证未完成，请检查网络后重新检测；不能据此认定已登录');
+    return result('error', error?.name === 'TimeoutError' || error?.name === 'AbortError' ? '网站接口响应超时，请检查网络或平台服务后重试' : '网站接口读取失败，请检查网络、登录状态或平台服务后重试');
   }
 }

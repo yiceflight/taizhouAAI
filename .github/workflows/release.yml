@@ -86,6 +86,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target universal-apple-darwin
+      - name: Retain frontend diagnostic symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-frontend-macos-${{ needs.metadata.outputs.version }}-${{ needs.metadata.outputs.source_ref }}
+          path: |
+            dist/assets/*.js
+            dist/assets/*.js.map
+          retention-days: 90
+          if-no-files-found: error
       - name: Collect macOS artifacts
         shell: bash
         run: |
@@ -139,6 +148,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Retain frontend diagnostic symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-frontend-windows-${{ needs.metadata.outputs.version }}-${{ needs.metadata.outputs.source_ref }}
+          path: |
+            dist/assets/*.js
+            dist/assets/*.js.map
+          retention-days: 90
+          if-no-files-found: error
       - name: Collect Windows artifacts
         shell: pwsh
         run: |

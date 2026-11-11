@@ -12,6 +12,12 @@ pub struct Evidence {
     pub flight_hour: Option<String>,
     #[serde(default)]
     pub potassium_threshold: Option<f64>,
+    #[serde(default)]
+    pub pm25_threshold: Option<f64>,
+    #[serde(default)]
+    pub potassium_enabled: Option<bool>,
+    #[serde(default)]
+    pub pm25_enabled: Option<bool>,
     pub city_hours: Vec<CityHour>,
     pub trigger: String,
     pub event: Option<Value>,
@@ -63,9 +69,13 @@ struct ReviewFile {
 pub fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
 pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path, now: i64) -> Result<Evidence, String> {
+    let settings = crate::settings::read(db)?;
     let mut e = Evidence {
         captured_at:now,
-        potassium_threshold: Some(crate::settings::read(db)?.potassium_threshold),
+        potassium_threshold: Some(settings.potassium_threshold),
+        pm25_threshold: Some(settings.pm25_threshold),
+        potassium_enabled: Some(settings.potassium_enabled),
+        pm25_enabled: Some(settings.pm25_enabled),
         flight_hour: DateTime::from_timestamp_millis(data.mission.start_time)
             .filter(|_| data.mission.start_time > 0)
             .map(|_| date(data.mission.start_time, "%Y-%m-%d %H:00:00")),
@@ -98,8 +108,8 @@ pub fn snapshot(db: &rusqlite::Connection, data: &Collected, review_path: &Path,
     } else if let Some(reason) = list_reasons(db)?.get(&data.mission.mission_id.to_string()) {
         e.trigger = match reason.as_str() { "manual_immediate" => "由人工手动发起", "dji_scheduled" => "由司空定时任务发起", "potassium_manual" => "由K⁺/PM2.5巡查经人工确认发起", "potassium_auto" => "由K⁺或PM2.5监测自动触发", _ => "触发原因待核实" }.into();
     }
-    // Include earlier valid readings across midnight, but never later hours.
-    if let Some(end) = e.trigger_hour().into_iter().chain(e.flight_hour.clone()).max() {
+    // Keep full flight-day observations for charts; narrative fields apply their own cutoff.
+    if let Some(end) = e.station_day_end().into_iter().chain(e.trigger_hour()).max() {
         let mut stmt = db.prepare("SELECT observed_at,potassium,source_url,synced_at,pm25 FROM hourly_observations WHERE city_code='321200' AND data_source='A_6' AND common_site_type='30' AND unit='μg/m³' AND observed_at<=?1 ORDER BY observed_at").map_err(|e| e.to_string())?;
         e.city_hours = stmt.query_map(params![end], |r| Ok(CityHour { time:r.get(0)?, potassium:r.get(1)?, source_url:r.get(2)?, synced_at:r.get(3)?, pm25:r.get(4)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     }
@@ -224,6 +234,40 @@ fn number(value: Option<f64>) -> String {
     value.map(|v| format!("{v:.2}")).unwrap_or_else(|| "【 】".into())
 }
 impl Evidence {
+    /// Use only this flight's archived weather; never consult today's weather.
+    pub fn patrol_context(&self, start_time: i64) -> String {
+        let route = self.dji_task.as_ref().and_then(|task| task.route_name.as_deref())
+            .map(str::trim).filter(|name| !name.is_empty())
+            .or_else(|| self.event.as_ref()?.get("route")?.as_str().map(str::trim).filter(|name| !name.is_empty()))
+            .unwrap_or("【 】");
+        let wind = self.event.as_ref()
+            .and_then(|event| event["weatherChecks"].as_array())
+            .into_iter().flatten()
+            .filter_map(|check| {
+                let checked = check["checkedAt"].as_i64()?;
+                let weather = &check["weather"];
+                let sample = &weather["current"];
+                let observed = sample["forecast"]["observedAt"].as_i64()
+                    .or_else(|| sample["observedAt"].as_i64())?;
+                let direction = sample["windDirection"].as_f64()?;
+                // Discard future, stale, failed or invalid snapshots.
+                if checked > start_time || checked <= 0 || weather["level"] == "unknown"
+                    || !(0..=3600).contains(&(start_time / 1000 - observed))
+                    || !direction.is_finite() || !(0.0..=360.0).contains(&direction) {
+                    return None;
+                }
+                Some((checked, direction))
+            })
+            .max_by_key(|(checked, _)| *checked)
+            .map(|(_, direction)| {
+                let names = ["北风", "东北风", "东风", "东南风", "南风", "西南风", "西风", "西北风"];
+                names[((direction.rem_euclid(360.0) + 22.5) / 45.0).floor() as usize % 8]
+            });
+        match wind {
+            Some(wind) => format!("当时风向为{wind}，执行航线为{route}，"),
+            None => format!("执行航线为{route}，"),
+        }
+    }
     pub fn trigger_hour(&self) -> Option<String> {
         let event_hour = self.event.as_ref().filter(|event| event["source"].as_str() == Some("auto"))
             .and_then(|event| event["sourceHour"].as_str().or_else(|| event["observedAt"].as_str()));
@@ -233,11 +277,23 @@ impl Evidence {
         };
         event_hour.and_then(valid_hour).or_else(|| self.flight_hour.as_deref().and_then(valid_hour))
     }
+    pub fn station_day_end(&self) -> Option<String> {
+        let hour = self.flight_hour.clone().or_else(|| self.trigger_hour())?;
+        let day = hour.get(..10)?;
+        Some(format!("{day} 23:00:00").min(date(self.captured_at, "%Y-%m-%d %H:00:00")))
+    }
     pub fn trigger_hour_label(&self) -> String {
         self.trigger_hour().and_then(|h| NaiveDateTime::parse_from_str(&h, "%Y-%m-%d %H:%M:%S").ok())
             .map(|h| h.format("%Y年%m月%d日%H时").to_string()).unwrap_or_else(|| "【 】".into())
     }
 
+    pub fn report_threshold(&self, potassium: bool) -> Option<f64> {
+        if (if potassium { self.potassium_enabled } else { self.pm25_enabled }) == Some(false) {
+            return None;
+        }
+        (if potassium { Some(self.high_threshold()) } else { self.pm25_threshold })
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
     pub fn high_threshold(&self) -> f64 {
         self.potassium_threshold.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0)
     }
@@ -283,16 +339,16 @@ impl Evidence {
         daily.sort_by(|a,b| a.time.cmp(&b.time));
         let k: Vec<_> = daily.iter().filter_map(|h| valid_value(h.potassium).map(|v| (*h,v))).collect();
         let ratios: Vec<_> = daily.iter().filter_map(|h| Some((h, valid_value(h.potassium)? / valid_value(h.pm25).filter(|v| *v > 0.0)? * 100.0))).collect();
-        let threshold = self.high_threshold();
-        let high: Vec<_> = k.iter().filter(|(_,v)| *v > threshold).collect();
-        fields.push(("CITY_HIGH_HOURS", if k.is_empty() {"【 】".into()} else {high.len().to_string()}));
+        let threshold = self.report_threshold(true);
+        let high: Vec<_> = k.iter().filter(|(_,v)| threshold.is_some_and(|t| *v > t)).collect();
+        fields.push(("CITY_HIGH_HOURS", if k.is_empty() || threshold.is_none() {"【 】".into()} else {high.len().to_string()}));
         fields.push(("CITY_HIGH_WINDOW", if high.is_empty() {"【 】".into()} else {high.iter().map(|(h,_)|hour(&h.time)).collect::<Vec<_>>().join("、")}));
         // K+ is sampled hourly: each valid hour above the configured threshold
         // counts once, including consecutive hours. Missing readings do not count.
-        fields.push(("CITY_PROCESS_COUNT", if k.is_empty() {"【 】".into()} else {high.len().to_string()}));
+        fields.push(("CITY_PROCESS_COUNT", if k.is_empty() || threshold.is_none() {"【 】".into()} else {high.len().to_string()}));
         // Tied maxima use the latest hour, consistently with the peak value/PM.
         let peak = k.iter().max_by(|a,b|a.1.total_cmp(&b.1));
-        fields.push(("CITY_PROCESS_TIME", peak.filter(|(_,v)| *v > threshold).map(|(h,_)|hour(&h.time)).unwrap_or_else(|| "【 】".into())));
+        fields.push(("CITY_PROCESS_TIME", peak.filter(|(_,v)| threshold.is_some_and(|t| *v > t)).map(|(h,_)|hour(&h.time)).unwrap_or_else(|| "【 】".into())));
         fields.push(("CITY_K_PEAK", number(peak.map(|(_,v)|*v))));
         fields.push(("CITY_PEAK_PM", number(peak.and_then(|(h,_)|valid_value(h.pm25)))));
         fields.push(("CITY_MAX_RATIO", number(ratios.iter().map(|(_,v)|*v).max_by(f64::total_cmp))));

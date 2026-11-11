@@ -39,6 +39,22 @@ fn main() {
         .file("src/flight_report/jpeg_lossless.c")
         .includes(std::env::split_paths(&includes))
         .compile("report_jpeg_lossless");
+    // Identify the source revision and this exact build without exposing build secrets.
+    let git = |args: &[&str]| std::process::Command::new("git").args(args).output().ok()
+        .filter(|out| out.status.success()).map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    for source in ["src", "Cargo.toml", "tauri.conf.json", "../src", "../package.json", "../vite.config.ts"] {
+        println!("cargo:rerun-if-changed={source}");
+    }
+    for reference in [Some("HEAD".to_owned()), git(&["symbolic-ref", "-q", "HEAD"]), Some("packed-refs".to_owned())].into_iter().flatten() {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) { println!("cargo:rerun-if-changed={path}"); }
+    }
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = git(&["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(true);
+    let built_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    println!("cargo:rustc-env=DIAGNOSTIC_COMMIT={commit}");
+    println!("cargo:rustc-env=DIAGNOSTIC_DIRTY={dirty}");
+    println!("cargo:rustc-env=DIAGNOSTIC_BUILD_TIME={built_at}");
+
     // Private release provisioning. Generate into ignored build output rather
     // than printing secrets as cargo:rustc-env (which would leak to build logs).
     let email_defaults = "../.secrets/email-defaults.json";

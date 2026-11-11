@@ -116,7 +116,7 @@ for old, new in [
     ('【3.47具体数值，高值时间段的数据】', '{{CITY_MAX_RATIO}}'),
 ]:
     replace_text(p13, old, new)
-set_text(p16, '周山河街区大气超级站在东南风向下易出现K⁺浓度异常升高的现象，站点东侧、东南、南侧农田连片分布，泰州中心综合分析周山河街区大气超级站监测数据规律与区域地理特征，在站点周边布设无人机机库，划定东侧、东南、南侧三条常态化自主巡航航线。本次任务{{TRIGGER}}，巡航时段为{{FLIGHT_WINDOW}}。各巡航区段执行情况如下。')
+set_text(p16, '周山河街区大气超级站在东南风向下易出现K⁺浓度异常升高的现象，站点东侧、东南、南侧农田连片分布，泰州中心综合分析周山河街区大气超级站监测数据规律与区域地理特征，在站点周边布设无人机机库，划定东侧、东南、南侧三条常态化自主巡航航线。本次任务{{TRIGGER}}，{{PATROL_CONTEXT}}巡航时段为{{FLIGHT_WINDOW}}。各巡航区段执行情况如下。')
 set_text(p24, '通过大疆司空2平台制定并执行无人机机库自动巡航任务，任务照片自动回传司空平台。本次巡航期间，司空平台共抓拍图片{{PHOTO_COUNT}}张，{{PHOTO_REVIEW_SUMMARY}}。主要抓拍图片信息如下：')
 set_text(conclusion, '{{CONCLUSION}}')
 # Keep the flight-specific conclusion; the approved work advice is fixed prose.
@@ -186,6 +186,8 @@ for p in list(body.findall(w('p'))):
     if text(p).startswith(('图1　','图2　','图3　','图4　','图5　','图6　','图7　')): remove_child(p)
 def new_slot(source_p, value):
     p = deepcopy(source_p); set_text(p, value); return p
+intro = next(p for p in body.findall(w('p')) if '自动巡飞' in text(p))
+body.insert(list(body).index(intro)+1, new_slot(intro, '{{STATION_CHARTS}}'))
 # Tables are: execution (6 cols), photo metadata (6 cols), air data (9 cols).
 tables = body.findall(w('tbl'))
 table1 = next(t for t in tables if len(t.findall(w('tr'))[0].findall(w('tc'))) == 6)
@@ -200,6 +202,8 @@ grid = table2.find(w('tblGrid'))
 if grid is not None and len(grid.findall(w('gridCol'))) == 7:
     grid.remove(grid.findall(w('gridCol'))[-1])
 table4 = next(t for t in tables if len(t.findall(w('tr'))[0].findall(w('tc'))) == 9)
+air_caption = table4.getprevious()
+body.insert(list(body).index(air_caption), new_slot(air_caption, '{{AIR_MAP}}'))
 # Ozone is not collected by the platform: remove its column and peak row.
 for row in table4.findall(w('tr')):
     row.remove(row.findall(w('tc'))[-1])

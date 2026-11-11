@@ -19,6 +19,7 @@ mod evidence;
 mod cache;
 mod presentation;
 mod air_chart;
+mod station_chart;
 mod image_compression;
 use evidence::{photo_facts, Evidence};
 
@@ -963,8 +964,8 @@ pub async fn collect_flight_report(
                 .await?,
         )
         .map_err(|e| format!("可飞格式错误：{e}"))? };
-        if !req.without_air_data && air.chart.is_none() {
-            return Err("未取得可飞 PM2.5 图表截图，请更新并重新加载浏览器插件后重试".into());
+        if !req.without_air_data && air.chart.as_ref().is_none_or(|c| c.map.is_none()) {
+            return Err("未取得可飞 PM2.5 浓度轨迹图，请更新并重新加载浏览器插件后重试".into());
         }
         if !req.without_air_data && !reuse_air {
             cache::store_air(&cache_root, &req.mission, &air, Utc::now().timestamp_millis())?;
@@ -1112,6 +1113,9 @@ fn fill_slots(template: &str, fields: &[(&str, String)]) -> Result<String, Strin
 // Delete authored text across Word runs while retaining the XML and formatting.
 // Called only on our template before any external/user text is inserted.
 fn omit_high_process_details(doc: &mut String) -> Result<(), String> {
+    omit_high_details_from(doc, "主要集中在")
+}
+fn omit_high_details_from(doc: &mut String, prefix: &str) -> Result<(), String> {
     let mut spans = Vec::new();
     let mut text = String::new();
     let mut cursor = 0;
@@ -1132,7 +1136,7 @@ fn omit_high_process_details(doc: &mut String) -> Result<(), String> {
         text.push_str(&doc[start..end]);
         cursor = end + 6;
     }
-    let start = text.find("主要集中在").ok_or("模板高值说明缺失")?;
+    let start = text.find(prefix).ok_or("模板高值说明缺失")?;
     let suffix = "前后高值过程最为突出，";
     let end = start + text[start..].find(suffix).ok_or("模板高值说明未结束")? + suffix.len();
     for (xml_start, xml_end, offset) in spans.into_iter().rev() {
@@ -1347,6 +1351,7 @@ fn build_docx(
         ("FLIGHT_DATE", date(m.start_time, "%Y年%-m月%-d日")),
         ("ANALYSIS_WINDOW", evidence.trigger_hour_label()),
         ("FLIGHT_WINDOW", flight_window.clone()),
+        ("PATROL_CONTEXT", evidence.patrol_context(m.start_time)),
         ("PHOTO_COUNT", count.clone()),
         ("TOTAL0_1", "本航次".into()),
         ("TOTAL0_2", table_window.clone()),
@@ -1378,7 +1383,9 @@ fn build_docx(
     doc.replace_range(threshold_offset..threshold_offset + "<w:t>1</w:t>".len(),
         &format!("<w:t>{}</w:t>", evidence.high_threshold()));
     fields.extend(evidence.city_fields());
-    if fields.iter().any(|(key, value)| *key == "CITY_HIGH_HOURS" && value == "0") {
+    if evidence.potassium_enabled == Some(false) {
+        omit_high_details_from(&mut doc, "高于")?;
+    } else if fields.iter().any(|(key, value)| *key == "CITY_HIGH_HOURS" && value == "0") {
         omit_high_process_details(&mut doc)?;
     }
     fields.push((
@@ -1452,6 +1459,33 @@ fn build_docx(
     .map_err(|e| e.to_string())?;
     let mut types = String::from_utf8(parts.remove("[Content_Types].xml").ok_or("模板类型缺失")?)
         .map_err(|e| e.to_string())?;
+    let day = date(m.start_time, "%Y-%m-%d");
+    let mut station_xml = String::new();
+    for (index, potassium) in [false, true].into_iter().enumerate() {
+        let values = station_chart::values(evidence, &day, potassium);
+        let threshold = evidence.report_threshold(potassium);
+        let id = 900 + index;
+        let name = format!("media/station-{}.png", if potassium { "potassium" } else { "pm25" });
+        parts.insert(format!("word/{name}"), station_chart::render(&values, &day, potassium, threshold)?);
+        rels = rels.replace("</Relationships>", &format!(r#"<Relationship Id="rIdFlight{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{name}"/></Relationships>"#));
+        station_xml.push_str(&image_xml(id, 5_600_000, 2_100_000));
+        let hours: Vec<_> = values.iter().enumerate().filter_map(|(h,v)| v.map(|_| h)).collect();
+        let range = match (hours.first(), hours.last()) {
+            (Some(first), Some(last)) => format!("有效数据 {first:02}—{last:02} 时，共 {} 小时；缺测处断线", hours.len()),
+            _ => "暂无有效小时数据".into(),
+        };
+        let warning = threshold.map(|v| {
+            let count = values.iter().flatten().filter(|value| **value > v).count();
+            let exceeded = if hours.is_empty() { "无有效数据，无法判断超标".into() }
+                else { format!("图示时段超标 {count} 小时") };
+            format!("设置警戒值 {v} μg/m³（红色虚线），{exceeded}")
+        }).unwrap_or_else(|| "未启用或未记录阈值，不作超标判断".into());
+        station_xml.push_str(&caption_for(format!("图{}　{} 大气站{}小时浓度（北京时间；{}；{}）", index+1, day,
+            if potassium { "钾离子（K⁺）" } else { "PM₂.₅" }, range, warning))?);
+    }
+    if !types.contains("Extension=\"png\"") {
+        types = types.replace("</Types>", "<Default Extension=\"png\" ContentType=\"image/png\"/></Types>");
+    }
     let mut photo_xml = String::new();
     let mut photo_sizes = HashMap::new();
 
@@ -1501,10 +1535,21 @@ fn build_docx(
             // releasing the chain at the final caption so groups can paginate.
             let keep = if photo_index + 1 < group_photos.len() { "1" } else { "0" };
             photo_xml.push_str(&format!(r#"<w:p><w:pPr><w:keepNext w:val="{keep}"/><w:snapToGrid w:val="0"/><w:spacing w:before="0" w:after="240" w:line="240" w:lineRule="exact"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:color w:val="000000"/><w:sz w:val="20"/></w:rPr><w:t>{}-{}</w:t></w:r></w:p>"#,
-                group_index + 1, photo_index + 1));
+                group_index + 3, photo_index + 1));
         }
     }
     if photo_xml.is_empty() { photo_xml = caption_for("未筛出含最高温度标注的照片组，不列问题图片。".into())?; }
+
+    let mut air_map_xml = String::new();
+    if let Some(map) = data.air.chart.as_ref().and_then(|c| c.map.as_ref()).filter(|_| !data.without_air_data) {
+        let name = "media/airins-pm25-map.png";
+        parts.insert(format!("word/{name}"), decode_image(&map.data_url)?.0);
+        rels = rels.replace("</Relationships>", &format!(r#"<Relationship Id="rIdFlight950" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{name}"/></Relationships>"#));
+        let scale = (5_600_000.0 / map.width as f64).min(5_600_000.0 / map.height as f64);
+        air_map_xml.push_str(&image_xml(950, (map.width as f64 * scale) as i64, (map.height as f64 * scale) as i64));
+        air_map_xml.push_str(&caption_for(format!("图{}　可飞平台PM₂.₅浓度轨迹图（μg/m³；平台完整采样时段{}～{}）", groups.len()+3,
+            date(data.air.chart.as_ref().unwrap().start_time, "%m月%d日%H时%M分"), date(data.air.chart.as_ref().unwrap().end_time, "%H时%M分")))?);
+    }
 
     // Fill global fields before adding user-derived table/figure content; no
     // arbitrary strings are used as XML, and absent fields keep editable blanks.
@@ -1540,6 +1585,8 @@ fn build_docx(
     // Remove the distribution image and caption, including their template paragraph.
     block(&mut doc, "SECTION_PHOTOS", "")?;
     block(&mut doc, "PHOTOS", &photo_xml)?;
+    block(&mut doc, "AIR_MAP", &air_map_xml)?;
+    block(&mut doc, "STATION_CHARTS", &station_xml)?;
     parts.insert("word/document.xml".into(), doc.into_bytes());
     parts.insert("word/_rels/document.xml.rels".into(), rels.into_bytes());
     parts.insert("[Content_Types].xml".into(), types.into_bytes());
@@ -1743,7 +1790,7 @@ pub async fn save_flight_report(
         // Refresh station observations on every save, even when flight assets
         // came from cache or the preview has been open for a while.
         if let Some(snapshot) = data.evidence.as_mut() {
-            if let Some(end) = snapshot.trigger_hour() {
+            if let Some(end) = snapshot.station_day_end() {
                 let (rows, url, synced_at) = crate::monitoring::report_hours(&app, &end).await
                     .map_err(|e| format!("重新读取大气站数据失败：{e}"))?;
                 snapshot.city_hours = rows.into_iter().map(|row| evidence::CityHour {
@@ -2324,8 +2371,8 @@ mod tests {
         assert!(!doc.contains("高温点坐标未取得"));
         assert!(!doc.contains("点位分布"));
         assert!(!doc.contains("rIdFlight20000"));
-        assert!(doc.contains("<w:t>1-1</w:t>"));
-        assert!(doc.contains("<w:t>1-2</w:t>"));
+        assert!(doc.contains("<w:t>3-1</w:t>"));
+        assert!(doc.contains("<w:t>3-2</w:t>"));
         assert!(!doc.contains("抓拍位置分布"));
         assert!(zip.by_name("word/media/high-temperature-targets.png").is_err());
     }
@@ -2362,6 +2409,37 @@ mod tests {
         assert!(description.contains("热源性质待核实"));
     }
     #[test]
+    fn patrol_context_uses_archived_wind_and_omits_missing_invalid_or_stale_records() {
+        let mut data = sample();
+        let start = data.mission.start_time;
+        let check = |direction: Value, observed: i64, checked: i64| json!({
+            "checkedAt": checked, "weather": {"level":"ok", "current": {
+                "windDirection": direction, "observedAt": observed
+            }}
+        });
+        for (name, direction, observed, checked, expected) in [
+            ("wind", json!(135), start / 1000 - 60, start - 30000, "当时风向为东南风，执行航线为东南侧巡查航线，"),
+            ("missing", Value::Null, start / 1000 - 60, start - 30000, "执行航线为东南侧巡查航线，"),
+            ("north", json!(0), start / 1000 - 60, start - 30000, "当时风向为北风，执行航线为东南侧巡查航线，"),
+            ("invalid", json!(361), start / 1000 - 60, start - 30000, "执行航线为东南侧巡查航线，"),
+            ("stale", json!(135), start / 1000 - 3601, start - 30000, "执行航线为东南侧巡查航线，"),
+            ("future", json!(135), start / 1000, start + 1, "执行航线为东南侧巡查航线，"),
+        ] {
+            data.evidence = Some(Evidence { event: Some(json!({"route":"东南侧巡查航线", "weatherChecks":[check(direction, observed, checked)]})), ..Default::default() });
+            assert_eq!(data.evidence.as_ref().unwrap().patrol_context(start), expected);
+            let bytes = build_docx(&data, &[PNG.into(), PNG.into()], start + 86400000).unwrap();
+            if let Ok(dir) = std::env::var("TAIZHOU_PATROL_QA_DIR") {
+                if matches!(name, "wind" | "missing") { fs::write(Path::new(&dir).join(format!("{name}.docx")), &bytes).unwrap(); }
+            }
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut doc = String::new();
+            zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+            assert!(doc.contains(&format!("触发，{expected}巡航时段为")));
+            if !expected.starts_with("当时") { assert!(!doc.contains("当时风向")); }
+        }
+    }
+
+    #[test]
     fn template_summarizes_flight_and_analysis_uses_trigger_hour() {
         let mut data = sample();
         data.mission.mission_name = "钾离子超标巡查-20261103-10".into();
@@ -2385,7 +2463,7 @@ mod tests {
         assert_eq!(doc.matches("<w:tbl>").count(), 3);
         assert!(doc.contains("第202609220701期（泰智飞  第202609220701期）"));
         assert!(doc.contains("2026年09月22日06时"));
-        assert!(doc.contains("本次任务由【钾离子超标巡查-20261103-10】触发，巡航时段为"));
+        assert!(doc.contains("本次任务由【钾离子超标巡查-20261103-10】触发，执行航线为【 】，巡航时段为"));
         assert!(!doc.contains("由人工手动发起"));
         assert!(!doc.contains("触发原因待核实"));
         assert!(!doc.contains("00:00至"));
@@ -2409,6 +2487,38 @@ mod tests {
             fill_slots("{{VALUE}}", &[("VALUE", "<&> {{VALUE}}".into())]).unwrap(),
             "&lt;&amp;&gt; {{VALUE}}"
         );
+    }
+    #[test]
+    fn report_thresholds_follow_settings_strict_boundary_and_disabled_metrics() {
+        let mut data = sample();
+        let day = date(data.mission.start_time, "%Y-%m-%d");
+        data.evidence = Some(Evidence {
+            flight_hour: Some(format!("{day} 06:00:00")),
+            potassium_threshold: Some(1.5), pm25_threshold: Some(45.0),
+            city_hours: [(1.5,45.0),(1.6,46.0)].into_iter().enumerate().map(|(h,(k,pm))| evidence::CityHour {
+                time: format!("{day} {h:02}:00:00"), potassium: Some(k), pm25: Some(pm),
+                source_url: String::new(), synced_at: String::new(),
+            }).collect(), ..Default::default()
+        });
+        let document = |data: &Collected| {
+            let bytes = build_docx(data, &[PNG.into(),PNG.into()], Utc::now().timestamp_millis()).unwrap();
+            let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut doc = String::new();
+            zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+            doc
+        };
+        let doc = document(&data);
+        assert!(doc.contains("设置警戒值 45 μg/m³（红色虚线），图示时段超标 1 小时"));
+        assert!(doc.contains("设置警戒值 1.5 μg/m³（红色虚线），图示时段超标 1 小时"));
+        data.evidence.as_mut().unwrap().pm25_threshold = Some(50.0);
+        assert!(document(&data).contains("设置警戒值 50 μg/m³（红色虚线），图示时段超标 0 小时"));
+        data.evidence.as_mut().unwrap().potassium_enabled = Some(false);
+        data.evidence.as_mut().unwrap().pm25_enabled = Some(false);
+        let doc = document(&data);
+        assert!(!doc.contains("主要集中在"));
+        assert!(!doc.contains("设置警戒值"));
+        assert_eq!(doc.matches("未启用或未记录阈值，不作超标判断").count(),2);
+        assert!(doc.contains("K⁺峰值浓度达") || doc.contains("峰值浓度达"));
     }
     #[test]
     fn docx_displays_configured_threshold_and_daily_process_fields() {
@@ -2664,7 +2774,8 @@ mod tests {
         assert!(!doc.contains("算术平均"));
         assert!(!doc.contains("建议逐张"));
         assert!(!doc.contains("建议优先"));
-        assert!(!doc.contains("rIdFlight"));
+        assert!(doc.contains("rIdFlight900") && doc.contains("rIdFlight901"));
+        assert!(!doc.contains("rIdFlight1000"));
         assert!(doc.contains("空气五参数监测数据"));
         assert!(doc.contains("<w:tblGrid>"));
         assert!(!doc.contains("巡飞监测记录"));

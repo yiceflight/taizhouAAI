@@ -92,6 +92,7 @@ export const EmailSettingsSection = forwardRef<EmailSettingsHandle, { disabled?:
         </div>
         <p className="settings-help">{settings.configured ? '发信服务已预配置。' : '请填写发信地址对应的 SMTP 密码。'} 点击底部“保存设置”一并保存，之后发送报告无需重复填写。接收邮箱留空时不能发送。</p>
       </>}
+      <p className="settings-help">正式版会自动将重要异常及详细运行日志作为附件发送到 stuzhaoxing@gmail.com，复用这里的发信账号，不受报告接收邮箱设置影响。日志保留原文，不做脱敏；断网时本地排队重试，测试版不自动发送。</p>
       {error && <p className="notice warning" role="alert">{error}</p>}
       {!settings && <button type="button" className="secondary-button" onClick={() => setRevision(value => value + 1)}>重新读取邮件设置</button>}
     </>}

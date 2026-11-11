@@ -88,13 +88,22 @@ pub struct View {
     selected_route: Option<String>,
     routes_synced_at: Option<i64>,
 }
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FlightRoute {
     pub route_id: String,
     pub name: String,
     #[serde(default)]
     pub update_time: i64,
+    #[serde(default)]
+    pub folder_path: Vec<RouteFolder>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct RouteFolder { pub id: String, pub name: String }
+impl FlightRoute {
+    fn selection(&self) -> String {
+        self.folder_path.iter().map(|f| f.name.as_str()).chain(std::iter::once(self.name.as_str())).collect::<Vec<_>>().join(" / ")
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,7 +127,7 @@ fn selected_route(db: &Connection) -> Result<Option<String>, String> {
 }
 fn exact_route_match(routes: &[FlightRoute], requested: &str) -> Result<Option<String>, String> {
     let exact: Vec<_> = routes.iter()
-        .filter(|route| route_name(&route.name) == route_name(requested))
+        .filter(|route| (route_name(&route.selection()) == route_name(requested) || route_name(&route.name) == route_name(requested)))
         .cloned().collect();
     best_route_match(&exact, requested)
 }
@@ -132,7 +141,7 @@ fn best_route_match(routes: &[FlightRoute], requested: &str) -> Result<Option<St
     let wanted = route_name(requested);
     if wanted.is_empty() { return Ok(None); }
     let mut candidates: Vec<_> = routes.iter().filter_map(|route| {
-        let name = route_name(&route.name);
+        let name = if requested.contains(" / ") { route_name(&route.selection()) } else { route_name(&route.name) };
         (!name.is_empty() && (name.starts_with(&wanted) || wanted.starts_with(&name)))
             .then(|| (name.chars().count().abs_diff(wanted.chars().count()), route))
     }).collect();
@@ -141,7 +150,7 @@ fn best_route_match(routes: &[FlightRoute], requested: &str) -> Result<Option<St
     if candidates.get(1).is_some_and(|(next, _)| next == distance) {
         return Err(format!("航线“{requested}”有多个差异相同的匹配，请重新选择唯一航线。"));
     }
-    Ok(Some(route.name.clone()))
+    Ok(Some(route.selection()))
 }
 fn direction_in_rule(direction: f64, start: f64, end: f64) -> bool {
     if start < end {
@@ -657,7 +666,11 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
         return Ok(());
     }
     crate::weather::refresh_for_route(app).await;
-    let route = match launch_route(app) {
+    let route = match launch_route(app).and_then(|route| {
+        let routes = read_routes(&database(app)?)?;
+        if routes.iter().any(|r| r.selection() == route && !r.folder_path.is_empty()) { Ok(route) }
+        else { Err("航线缺少文件夹信息，请重新同步航线".into()) }
+    }) {
         Ok(route) => route,
         Err(error) => {
             event.status = "failed".into();
@@ -666,12 +679,15 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
             return Err(error);
         }
     };
+    let route_detail = read_routes(&database(app)?)?.into_iter().find(|r| r.selection() == route)
+        .ok_or("航线已变化，请重新同步并选择")?;
+    if route_detail.folder_path.is_empty() { return Err("航线缺少文件夹信息，请重新同步航线".into()); }
     event.route = Some(route.clone());
     update_current(app, &event)?;
     let auto_submit = !needs_confirmation(&database(app)?, &event)?;
     let preparation = app
         .state::<Bridge>()
-        .prepare_flight(&event.id, &event.name, &route, auto_submit)
+        .prepare_flight(&event.id, &event.name, &route_detail, auto_submit)
         .await
         .and_then(|data| {
             if data["status"] != "ready"
@@ -731,7 +747,7 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
     }
     let result = app
         .state::<Bridge>()
-        .submit_flight(&event.id, &event.name, &route)
+        .submit_flight(&event.id, &event.name, &route_detail)
         .await;
     let state = app.state::<Flight>();
     let _gate = state.gate.lock().unwrap();
@@ -1218,10 +1234,11 @@ pub async fn sync_flight_routes(
     let mut db = database(&app)?;
     let tx = db.transaction().map_err(|e| e.to_string())?;
     let previous = selected_route(&tx)?;
-    // An ambiguous replacement fails the entire sync; never silently switch routes.
+    // Keep the catalog available even if a legacy unqualified name becomes ambiguous.
+    // Clear that selection so the operator can explicitly choose a folder.
     let selected = previous.as_deref()
         .map(|previous| best_route_match(&routes, previous))
-        .transpose()?.flatten();
+        .transpose().unwrap_or(None).flatten();
     put(&tx, "flight_routes", &serde_json::to_string(&routes).map_err(|e| e.to_string())?)?;
     put(&tx, "flight_route", selected.as_deref().unwrap_or(""))?;
     put(&tx, "flight_routes_synced_at", &chrono::Utc::now().timestamp_millis().to_string())?;
@@ -1232,7 +1249,7 @@ pub async fn sync_flight_routes(
 pub fn set_flight_route(app: tauri::AppHandle, route: String) -> Result<RoutesView, String> {
     let _access = crate::data_reset::access(&app)?;
     let normalized = route_name(&route);
-    if normalized.is_empty() || normalized.len() > 200 { return Err("航线名称无效。".into()); }
+    if normalized.is_empty() || normalized.len() > 2000 { return Err("航线名称无效。".into()); }
     let db = database(&app)?;
     let routes = read_routes(&db)?;
     let chosen = exact_route_match(&routes, &route)?
@@ -1456,9 +1473,9 @@ mod tests {
     #[test]
     fn route_matching_prefers_the_smallest_difference_and_keeps_copy_names() {
         let routes = vec![
-            FlightRoute { route_id: "1".into(), name: "东南火点巡查航线".into(), update_time: 1 },
-            FlightRoute { route_id: "2".into(), name: "东南火点巡查航线-改".into(), update_time: 2 },
-            FlightRoute { route_id: "3".into(), name: "东南火点巡查航线-改-副本(6)".into(), update_time: 3 },
+            FlightRoute { route_id: "1".into(), name: "东南火点巡查航线".into(), update_time: 1, ..Default::default() },
+            FlightRoute { route_id: "2".into(), name: "东南火点巡查航线-改".into(), update_time: 2, ..Default::default() },
+            FlightRoute { route_id: "3".into(), name: "东南火点巡查航线-改-副本(6)".into(), update_time: 3, ..Default::default() },
         ];
         assert_eq!(best_route_match(&routes, "东南火点巡查航线").unwrap(), Some("东南火点巡查航线".into()));
         assert_eq!(best_route_match(&routes[1..], "东南火点巡查航线").unwrap(), Some("东南火点巡查航线-改".into()));
@@ -1469,7 +1486,7 @@ mod tests {
         let db = db();
         put(&db, "flight_route", "旧的内置航线").unwrap();
         assert_eq!(selected_route(&db).unwrap(), None);
-        let routes = vec![FlightRoute { route_id: "1".into(), name: "现场巡查航线".into(), update_time: 1 }];
+        let routes = vec![FlightRoute { route_id: "1".into(), name: "现场巡查航线".into(), update_time: 1, ..Default::default() }];
         put(&db, "flight_routes", &serde_json::to_string(&routes).unwrap()).unwrap();
         assert_eq!(selected_route(&db).unwrap(), None);
         put(&db, "flight_route", "现场巡查航线").unwrap();
@@ -1484,7 +1501,7 @@ mod tests {
             ("西风", 247.5, 292.5), ("西北风", 292.5, 337.5),
         ];
         let routes: Vec<_> = sectors.iter().enumerate().map(|(i, (name, _, _))| FlightRoute {
-            route_id: i.to_string(), name: name.to_string(), update_time: 1,
+            route_id: i.to_string(), name: name.to_string(), update_time: 1, ..Default::default()
         }).collect();
         let mut settings = crate::settings::Settings::default();
         settings.route_selection_mode = "wind".into();
@@ -1506,8 +1523,8 @@ mod tests {
     #[test]
     fn wind_route_rules_match_normal_and_cross_zero_ranges() {
         let routes = vec![
-            FlightRoute { route_id: "1".into(), name: "东南航线".into(), update_time: 1 },
-            FlightRoute { route_id: "2".into(), name: "西北航线".into(), update_time: 1 },
+            FlightRoute { route_id: "1".into(), name: "东南航线".into(), update_time: 1, ..Default::default() },
+            FlightRoute { route_id: "2".into(), name: "西北航线".into(), update_time: 1, ..Default::default() },
         ];
         let mut settings = crate::settings::Settings::default();
         settings.route_selection_mode = "wind".into();
@@ -1523,8 +1540,8 @@ mod tests {
     #[test]
     fn wind_route_fallback_handles_missing_invalid_and_unconfigured_directions() {
         let routes = vec![
-            FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1 },
-            FlightRoute { route_id: "2".into(), name: "北侧航线".into(), update_time: 1 },
+            FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1, ..Default::default() },
+            FlightRoute { route_id: "2".into(), name: "北侧航线".into(), update_time: 1, ..Default::default() },
         ];
         let mut settings = crate::settings::Settings::default();
         settings.route_selection_mode = "wind".into();
@@ -1561,7 +1578,7 @@ mod tests {
         settings.route_selection_mode = "wind".into();
         crate::settings::save_and_reconcile(&db, &settings, now()).unwrap();
         assert!(route_configuration_ready(&db).unwrap_err().contains("默认航线"));
-        let routes = vec![FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1 }];
+        let routes = vec![FlightRoute { route_id: "1".into(), name: "默认航线".into(), update_time: 1, ..Default::default() }];
         put(&db, "flight_routes", &serde_json::to_string(&routes).unwrap()).unwrap();
         put(&db, "flight_route", "已删除航线").unwrap();
         assert!(route_configuration_ready(&db).is_err());
@@ -1570,7 +1587,7 @@ mod tests {
     }
     #[test]
     fn wind_route_rules_support_platform_copy_names() {
-        let routes = vec![FlightRoute { route_id: "1".into(), name: "东南航线-副本(2)".into(), update_time: 1 }];
+        let routes = vec![FlightRoute { route_id: "1".into(), name: "东南航线-副本(2)".into(), update_time: 1, ..Default::default() }];
         let mut settings = crate::settings::Settings::default();
         settings.route_selection_mode = "wind".into();
         settings.wind_route_rules = vec![crate::settings::WindRouteRule { start_degrees: 0.0, end_degrees: 90.0, route: "东南航线".into() }];
@@ -3419,7 +3436,7 @@ mod tests {
 
     #[test]
     fn prefix_route_distance_handles_unicode_exact_matches_and_ambiguity() {
-        let route = |name: &str, id: &str| FlightRoute {name:name.into(), route_id:id.into(), update_time:0};
+        let route = |name: &str, id: &str| FlightRoute {name:name.into(), route_id:id.into(), update_time:0, ..Default::default() };
         let routes = vec![route("北侧航线-副本(123)", "1"), route("北侧航线-副本(1)", "2")];
         assert_eq!(best_route_match(&routes, " 北侧 航线 ").unwrap().as_deref(), Some("北侧航线-副本(1)"));
         assert_eq!(best_route_match(&routes, "北侧航线-副本(123)").unwrap().as_deref(), Some("北侧航线-副本(123)"));
@@ -3494,4 +3511,20 @@ mod tests {
         assert_eq!(claim_due(&db,event.launch_at.unwrap()).unwrap().unwrap().id,event.id);
     }
 
+}
+
+#[cfg(test)]
+mod folder_route_tests {
+    use super::*;
+    #[test]
+    fn folder_names_disambiguate_routes_and_legacy_names_fail_closed() {
+        let routes = vec![
+            FlightRoute { route_id: "one".into(), name: "巡查航线".into(), folder_path: vec![RouteFolder{id:"a".into(),name:"日常巡逻".into()}], ..Default::default() },
+            FlightRoute { route_id: "two".into(), name: "巡查航线".into(), folder_path: vec![RouteFolder{id:"b".into(),name:"油烟巡查".into()}], ..Default::default() },
+        ];
+        assert!(exact_route_match(&routes,"巡查航线").is_err());
+        assert_eq!(exact_route_match(&routes,"日常巡逻 / 巡查航线").unwrap(),Some("日常巡逻 / 巡查航线".into()));
+        let restored: Vec<FlightRoute> = serde_json::from_str(&serde_json::to_string(&routes).unwrap()).unwrap();
+        assert_eq!(restored,routes);
+    }
 }

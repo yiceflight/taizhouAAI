@@ -6,6 +6,7 @@ export type ReportSummary = { id: string; createdAt: number; source: string; tit
 export const tabKey = (tab: BrowserTab) => `${tab.session}:${tab.id}`;
 export type SiteHealth = { id: string; state: 'blocked' | 'unchecked' | 'not_open' | 'ready' | 'login_required' | 'forbidden' | 'page_required' | 'error'; message: string; checkedAt: string | null; session: string | null; tabId: number | null; url: string | null };
 export type Readiness = {
+  checks?: { id: string; message: string; elapsedSeconds: number; remainingSeconds: number; dispatched: boolean }[];
   monitoringReady?: boolean; flightReady?: boolean; reportReady?: boolean; pluginReady: boolean; pluginMessage: string; pluginUpdateRequired: boolean; minimumExtensionVersion: string; checking: boolean; sites: SiteHealth[]; ready: boolean; started: boolean };
 export type HourRow = { time: string; potassium: number | null; pm25: number | null };
 export type NoFlyPeriod = { start: string; end: string };
@@ -13,7 +14,7 @@ export type NoFlyPeriod = { start: string; end: string };
 export type RouteSelectionMode = 'fixed' | 'wind';
 export type WindRouteRule = { startDegrees: number; endDegrees: number; route: string };
 export type WorkspaceSettings = { potassiumEnabled?: boolean; pm25Enabled?: boolean; potassiumThreshold: number; pm25Threshold: number; takeoffDelayMinutes: number; requireManualConfirmation: boolean; noFlyPeriods?: NoFlyPeriod[]; routeSelectionMode?: RouteSelectionMode; windRouteRules?: WindRouteRule[] };
-export type FlightRoute = { routeId: string; name: string; updateTime?: number };
+export type FlightRoute = { routeId: string; name: string; updateTime?: number; folderPath?: { id: string; name: string }[] };
 export const defaultSettings: WorkspaceSettings = { potassiumThreshold: 1.0, pm25Threshold: 30, takeoffDelayMinutes: 5, requireManualConfirmation: true, noFlyPeriods: [{ start: '05:00', end: '08:00' }], windRouteRules: [] };
 export type FlightEvent = { id: string; observedAt: string; sourceHour?: string | null; potassium: number | null; pm25?: number | null; route?: string | null; name: string; status: 'countdown' | 'preparing' | 'ready' | 'submitting' | 'submitted' | 'uncertain' | 'flying' | 'paused' | 'completed' | 'flight_error' | 'failed' | 'not_flown' | 'restricted' | 'canceled' | 'dismissed'; error: string | null; preview: boolean; source?: string; launchAt?: number | null; statusCheckError?: string | null; statusCheckedAt?: number | null; weatherOverrideConfirmedAt?: number | null; weatherChecks?: WeatherCheck[]; resolvedAt?: number | null; flightTime?: FlightTime | null };
 export type MonitorView = { weather?: WeatherView; enabled: boolean; syncing: boolean; lastAttempt: string | null; lastSuccess: string | null; error: string | null; total: number; rows: HourRow[]; queryThrough: string | null; settings: WorkspaceSettings; flight: { threshold: number; delayMinutes?: number; event: FlightEvent | null; records?: FlightEvent[]; tasksClearedAt?: number | null; routes?: FlightRoute[]; selectedRoute?: string; routesSyncedAt?: number | null } };

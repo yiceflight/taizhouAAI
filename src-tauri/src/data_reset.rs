@@ -55,7 +55,7 @@ fn remove_child(path: &Path) -> Result<bool, String> {
 
 fn clear_known_files(app_data: &Path) -> Result<Vec<String>, String> {
     let mut removed = Vec::new();
-    for name in [REPORTS_DIR, RUNTIME_LOG_EXPORTS_DIR, PHOTO_REVIEWS] {
+    for name in [REPORTS_DIR, RUNTIME_LOG_EXPORTS_DIR, PHOTO_REVIEWS, "last-panic.txt"] {
         let path = app_data.join(name);
         if remove_child(&path)? {
             removed.push(name.to_owned());

@@ -23,6 +23,10 @@
 - `pnpm exec vitest run tests/email-settings.test.tsx tests/settings-flight.test.tsx tests/data-reset-ui.test.tsx tests/patrol-tab.test.tsx`
 - `cargo test --manifest-path src-tauri/Cargo.toml email::tests`（默认不发信，仅使用临时目录验证文件存储）
 
+## 重要异常邮件
+
+正式版会复用以上发信账号，自动将重要异常日志 ZIP 附件发送到 `stuzhaoxing@gmail.com`。该收件地址固定，不受报告接收邮箱列表影响，报告接收邮箱为空也可发送诊断邮件。没有发信密码或网络失败时保留待发附件并重试。详细行为与覆盖边界见 [诊断邮件](diagnostic-email.md)。
+
 ## Word 附件大小与图片压缩
 
 新生成/重新生成 Word 时自动优化展示图片，保留像素尺寸；JPG 和 PNG 截图使用带全分辨率质量检查的 JPEGli 编码，JPG 另保留像素一致的无损优化候选。压缩失败或质量不达标则保留原图，原始归档不受影响。旧 Word 需重新生成。

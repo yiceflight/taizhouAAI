@@ -3,12 +3,15 @@ export const PLAN_URL = 'https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5
 export const PLAN_RECIPE = Object.freeze({
   device: '泰州环境监测', dock: 'Dock 3', aircraft: 'Matrice 4TD',
   precision: '高精度 RTK', strategy: '立即', returnHeight: 110,
-  lostLink: '返航', completion: '自动返航', media: '全部文件', subscriber: '运维',
+  lostLink: '返航', completion: '自动返航', media: '全部文件',
 });
 export function validatePlanJob(job) {
   if (job.type !== 'dji-prepare' || job.submit !== false || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
       typeof job.name !== 'string' || !/^((钾离子超标巡查|PM2\.5超标巡查|司空填写演练)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
-      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
+      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200 ||
+      !/^[a-f0-9-]{36}$/.test(job.routeId || '') ||
+      !Array.isArray(job.folderPath) || !job.folderPath.length || job.folderPath.length > 50 ||
+      job.folderPath.some(folder => !folder || typeof folder.id !== 'string' || !folder.id || typeof folder.name !== 'string' || !folder.name.trim())) {
     throw new Error('司空任务参数无效；只允许填写，禁止提交');
   }
 }
@@ -16,7 +19,10 @@ export function validatePlanJob(job) {
 export function validateSubmitJob(job) {
   if (job.type !== 'dji-submit' || job.submit !== true || !/^[a-f0-9-]{36}$/.test(job.eventId || '') ||
       typeof job.name !== 'string' || !/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(job.name) ||
-      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200) {
+      typeof job.route !== 'string' || !job.route.trim() || job.route.length > 200 ||
+      !/^[a-f0-9-]{36}$/.test(job.routeId || '') ||
+      !Array.isArray(job.folderPath) || !job.folderPath.length || job.folderPath.length > 50 ||
+      job.folderPath.some(folder => !folder || typeof folder.id !== 'string' || !folder.id || typeof folder.name !== 'string' || !folder.name.trim())) {
     throw new Error('起飞任务参数无效；演练任务禁止提交');
   }
 }
@@ -218,30 +224,120 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   if (!routePrefix) throw new Error('指定航线为空，已停止填写');
   const routeNames = root => all('*', root).filter(e => text(e).startsWith(routePrefix)
     && ![...e.children].some(c => visible(c) && text(c).startsWith(routePrefix)));
+  let observedRoutes = [];
+  const libraryIdentity = (element, library) => {
+    const card = element.closest('.component-plan-app-wayline-item');
+    // The prepared form also renders a route card; it is not a library row.
+    const cards = all('.component-plan-app-wayline-item', library);
+    const index = cards.indexOf(card);
+    // Match the entire rendered list after the response, not just a same-name card.
+    if (cards.length !== observedRoutes.length || cards.some((c, i) =>
+      !leaves(observedRoutes[i].name, c).length)) return null;
+    return observedRoutes[index] ?? null;
+  };
   const routeSelected = () => {
     const matches = routeNames(form);
     if (matches.length > 1) throw new Error('已选航线不唯一，已停止填写');
     return matches.length === 1;
   };
-  if (!routeSelected()) {
+  if (!routeSelected() || (!submit && recipe.folderPath?.length)) {
     if (submit) throw new Error('指定航线已变化，未提交');
+    const originalOpen = globalThis.XMLHttpRequest?.prototype.open;
+    const originalFetch = globalThis.fetch;
+    const observe = (url, result) => {
+      try {
+        const request = new URL(url, location.href);
+        const target = recipe.folderPath?.at(-1)?.id;
+        if (!target || !request.pathname.endsWith('/web-waylines') || request.searchParams.get('file_type') !== '5' || request.searchParams.get('parent_id') !== target || result.code !== 0) return;
+        const data = result.data?.data ?? result.data;
+        if (!Array.isArray(data?.list)) return;
+        const page = Number(request.searchParams.get('page') || 1);
+        if (page === 1) observedRoutes = data.list;
+        else if (observedRoutes.length === (page - 1) * 20) observedRoutes = observedRoutes.concat(data.list);
+      } catch { /* Unknown responses never establish route identity. */ }
+    };
+    if (recipe.folderPath?.length && originalOpen) {
+      globalThis.XMLHttpRequest.prototype.open = function(method, url, ...args) {
+        if (String(method).toUpperCase() === 'GET') this.addEventListener('load', () => {
+          try { observe(String(url), this.responseType === 'json' ? this.response : JSON.parse(this.responseText)); } catch {}
+        }, { once: true });
+        return originalOpen.call(this, method, url, ...args);
+      };
+    }
+    if (recipe.folderPath?.length && originalFetch) globalThis.fetch = async function(...args) {
+      const response = await originalFetch.apply(this, args);
+      try { observe(typeof args[0] === 'string' ? args[0] : args[0].url, await response.clone().json()); } catch {}
+      return response;
+    };
+    try {
     choose('选择航线', form);
     const library = await wait(() => {
       const titles = leaves('航线库');
       if (!titles.length) return null;
       let root = unique(titles, '航线库').parentElement;
       while (root && root !== document.body && !root.contains(form)) {
-        if (routeNames(root).length) return root;
+        if (all('.wayline-folder-tree', root).length || (!recipe.folderPath?.length && routeNames(root).length)) return root;
         root = root.parentElement;
       }
       return null;
     }, '航线库内的指定航线');
-    const candidates = routeNames(library);
+    if (recipe.folderPath?.length) {
+      const tree = unique(all('.wayline-folder-tree', library), '航线文件夹');
+      const findFolder = folder => all('[data-id]', tree).filter(e => e.getAttribute('data-id') === folder.id);
+      for (let index = 0; index < recipe.folderPath.length; index += 1) {
+        const folder = recipe.folderPath[index];
+        const row = unique(await wait(() => findFolder(folder).length ? findFolder(folder) : null, '航线文件夹'), '航线文件夹');
+        const label = unique(leaves(folder.name, row), '航线文件夹名称');
+        if (index === recipe.folderPath.length - 1 && (row.classList.contains('uranus-tree-item-selected') || row.classList.contains('folder-item-highlight')) && !observedRoutes.length) {
+          const other = all('[data-id]', tree).find(e => e !== row);
+          if (other) {
+            click(unique(all('.uranus-tree-node-name', other), '其他航线文件夹'));
+            await new Promise(resolve => setTimeout(resolve, 150));
+          } else {
+            await wait(() => observedRoutes.length, '当前目录航线响应（若未加载请关闭航线库后重试）');
+          }
+        }
+        click(label);
+        await wait(() => row.classList.contains('uranus-tree-item-selected') || row.classList.contains('folder-item-highlight'), '文件夹选中状态');
+        const next = recipe.folderPath[index + 1];
+        if (next && !findFolder(next).length) {
+          const icon = row.querySelector('.uranus-tree-node-content > :first-child');
+          if (!icon) throw new Error('无法展开航线文件夹');
+          click(icon);
+        }
+      }
+      // Verify the rendered card's actual API identity. A folder highlight or
+      // a same-name stale card is not proof that the asynchronous list loaded.
+      await wait(() => {
+        if (all('.icon-loading', library).length) return false;
+        const found = routeNames(library).some(e => {
+          const item = libraryIdentity(e, library);
+          return item?.id === recipe.routeId && item.parent_id === recipe.folderPath.at(-1).id;
+        });
+        if (!found && !all('[class*="spin-spinning"],[aria-busy="true"]', library).length) {
+          for (const element of all('*', library)) {
+            if (!tree.contains(element) && element.scrollHeight > element.clientHeight && element.clientHeight > 0) element.scrollTop = element.scrollHeight;
+          }
+        }
+        return found;
+      }, '目标文件夹内的航线身份');
+    }
+    const candidates = routeNames(library).filter(e => {
+      if (!recipe.folderPath?.length) return true;
+      const item = libraryIdentity(e, library);
+      return text(e) === routePrefix && item?.id === recipe.routeId && item.parent_id === recipe.folderPath.at(-1).id;
+    });
     const distance = e => [...text(e)].length - [...routePrefix].length;
     const minimum = Math.min(...candidates.map(distance));
     click(unique(candidates.filter(e => distance(e) === minimum), '差异最小的指定航线'));
     await wait(routeSelected, '选中航线');
+    if (recipe.folderPath?.length) form.dataset.aaiRouteIdentity = JSON.stringify([recipe.routeId, recipe.folderPath]);
+    } finally {
+      if (recipe.folderPath?.length && originalOpen) globalThis.XMLHttpRequest.prototype.open = originalOpen;
+      if (recipe.folderPath?.length && originalFetch) globalThis.fetch = originalFetch;
+    }
   }
+  if (recipe.folderPath?.length && form.dataset.aaiRouteIdentity !== JSON.stringify([recipe.routeId, recipe.folderPath])) throw new Error('航线文件夹选择凭据已失效，请重新准备计划');
   const deviceCards = root => {
     // Smallest visible card containing both model and exact device label.
     return all('*', root).filter(e => text(e).includes(norm(recipe.dock)) && text(e).includes(norm(recipe.device)) && text(e).includes(norm(recipe.aircraft)))
@@ -258,25 +354,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   if (!submit) for (const label of [recipe.precision, recipe.strategy, recipe.lostLink]) choose(label, form);
   const height = field('最低返航高度（相对机场）', 'input', form);
   if (!submit) setInput(height, recipe.returnHeight);
-  if (!submit) choose('编辑', form);
-  const notice = await wait(() => {
-    const titles = leaves('告警通知设置'); if (titles.length !== 1) return null;
-    let e = titles[0].parentElement;
-    while (e && e !== document.body) { if (leaves('订阅人员', e).length && all('input[type="checkbox"],[role="checkbox"]', e).length) return e; e = e.parentElement; }
-    return null;
-  }, '告警通知设置');
-  const channels = [['站内通知', true], ['短信', false], ['邮件', false]].map(([label, value]) => {
-    const controls = all('input[type="checkbox"],[role="checkbox"]', notice).filter(e => text(e.closest('label') || e.parentElement) === norm(label));
-    const input = unique(controls, label); if (!submit) toggle(input, value, label); return { input, value, label };
-  });
-  const frequencyInputs = all('input', notice).filter(e => e.type !== 'checkbox' && !['搜索', '请输入'].some(s => (e.placeholder || '').includes(s)));
-  const frequency = unique(frequencyInputs, '告警频率'); if (!submit) setInput(frequency, 0);
-  const subscriberRow = unique(all('tr,[role="row"]', notice).filter(e => leaves(recipe.subscriber, e).length), '订阅人员运维');
-  const rows = all('tr,[role="row"]', notice).filter(e => all('td,[role="cell"]', e).length);
-  for (const row of rows) {
-    const controls = all('input[type="checkbox"]', row).length ? all('input[type="checkbox"]', row) : all('[role="checkbox"]', row);
-    if (!submit && controls.length) toggle(unique(controls, '订阅人员勾选框'), row === subscriberRow, '订阅人员');
-  }
+  // Notification channels, frequency and subscribers are left to FlightHub.
   // Route/device selection may asynchronously replace the platform's default
   // name. Fill the name last, after all dependent selections have settled.
   await new Promise(resolve => setTimeout(resolve, 300)); check();
@@ -296,11 +374,9 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   };
   const checks = [
     [finalNameInput.value === name, '计划名称'], [Number(height.value) === recipe.returnHeight, '最低返航高度（相对机场）'],
-    [Number(frequency.value) === 0, '告警频率'],
     ...[recipe.precision, recipe.strategy, recipe.lostLink, '普通任务'].map(label => [selected(label), label]),
     [routeSelected(), '执行航线'], [deviceCards(form).length === 1, '选择设备'],
     [leaves(recipe.completion, form).length === 1, '完成动作'], [leaves(recipe.media, form).length === 1, '媒体存储位置'],
-    [leaves(recipe.subscriber, form).length === 1, '订阅人员'],
   ];
   const failed = checks.filter(([ok]) => !ok).map(([, label]) => label);
   if (failed.length) throw new Error(`填写核对未通过：${failed.join('、')}；未点击确定`);
@@ -308,15 +384,6 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
     if (checked(field(label, '[role="switch"],input[type="checkbox"]', form)) !== false) throw new Error(`${label}未关闭`);
     checks.push([true, label]);
   }
-  for (const { input, value, label } of channels) {
-    if (checked(input) !== value) throw new Error(`${label}未通过核对`);
-    checks.push([true, label]);
-  }
-  for (const row of rows) {
-    const controls = all('input[type="checkbox"]', row).length ? all('input[type="checkbox"]', row) : all('[role="checkbox"]', row);
-    if (controls.length && checked(controls[0]) !== (row === subscriberRow)) throw new Error('订阅人员未通过核对');
-  }
-  checks.push([true, '订阅人员勾选']);
   let footer = form;
   while (footer && !leaves('确定', footer).length) footer = footer.parentElement;
   const confirmation = unique(leaves('确定', footer || form), '最终确定按钮');

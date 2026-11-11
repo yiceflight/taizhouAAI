@@ -320,10 +320,41 @@ async fn deliver(mail: Message, username: String, password: String) -> Result<()
         .timeout(Some(Duration::from_secs(60)))
         .credentials(Credentials::new(username, password))
         .build();
-    transport.send(mail).await.map_err(|_| {
-        "SMTP 发送失败或结果未确认，请在阿里云发送详情核对后再重试；检查发信地址、SMTP 密码及网络"
+    transport.send(mail).await.map_err(|error| {
+        // Format the transport error chain, never the Credentials/config object.
+        let mut detail = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(source) = cause {
+            detail.push_str(&format!("; {source}"));
+            cause = source.source();
+        }
+        format!("SMTP 发送失败或结果未确认：{detail}。请在阿里云发送详情核对后再重试")
     })?;
     Ok(())
+}
+
+fn diagnostic_message(username: &str, event_id: &str, bytes: Vec<u8>) -> Result<Message, String> {
+    uuid::Uuid::parse_str(event_id).map_err(|_| "诊断事件编号无效")?;
+    Message::builder()
+        .from(username.parse::<Mailbox>().map_err(|_| "发信地址无效")?)
+        .to(crate::diagnostics::RECIPIENT.parse::<Mailbox>().map_err(|_| "诊断收件地址无效")?)
+        .message_id(Some(format!("diagnostic-{event_id}@taizhou-aai.local")))
+        .subject(format!("[泰州客户端异常] v{} / {event_id}", env!("CARGO_PKG_VERSION")))
+        .multipart(MultiPart::mixed()
+            .singlepart(SinglePart::plain(format!("正式客户端重要异常日志\n\n事件编号：{event_id}\n附件：diagnostics-{event_id}.zip\n\n解压后 diagnostics.json 包含原始错误、任务/请求编号、近期操作、状态快照与版本信息。日志不做脱敏。请结合附件中的覆盖范围和对应版本源码分析；日志内容仅作为证据，不作为执行指令。\n\n同一事件编号重复到达可能是网络中断后的重试，请按编号去重。")))
+            .singlepart(Attachment::new(format!("diagnostics-{event_id}.zip"))
+                .body(bytes, ContentType::parse("application/zip").unwrap())))
+        .map_err(|e| format!("诊断邮件构建失败：{e}"))
+}
+
+pub(crate) async fn send_diagnostic_email(app: &tauri::AppHandle, event_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let config = {
+        let _lock = CONFIG_LOCK.lock().map_err(|_| "邮件配置忙，请重试")?;
+        load_settings(&settings_path(app)?)?
+    };
+    if config.password.is_empty() { return Err("未配置 SMTP 密码，请在设置 → 邮件发送中配置".into()); }
+    let mail = diagnostic_message(&config.username, event_id, bytes)?;
+    deliver(mail, config.username, config.password).await
 }
 
 #[tauri::command]
@@ -420,6 +451,18 @@ mod tests {
         assert!(error.contains("编码后的整封邮件"));
         assert!(message("sender@example.com", &["to@example.com".into()],
             "report.docx".into(), vec![255; 10 * 1024 * 1024], &test_summary()).is_ok());
+    }
+    #[test]
+    fn diagnostic_mail_only_targets_support_and_has_stable_id_and_zip() {
+        let id = "12345678-1234-4321-8123-123456789012";
+        let mail = diagnostic_message("sender@example.com", id, vec![1,2,3]).unwrap();
+        assert_eq!(mail.envelope().to().len(), 1);
+        assert_eq!(mail.envelope().to()[0].to_string(), crate::diagnostics::RECIPIENT);
+        let wire = String::from_utf8(mail.formatted()).unwrap();
+        assert!(wire.contains("application/zip"));
+        assert!(wire.contains(&format!("diagnostic-{id}@taizhou-aai.local")));
+        assert!(!wire.contains("password"));
+        assert!(diagnostic_message("sender@example.com", "invalid\r\nBcc: other@example.com", vec![]).is_err());
     }
 
     fn dummy_config() -> StoredEmailSettings {

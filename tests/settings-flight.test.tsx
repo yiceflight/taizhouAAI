@@ -125,11 +125,11 @@ it('keeps the confirmation available and shows storage errors on clear failure',
 it('shows the synced route choice and persists a changed route prefix', async () => {
   await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[{ routeId: 'r1', name: '东南火点巡查航线-改' }, { routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }]} selectedRoute="东南火点巡查航线-改" onClose={onClose} onSaved={onSaved} />));
   const trigger = document.querySelector<HTMLButtonElement>('#flight-route')!;
-  const select = trigger.parentElement!.querySelector<HTMLSelectElement>('select')!;
+  await act(async () => trigger.click());
   expect(trigger.textContent).toBe('东南火点巡查航线-改');
-  expect([...select.options].map(option => option.textContent)).toEqual(['东南火点巡查航线-改', '东南火点巡查航线-改-副本(6)']);
+  expect([...document.querySelectorAll('.route-tree-route > span:first-child')].map(option => option.textContent)).toEqual(['东南火点巡查航线-改', '东南火点巡查航线-改-副本(6)']);
   ipc.invoke.mockResolvedValueOnce({ routes: [{ routeId: 'r2', name: '东南火点巡查航线-改-副本(6)' }], selected: '东南火点巡查航线-改-副本(6)' });
-  await act(async () => { select.options[1].selected = true; select.dispatchEvent(new window.Event('change', { bubbles: true })); });
+  await act(async () => (document.querySelectorAll<HTMLButtonElement>('.route-tree-route')[1]).click());
   expect(ipc.invoke).toHaveBeenCalledWith('set_flight_route', { route: '东南火点巡查航线-改-副本(6)' });
 });
 it('configures eight Chinese wind choices and persists the matching sector', async () => {
@@ -251,8 +251,8 @@ it('serializes route selection with clearing so a late selection cannot restore 
   await clickText('清空数据');
   let finish!: (value: unknown) => void;
   ipc.invoke.mockImplementationOnce(() => new Promise(resolve => {finish=resolve;}));
-  const select=document.querySelector('#flight-route')!.parentElement!.querySelector<HTMLSelectElement>('select')!;
-  await act(async () => { select.options[1].selected=true; select.dispatchEvent(new window.Event('change',{bubbles:true})); });
+  await act(async () => document.querySelector<HTMLButtonElement>('#flight-route')!.click());
+  await act(async () => document.querySelectorAll<HTMLButtonElement>('.route-tree-route')[1].click());
   // Programmatic clicks can bypass disabled fieldsets in a DOM fixture. The shared lock still rejects them.
   await clickText('确认清空数据');
   expect(ipc.invoke.mock.calls.map(call=>call[0])).toEqual(['set_flight_route']);
@@ -276,4 +276,36 @@ it('requires at least one configured metric', async () => {
   await submit();
   expect(ipc.invoke).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain('请至少设置一个监测阈值');
+});
+
+it('shows the folder-qualified route selection for duplicate route names', async () => {
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} flightReady routes={[
+    {routeId:'one',name:'巡查航线',folderPath:[{id:'a',name:'日常巡逻'}]},
+    {routeId:'two',name:'巡查航线',folderPath:[{id:'b',name:'油烟巡查'}]},
+  ]} selectedRoute="日常巡逻 / 巡查航线" onClose={onClose} onSaved={onSaved} />));
+  expect(document.querySelector('#flight-route')?.textContent).toContain('日常巡逻 / 巡查航线');
+  expect(document.querySelector('#flight-route')?.textContent).not.toContain('需重新同步');
+});
+
+it('expands folders independently and selects duplicate names with their full paths', async () => {
+  const routes = [{routeId:'a',name:'巡查航线',folderPath:[{id:'daily',name:'日常巡逻'}]}, {routeId:'b',name:'巡查航线',folderPath:[{id:'smoke',name:'油烟巡查'}]}];
+  await act(async () => root.render(<SettingsDialog settings={defaultSettings} routes={routes} selectedRoute="日常巡逻 / 巡查航线" onClose={onClose} onSaved={onSaved} />));
+  await act(async () => document.querySelector<HTMLButtonElement>('#flight-route')!.click());
+  expect(document.querySelector('[role="tree"]')?.closest('dialog')).not.toBeNull();
+  expect(document.querySelectorAll('.route-tree-folder')).toHaveLength(2);
+  const first = document.querySelector<HTMLButtonElement>('.route-tree-folder')!;
+  await act(async () => first.click());
+  expect(first.getAttribute('aria-expanded')).toBe('false');
+  expect(document.querySelectorAll('.route-tree-route')).toHaveLength(1);
+  expect(ipc.invoke).not.toHaveBeenCalled();
+  ipc.invoke.mockResolvedValueOnce({routes,selected:'油烟巡查 / 巡查航线'});
+  await act(async () => document.querySelector<HTMLButtonElement>('.route-tree-route')!.click());
+  expect(ipc.invoke).toHaveBeenCalledWith('set_flight_route',{route:'油烟巡查 / 巡查航线'});
+  expect(document.querySelector('[role="tree"]')).toBeNull();
+});
+it('saves folder-qualified wind rules', async () => {
+  const route='日常巡逻 / 巡查航线';
+  await act(async () => root.render(<SettingsDialog settings={{...defaultSettings,windRouteRules:[{startDegrees:337.5,endDegrees:22.5,route}]}} routes={[{routeId:'a',name:'巡查航线',folderPath:[{id:'daily',name:'日常巡逻'}]}]} selectedRoute={route} onClose={onClose} onSaved={onSaved} />));
+  await submit();
+  expect(ipc.invoke).toHaveBeenCalledWith('save_workspace_settings',{settings:expect.objectContaining({windRouteRules:[{startDegrees:337.5,endDegrees:22.5,route}]})});
 });

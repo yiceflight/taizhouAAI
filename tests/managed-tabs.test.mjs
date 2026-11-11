@@ -4,13 +4,19 @@ import { createManagedChrome } from '../extension/src/managed-tabs.js';
 
 function fixture() {
   const tabs = new Map([[1, { id: 1, url: 'https://fh.dji.com/', windowId: 1, groupId: -1 }]]);
-  const groups = new Map(), saved = {};
+  const groups = new Map(), saved = {}, localSaved = {};
   let nextTab = 2, nextGroup = 1, fail = false;
   const api = {
     runtime: { getManifest: () => ({ name: '浏览器桥接' }) },
-    storage: { session: { get: async () => saved, set: async value => Object.assign(saved, value) } },
+    storage: {
+      session: { get: async () => saved, set: async value => Object.assign(saved, value) },
+      local: { get: async () => localSaved, set: async value => Object.assign(localSaved, value) },
+    },
     tabGroups: {
-      query: async ({ title }) => [...groups.values()].filter(g => g.title === title),
+      query: async ({ title, groupId } = {}) => {
+        if (Number.isInteger(groupId)) return [...tabs.values()].filter(t => t.groupId === groupId);
+        return [...groups.values()].filter(g => title === undefined || g.title === title);
+      },
       get: async id => { if (!groups.has(id)) throw Error('closed'); return groups.get(id); },
       update: async (id, value) => Object.assign(groups.get(id), value),
     },
@@ -30,7 +36,7 @@ function fixture() {
       },
     },
   };
-  return { api, tabs, groups, setFailure: () => { fail = true; } };
+  return { api, tabs, groups, saved, localSaved, setFailure: () => { fail = true; } };
 }
 
 test('concurrent creation uses one group and excludes personal platform pages', async () => {
@@ -47,6 +53,7 @@ test('concurrent creation uses one group and excludes personal platform pages', 
 test('worker restart reuses group, existing owned tab moves across windows, group closure recovers', async () => {
   const f = fixture();
   const first = await createManagedChrome(f.api).tabs.create({ url: 'https://fh.dji.com/' });
+  for (const key of Object.keys(f.saved)) delete f.saved[key];
   const chrome = createManagedChrome(f.api);
   f.tabs.set(20, { id: 20, windowId: 9, groupId: -1, pinned: true });
   const moved = await chrome.tabs.get(20);
@@ -64,4 +71,17 @@ test('grouping failure closes only the newly created page and fails the operatio
   const f = fixture(); f.setFailure();
   await assert.rejects(createManagedChrome(f.api).tabs.create({}), /group failed/);
   assert.deepEqual([...f.tabs.keys()], [1]);
+});
+
+test('reuses and merges duplicate same-named groups after a worker restart', async () => {
+  const f = fixture();
+  f.groups.set(10, { id: 10, windowId: 1, title: '泰州监测 · App 托管' });
+  f.groups.set(11, { id: 11, windowId: 2, title: '泰州监测 · App 托管' });
+  f.tabs.set(20, { id: 20, windowId: 2, groupId: 11, pinned: false });
+  const chrome = createManagedChrome(f.api);
+  const tab = await chrome.tabs.create({ url: 'https://fh.dji.com/', active: false });
+  assert.equal(tab.groupId, 10);
+  assert.equal(f.tabs.get(20).groupId, 10);
+  assert.equal(f.tabs.get(20).windowId, 1);
+  assert.equal(f.groups.size, 2);
 });

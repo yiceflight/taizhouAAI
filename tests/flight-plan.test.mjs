@@ -449,3 +449,33 @@ test('folder selection ignores an existing selected route card outside the libra
  assert.equal(f.chosenRoute(),TEST_ROUTE);
  assert.equal(f.submissions(),0);
 });
+
+test('automatic preparation accepts verified flight fields while still rejecting a missing safety check', async () => {
+  const {readFile}=await import('node:fs/promises');
+  const worker=await readFile(new URL('../extension/src/service-worker.js',import.meta.url),'utf8');
+  const source=worker.slice(worker.indexOf('async function prepareFlight(job)'),worker.indexOf('async function submitFlight(job)'));
+  const f=fixture();
+  const filled=await f.prepare();
+  for (const missing of [null,'选择设备','最低返航高度（相对机场）']) {
+    const stored={};const messages=[];
+    const result={...filled,verified:filled.verified.filter(label=>label!==missing)};
+    const chrome={storage:{local:{get:async key=>({[key]:stored[key]}),set:async values=>Object.assign(stored,values)}},tabs:{
+      create:async()=>({id:42,status:'complete',url:PLAN_URL}),
+      get:async()=>({id:42,status:'complete',url:filled.url}),
+      sendMessage:async(id,message)=>{messages.push(message);return {ok:true};},
+    },debugger:{sendCommand:async()=>({result:{value:result}})}};
+    const execute=runInNewContext(`let capturing=false; ${source}; prepareFlight`,{
+      chrome,validatePlanJob,PLAN_URL,PLAN_RECIPE,fillFlightPlan,evaluationValue,
+      debuggerSession:{acquire:async()=>true,release:async()=>{}},Date,JSON,
+    });
+    const task=execute({...job,autoSubmit:true});
+    if(missing) {
+      await assert.rejects(task,/核对面板字段未全部通过/);
+      assert.ok(!messages.some(message=>message.type==='flight.review.verified'));
+    } else {
+      assert.equal((await task).status,'ready');
+      assert.ok(messages.some(message=>message.type==='flight.review.verified'));
+      assert.ok(stored[`flight-review-${job.eventId}`].startedAt>0);
+    }
+  }
+});

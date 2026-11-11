@@ -43,6 +43,53 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
     await report('reading');
     return captureStableHealth(chrome, capture, tabId, timing);
   };
+  // Persist the cooldown across service-worker suspension. Only recover the
+  // business page, never a login page or a page the user navigated to.
+  let reloaded = false;
+  const reloadAllowed = async () => {
+    if (original.url.startsWith(`${PLAN_URL}/create-plan`)) return false;
+    if (timing.canReload && !await timing.canReload()) return false;
+    if (origin === 'https://fh.dji.com') {
+      const saved = await chrome.storage.local.get(null);
+      if (Object.entries(saved).some(([key, value]) => /^flight-[a-f0-9-]{36}$/.test(key) && value === tabId)) return false;
+    }
+    return true;
+  };
+  const reload = async () => {
+    if (/[/#](login|signin)([/?#]|$)/i.test(original.url) || reloaded) return false;
+    if (!await reloadAllowed()) return false;
+    await samePage();
+    const key = `siteHealthReload:${tabId}`;
+    const stored = await chrome.storage.session.get(key);
+    if (stored[key] != null && now() - stored[key] < 120000) return false;
+    await chrome.storage.session.set({[key]: now()});
+    await report('loading');
+    await samePage();
+    if (!await reloadAllowed()) return false;
+    reloaded = true;
+    await chrome.tabs.reload(tabId);
+    const deadline = now() + 20000;
+    while (now() < deadline) {
+      await pause(250);
+      const current = await samePage();
+      if (current.status === 'complete' && !current.discarded && !current.frozen) {
+        await pause(750);
+        await samePage();
+        return true;
+      }
+    }
+    throw Error('网站页面自动刷新后仍未加载完成，请检查网络或登录状态');
+  };
+  const recoverBlank = async result => {
+    if (result.state !== 'error' || result.reason !== 'blank_page') return result;
+    // Give a transient SPA render a chance before interrupting it with reload.
+    await pause(1500);
+    await samePage();
+    const confirmed = await read();
+    if (confirmed.state !== 'error' || confirmed.reason !== 'blank_page') return confirmed;
+    if (await reload()) return read();
+    return confirmed;
+  };
   const activate = async () => {
     await report('focus_wait');
     const previous = activationTail;
@@ -61,11 +108,15 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
         await pause(250);
         const current = await samePage();
         if (current.status === 'complete' && !current.discarded && !current.frozen) break;
-        if (now() >= deadline) throw Error('页面唤醒超时，请打开网站检查白屏或登录状态');
+        if (now() >= deadline) {
+          if (await reload()) return await recoverBlank(await read());
+          throw Error('页面唤醒超时，请打开网站检查白屏或登录状态');
+        }
       }
       // Allow the visible SPA a render turn before reading its login/API state.
       await pause(750);
-      return await read();
+      await samePage();
+      return await recoverBlank(await read());
     } finally {
       try {
         if (activated && active && active.id !== tabId) {
@@ -80,12 +131,12 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
   let result;
   try { result = await read(); }
   catch (error) {
-    if (origin !== 'https://aai.airins.cn' || original.active) throw error;
+    if (original.active && original.status === 'complete') throw error;
     await samePage();
     return activate();
   }
-  if (origin === 'https://aai.airins.cn' && !original.active && result.state === 'error') return activate();
-  return result;
+  if (!original.active && result.state === 'error' && (origin === 'https://aai.airins.cn' || result.reason === 'blank_page')) return activate();
+  return recoverBlank(result);
 }
 
 // Fixed read-only checks in the site's own context. Platform credentials are
@@ -149,6 +200,7 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     }
     return result('login_required', '请在 Chrome 中完成登录');
   }
+  if (document.body && !document.body.innerText?.trim() && !document.body.querySelector?.('canvas, iframe')) return { ...result('error', '网站页面仍为空白，正在尝试自动恢复'), reason: 'blank_page' };
   const classify = response => {
     const code = response?.code;
     if ([401, 44001, 200401, '401', '44001', '200401'].includes(code)) return 'login_required';
@@ -165,7 +217,6 @@ export async function checkSiteHealth(getJiangsuApi = findJiangsuApi) {
     }
     if (origin === 'https://aai.airins.cn') {
       if (!location.pathname.startsWith('/sniff')) return result('page_required', '请打开可飞历史任务页面');
-      if (document.body && !document.body.innerText?.trim() && !document.body.querySelector?.('canvas, iframe')) return result('error', '可飞页面仍为空白，请检查页面加载或网络');
       const response = await fetch('https://api-aai.airins.cn/api/met/sniff/mission_based/historical_data/mission/list', { credentials: 'include', signal: AbortSignal.timeout(12000) });
       if (response.status === 401) return result('login_required', '登录已过期，请重新登录可飞');
       if (response.status === 403) return result('forbidden', '当前账号无权读取可飞任务');

@@ -191,7 +191,7 @@ describe('workspace readiness and data truthfulness',()=>{
     const automatic = dom(<MonitoringPanel data={data} busy={false} ready started action={action} onPrepare={noop} onFlight={noop}/>);
     expect(automatic.querySelector('.task-policy-grid')?.textContent).toContain('自动执行');
     expect(automatic.querySelector('.task-policy-grid')?.textContent).toContain('自动提交');
-    expect(automatic.querySelector('.task-policy-note')?.textContent).toContain('延迟 12 分钟');
+    expect(automatic.querySelector('.task-policy-note')?.textContent).toContain('倒计时 12 分钟');
     expect(automatic.querySelector('.task-policy-grid')?.textContent).toContain('05:00–08:00');
     const manualOnly = dom(<MonitoringPanel data={data} busy={false} ready started action={action} onPrepare={noop} onFlight={noop}/>);
     expect(manualOnly.querySelector('.task-policy-grid')?.textContent).toContain('自动执行');

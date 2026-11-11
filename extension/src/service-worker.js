@@ -113,7 +113,7 @@ async function closeCachedReportTab(job) {
 
 async function capture(tabId, job) {
   if (job?.type === 'flight-dji-list' && job.closeOnly === true) return closeCachedReportTab(job);
-  if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId, {progress:job.healthProgress, deadline:job.expiresAt});
+  if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId, {progress:job.healthProgress, deadline:job.expiresAt, canReload: () => !capturing});
   return captureOnce(tabId, job);
 }
 async function captureOnce(tabId, job) {
@@ -217,9 +217,6 @@ async function prepareFlight(job) {
       ['最低返航高度（相对机场）', `${PLAN_RECIPE.returnHeight} 米`],
       ['航线飞行中失联', PLAN_RECIPE.lostLink, PLAN_RECIPE.lostLink],
       ['完成动作', PLAN_RECIPE.completion], ['媒体存储位置', PLAN_RECIPE.media],
-      ['站内通知', '开启'], ['短信', '关闭'], ['邮件', '关闭'],
-      ['告警频率', '0 分钟'], ['订阅人员', PLAN_RECIPE.subscriber],
-      ['订阅人员勾选', '仅运维'],
     ].map(([label, value, check]) => ({ label, value, check: check || label }));
     if (job.autoSubmit) {
       await chrome.storage.local.set({ [reviewKey]: { tabId, startedAt: null, canceled: false } });

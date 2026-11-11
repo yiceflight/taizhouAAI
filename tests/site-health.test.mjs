@@ -247,7 +247,9 @@ function wakeFixture(extra = {}) {
   let elapsed = 0;
   const tabs = new Map([[1, {id:1,windowId:7,url:air,status:'complete',active:false,...extra}], [2,{id:2,windowId:7,url:'https://example.test',active:true}]]);
   const activations = [], stages = [];
-  const chrome = {tabs:{
+  const storage = {};
+  const local = extra.local || {};
+  const chrome = {storage:{local:{get:async()=>({...local})},session:{get:async key=>({[key]:storage[key]}),set:async value=>Object.assign(storage,value)}},tabs:{
     get:async id => { if (!tabs.has(id)) throw Error('closed'); return {...tabs.get(id)}; },
     query:async () => [...tabs.values()].filter(tab=>tab.active),
     update:async (id, update) => { activations.push(id); for (const tab of tabs.values()) tab.active=false; Object.assign(tabs.get(id),update,{discarded:false,frozen:false}); return {...tabs.get(id)}; },
@@ -301,4 +303,70 @@ test('concurrent discarded health pages activate sequentially', async () => {
     assert.equal(f.tabs.get(tabId).active,true); return {state:'ready'};
   },id,f.timing)));
   assert.deepEqual(f.activations,[1,2,3,2]);
+});
+
+test('all three sites classify blank pages without requesting APIs, but preserve login results', async () => {
+  for (const url of [air,dji,map]) {
+    const document={body:{innerText:' ',querySelector:()=>null},querySelectorAll:()=>[]};
+    const result=await run(url,{document,fetch:()=>{throw Error('must not fetch');}});
+    assert.equal(result.reason,'blank_page');
+    assert.equal((await run(new URL(url).origin+'/#/login',{document})).state,'login_required');
+  }
+});
+test('all three sites reload persistent blank pages once and enforce cooldown across checks', async () => {
+  for (const url of [air,dji,map]) {
+    const f=wakeFixture({url,active:true}); let reloads=0;
+    f.chrome.tabs.reload=async()=>{reloads++;};
+    const blank=async()=>({state:'error',reason:'blank_page'});
+    assert.equal((await captureHealth(f.chrome,blank,1,f.timing)).reason,'blank_page');
+    await captureHealth(f.chrome,blank,1,f.timing);
+    assert.equal(reloads,1);
+    await f.timing.pause(120000);
+    await captureHealth(f.chrome,async()=>reloads===2?{state:'ready'}:blank(),1,f.timing);
+    assert.equal(reloads,2);
+  }
+});
+test('all three sites reload after wake timeout and verify recovery', async () => {
+  for (const url of [air,dji,map]) {
+    const f=wakeFixture({url,discarded:true,status:'loading'}); let reloads=0;
+    f.chrome.tabs.reload=async()=>{reloads++;f.tabs.get(1).status='complete';};
+    const result=await captureHealth(f.chrome,async()=>({state:'ready'}),1,f.timing);
+    assert.equal(result.state,'ready');assert.equal(reloads,1);
+    assert.deepEqual(f.activations,[1,2]);
+  }
+});
+test('recovery does not reload transient blank, auth, permission or service errors', async () => {
+  for (const url of [air,dji,map]) for (const state of ['ready','login_required','forbidden','error']) {
+    const f=wakeFixture({url,active:true});let calls=0;
+    f.chrome.tabs.reload=async()=>{assert.fail('unexpected reload');};
+    const result=await captureHealth(f.chrome,async()=>++calls===1?{state:'error',reason:'blank_page'}:{state},1,f.timing);
+    assert.equal(result.state,state);
+  }
+});
+test('recovery stops when user navigates, deadline expires, or refreshed page keeps loading', async () => {
+  for (const mode of ['navigation','deadline','loading']) {
+    const f=wakeFixture({active:true});let reloads=0,calls=0;
+    f.chrome.tabs.reload=async()=>{reloads++;f.tabs.get(1).status='loading';};
+    if(mode==='deadline') f.timing.deadline=1000;
+    await assert.rejects(captureHealth(f.chrome,async()=>{
+      if(++calls===2 && mode==='navigation') f.tabs.get(1).url='https://aai.airins.cn/#/login';
+      return {state:'error',reason:'blank_page'};
+    },1,f.timing));
+    assert.equal(reloads,mode==='loading'?1:0);
+  }
+});
+
+test('blank-page reload never touches a plan draft, a saved flight tab or a busy extension', async () => {
+  const cases=[
+    ['create-plan draft',{url:dji+'/create-plan'},{}],
+    ['saved flight tab',{url:dji},{local:{'flight-00000000-0000-4000-8000-000000000001':1}}],
+    ['busy extension',{url:dji},{},{canReload:()=>false}],
+  ];
+  for (const [label,tab,fixtureExtra,timing] of cases) {
+    const f=wakeFixture({...tab,active:true,...fixtureExtra}); let reloads=0;
+    f.chrome.tabs.reload=async()=>{reloads++;};
+    const result=await captureHealth(f.chrome,async()=>({state:'error',reason:'blank_page'}),1,{...f.timing,...timing});
+    assert.equal(result.reason,'blank_page',label);
+    assert.equal(reloads,0,label);
+  }
 });

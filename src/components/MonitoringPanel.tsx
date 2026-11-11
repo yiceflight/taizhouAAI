@@ -167,7 +167,7 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
   const executionValue = manualConfirmation ? '手动执行' : '自动执行';
   const executionDetail = manualConfirmation
     ? '计划填写完成后，由工作人员确认起飞'
-    : `计划填写完成后，延迟 ${settings.takeoffDelayMinutes} 分钟自动提交`;
+    : `任务生成后倒计时 ${settings.takeoffDelayMinutes} 分钟，再填写计划；核对 30 秒后自动提交`;
   const windRules = settings.windRouteRules ?? [];
   const hasWindRules = windRules.length > 0;
   const defaultRoute = data?.flight.selectedRoute;
@@ -233,7 +233,7 @@ export function MonitoringPanel({ data, busy, ready, flightReady = ready, starte
           <small className="task-policy-detail" role="cell">禁飞时段内仅记录，不发起起飞</small>
         </div>
       </div>
-      <div className="task-policy-note"><span aria-hidden="true">i</span><p>{manualConfirmation ? '执行流程：已配置指标任一项超过阈值 → 填写巡查计划 → 工作人员确认 → 执行起飞。' : `执行流程：已配置指标任一项超过阈值 → 填写巡查计划 → 延迟 ${settings.takeoffDelayMinutes} 分钟 → 自动起飞。`} 天气用于任务记录和风向选线，是否允许起飞由大疆后台决定；禁飞时段不提交起飞请求。</p></div>
+      <div className="task-policy-note"><span aria-hidden="true">i</span><p>{manualConfirmation ? '执行流程：已配置指标任一项超过阈值 → 填写巡查计划 → 工作人员确认 → 执行起飞。' : `执行流程：同步数据并生成超标任务 → 倒计时 ${settings.takeoffDelayMinutes} 分钟 → 填写巡查计划 → 核对 30 秒 → 自动提交起飞请求。`} 天气用于任务记录和风向选线，是否允许起飞由大疆后台决定；禁飞时段不提交起飞请求。</p></div>
       {pending && plan && <div className="task-details-copy"><p>{plan.name} · {plan.observedAt.slice(0, 16)}（北京时间）</p>{plan.sourceHour && <p>绑定小时数据：{plan.sourceHour.slice(0, 16)}（北京时间）</p>}
         {plan.status === 'uncertain' && plan.error && <details><summary>查看原始回执</summary><p>{plan.error}</p></details>}
       </div>}

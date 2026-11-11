@@ -1,4 +1,4 @@
-//! Durable diagnostic mail batches. No network work runs on the logging path.
+//! Durable local diagnostics. Only an explicit user command sends mail.
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -7,7 +7,6 @@ use tauri::Manager;
 
 pub(crate) const RECIPIENT: &str = "stuzhaoxing@gmail.com";
 const INTERVAL: i64 = 15 * 60 * 1000;
-const RETENTION: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_PACKET: usize = 8 * 1024 * 1024;
 const MAX_QUEUE: i64 = 20;
 
@@ -78,12 +77,6 @@ const FIELDS: &str = "id,at,session,level,category,event,message,details";
 
 // Returns a visible queue event. Cursor and attachment are committed atomically.
 fn collect(db: &Connection, now: i64, metadata: &Value) -> Result<Option<Value>, String> {
-    let expired = db
-        .execute(
-            "DELETE FROM diagnostic_outbox WHERE created<?",
-            [now - RETENTION],
-        )
-        .map_err(|e| e.to_string())?;
     let next_collect: i64 = db
         .query_row(
             "SELECT next_collect FROM diagnostic_state WHERE singleton=1",
@@ -92,15 +85,13 @@ fn collect(db: &Connection, now: i64, metadata: &Value) -> Result<Option<Value>,
         )
         .map_err(|e| e.to_string())?;
     if now < next_collect {
-        return Ok((expired > 0).then(|| json!({"status":"expired", "expired":expired})));
+        return Ok(None);
     }
     let count: i64 = db
         .query_row("SELECT count(*) FROM diagnostic_outbox", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     if count >= MAX_QUEUE {
-        return Ok(Some(
-            json!({"status":"queue_full", "pending":count, "expired":expired}),
-        ));
+        return Ok(Some(json!({"status":"queue_full", "pending":count})));
     }
     let (cursor, installation): (i64, String) = db
         .query_row(
@@ -115,7 +106,7 @@ fn collect(db: &Connection, now: i64, metadata: &Value) -> Result<Option<Value>,
         &[&cursor],
     )?;
     let Some(last) = rows.last() else {
-        return Ok((expired > 0).then(|| json!({"status":"expired", "expired":expired})));
+        return Ok(None);
     };
     let end = last["id"].as_i64().unwrap();
     let triggers: Vec<_> = rows.iter().filter(|r| important(r)).collect();
@@ -125,7 +116,7 @@ fn collect(db: &Connection, now: i64, metadata: &Value) -> Result<Option<Value>,
             [end],
         )
         .map_err(|e| e.to_string())?;
-        return Ok((expired > 0).then(|| json!({"status":"expired", "expired":expired})));
+        return Ok(None);
     }
     let first = triggers[0];
     let first_id = first["id"].as_i64().unwrap();
@@ -192,7 +183,7 @@ fn collect(db: &Connection, now: i64, metadata: &Value) -> Result<Option<Value>,
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(Some(
-        json!({"status":"queued","eventId":id,"triggers":triggers.len(),"omittedForSize":omitted,"expired":expired}),
+        json!({"status":"queued","eventId":id,"triggers":triggers.len(),"omittedForSize":omitted}),
     ))
 }
 
@@ -200,58 +191,112 @@ struct Pending {
     id: String,
     payload: Vec<u8>,
 }
-fn pending(db: &Connection, now: i64) -> Result<Option<Pending>, String> {
-    use rusqlite::OptionalExtension;
-    db.query_row(
-        "SELECT id,payload FROM diagnostic_outbox WHERE next_attempt<=? AND
-        (SELECT next_send FROM diagnostic_state WHERE singleton=1)<=? ORDER BY created,id LIMIT 1",
-        params![now, now],
-        |r| {
+fn pending(db: &Connection) -> Result<Vec<Pending>, String> {
+    let mut statement = db
+        .prepare("SELECT id,payload FROM diagnostic_outbox ORDER BY created,id")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |r| {
             Ok(Pending {
                 id: r.get(0)?,
                 payload: r.get(1)?,
             })
-        },
-    )
-    .optional()
-    .map_err(|e| e.to_string())
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
-fn reserve(db: &Connection, id: &str, now: i64) -> Result<(), String> {
+
+fn acknowledge(db: &Connection, ids: &[String]) -> Result<(), String> {
     let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute(
-        "UPDATE diagnostic_state SET next_send=? WHERE singleton=1",
-        [now + INTERVAL],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "UPDATE diagnostic_outbox SET next_attempt=? WHERE id=?",
-        params![now + INTERVAL, id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
-}
-fn finish(db: &Connection, id: &str, now: i64, result: &Result<(), String>) -> Result<(), String> {
-    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
-    if let Err(error) = result {
-        let attempts: i64 = tx
-            .query_row(
-                "SELECT attempts FROM diagnostic_outbox WHERE id=?",
-                [id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        let delay = (INTERVAL * (1_i64 << attempts.min(5))).min(6 * 60 * 60 * 1000);
-        tx.execute("UPDATE diagnostic_outbox SET attempts=attempts+1,next_attempt=?,last_error=? WHERE id=?", params![now+delay,error,id]).map_err(|e| e.to_string())?;
-    } else {
+    for id in ids {
         tx.execute("DELETE FROM diagnostic_outbox WHERE id=?", [id])
             .map_err(|e| e.to_string())?;
     }
-    tx.execute(
-        "UPDATE diagnostic_state SET next_send=? WHERE singleton=1",
-        [now + INTERVAL],
-    )
-    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+fn combined_attachment(packets: &[Pending]) -> Result<Vec<u8>, String> {
+    let batches: Vec<Value> = packets
+        .iter()
+        .map(|p| serde_json::from_slice(&p.payload).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    attachment(
+        &serde_json::to_vec(&json!({"schemaVersion":2,"batches":batches}))
+            .map_err(|e| e.to_string())?,
+    )
+}
+
+static SEND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tauri::command]
+pub async fn report_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+    let _sending = SEND_LOCK
+        .try_lock()
+        .map_err(|_| "正在上报异常，请勿重复点击")?;
+    let _access = crate::data_reset::access(&app)?;
+    let logger = app
+        .state::<crate::runtime_log::RuntimeLog>()
+        .inner()
+        .clone();
+    let metadata = build_metadata(&app);
+    // Include recent errors immediately, without waiting for the background interval.
+    let packets = logger.with_db(|db| {
+        loop {
+            let before: i64 = db
+                .query_row("SELECT cursor FROM diagnostic_state", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            db.execute("UPDATE diagnostic_state SET next_collect=0", [])
+                .map_err(|e| e.to_string())?;
+            collect(db, Utc::now().timestamp_millis(), &metadata)?;
+            let after: i64 = db
+                .query_row("SELECT cursor FROM diagnostic_state", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if after == before {
+                break;
+            }
+        }
+        pending(db)
+    })?;
+    if packets.is_empty() {
+        return Ok("暂无需要上报的异常缓存。".into());
+    }
+    let mut sent = 0;
+    let mut start = 0;
+    while start < packets.len() {
+        let mut end = start + 1;
+        let mut size = packets[start].payload.len();
+        while end < packets.len() && size + packets[end].payload.len() < MAX_PACKET {
+            size += packets[end].payload.len();
+            end += 1;
+        }
+        let group = &packets[start..end];
+        let result = match combined_attachment(group) {
+            Ok(bytes) => crate::email::send_diagnostic_email(&app, &group[0].id, bytes).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            return Err(format!(
+                "异常上报失败：{error}。已发送并清理 {sent} 批，其余缓存已保留，请手动重试。"
+            ));
+        }
+        let ids: Vec<_> = group.iter().map(|p| p.id.clone()).collect();
+        logger.with_db(|db| acknowledge(db, &ids)).map_err(|e| {
+            format!("邮件已被 SMTP 接收，但缓存清理失败：{e}；再次上报可能重复发送")
+        })?;
+        sent += group.len();
+        start = end;
+    }
+    logger.record(
+        "info",
+        "diagnostics",
+        "diagnostic.accepted",
+        "手动异常上报已被 SMTP 接收，已清理对应缓存",
+        json!({"batches":sent,"recipient":RECIPIENT}),
+    );
+    Ok(format!(
+        "SMTP 已接收异常日志邮件，已清理 {sent} 批缓存。收件邮箱：{RECIPIENT}。"
+    ))
 }
 
 pub(crate) fn attachment(payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -302,16 +347,16 @@ fn system_version() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-pub fn start(app: &tauri::AppHandle) {
-    // No emails from dev instances, test builds or unit tests.
-    if crate::environment::IS_TEST {
-        return;
-    }
-    let metadata = json!({"version":app.package_info().version.to_string(),
+fn build_metadata(app: &tauri::AppHandle) -> Value {
+    json!({"version":app.package_info().version.to_string(),
         "commit":env!("DIAGNOSTIC_COMMIT"),"dirty":env!("DIAGNOSTIC_DIRTY"),
         "builtAt":env!("DIAGNOSTIC_BUILD_TIME"),"os":std::env::consts::OS,
         "architecture":std::env::consts::ARCH,"osVersion":system_version(),"channel":crate::environment::CHANNEL,
-        "minimumExtensionVersion":env!("BRIDGE_MIN_EXTENSION_VERSION")});
+        "minimumExtensionVersion":env!("BRIDGE_MIN_EXTENSION_VERSION")})
+}
+
+pub fn start(app: &tauri::AppHandle) {
+    let metadata = build_metadata(app);
     if let Ok(root) = app.path().app_data_dir() {
         let path = root.join("last-panic.txt");
         if let Ok(panic) = std::fs::read_to_string(&path) {
@@ -353,7 +398,7 @@ pub fn start(app: &tauri::AppHandle) {
         let mut last_status = Value::Null;
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            // Hold reset guard through the send so reset cannot resurrect a queued batch.
+            // Collection shares reset protection with runtime logs.
             let Ok(_access) = crate::data_reset::access(&app) else {
                 continue;
             };
@@ -377,72 +422,11 @@ pub fn start(app: &tauri::AppHandle) {
                         },
                         "diagnostics",
                         "diagnostic.queue",
-                        "诊断邮件队列状态",
+                        "异常本地缓存状态",
                         status.clone(),
                     );
                     last_status = status;
                 }
-            }
-            let mail = match logger.with_db(|db| pending(db, now)) {
-                Ok(value) => value,
-                Err(error) => {
-                    logger.record(
-                        "warning",
-                        "diagnostics",
-                        "diagnostic.queue_failed",
-                        "无法读取诊断邮件队列",
-                        json!({"error":error}),
-                    );
-                    continue;
-                }
-            };
-            let Some(mail) = mail else {
-                continue;
-            };
-            if let Err(error) = logger.with_db(|db| reserve(db, &mail.id, now)) {
-                logger.record(
-                    "warning",
-                    "diagnostics",
-                    "diagnostic.reserve_failed",
-                    "无法保存邮件发送间隔，暂缓发送",
-                    json!({"error":error}),
-                );
-                continue;
-            }
-            let result = match attachment(&mail.payload) {
-                Ok(bytes) => crate::email::send_diagnostic_email(&app, &mail.id, bytes).await,
-                Err(error) => Err(error),
-            };
-            let completed = Utc::now().timestamp_millis();
-            let mut checkpoint_failed = false;
-            if let Err(error) = logger.with_db(|db| finish(db, &mail.id, completed, &result)) {
-                logger.record(
-                    "warning",
-                    "diagnostics",
-                    "diagnostic.checkpoint_failed",
-                    "无法保存诊断邮件发送状态；下次可能重复发送",
-                    json!({"eventId":mail.id,"error":error}),
-                );
-                checkpoint_failed = true;
-            }
-            logger.record(
-                if result.is_ok() { "info" } else { "warning" },
-                "diagnostics",
-                if result.is_ok() {
-                    "diagnostic.accepted"
-                } else {
-                    "diagnostic.retry"
-                },
-                if result.is_ok() {
-                    "SMTP 已接收诊断附件邮件"
-                } else {
-                    "诊断邮件暂未发送，已保留等待重试"
-                },
-                json!({"eventId":mail.id,"recipient":RECIPIENT,"error":result.err()}),
-            );
-            drop(_access);
-            if checkpoint_failed {
-                tokio::time::sleep(Duration::from_millis(INTERVAL as u64)).await;
             }
         }
     });
@@ -492,7 +476,7 @@ mod tests {
             original.clone(),
         );
         collect(&db, now, &json!({"version":"test-build"})).unwrap();
-        let first = pending(&db, now).unwrap().unwrap();
+        let first = pending(&db).unwrap().remove(0);
         let packet: Value = serde_json::from_slice(&first.payload).unwrap();
         assert!(packet["logs"]
             .as_array()
@@ -505,11 +489,11 @@ mod tests {
             .iter()
             .any(|r| r["details"]["version"] == "old-build"));
         let installation = packet["installationId"].clone();
-        finish(&db, &first.id, now, &Err("offline".into())).unwrap();
-        assert!(pending(&db, now + INTERVAL - 1).unwrap().is_none());
+        // A failed send makes no database changes.
+        assert_eq!(pending(&db).unwrap().len(), 1);
         drop(db);
         let db = database(&path);
-        let retried = pending(&db, now + INTERVAL).unwrap().unwrap();
+        let retried = pending(&db).unwrap().remove(0);
         assert_eq!(retried.id, first.id);
         assert_eq!(retried.payload, first.payload);
         add(
@@ -521,15 +505,14 @@ mod tests {
             json!({"error":"new failure"}),
         );
         collect(&db, now + INTERVAL, &json!({})).unwrap();
-        finish(&db, &retried.id, now + INTERVAL, &Ok(())).unwrap();
-        assert!(pending(&db, now + INTERVAL).unwrap().is_none());
-        let next = pending(&db, now + 2 * INTERVAL).unwrap().unwrap();
+        acknowledge(&db, &[retried.id]).unwrap();
+        let next = pending(&db).unwrap().remove(0);
         assert_ne!(next.id, first.id);
         let packet: Value = serde_json::from_slice(&next.payload).unwrap();
         assert_eq!(packet["installationId"], installation);
         assert_eq!(packet["triggerIds"], json!([4]));
         clear(&db).unwrap();
-        assert!(pending(&db, now + 3 * INTERVAL).unwrap().is_none());
+        assert!(pending(&db).unwrap().is_empty());
     }
     #[test]
     fn ignores_initial_idle_and_diagnostic_failures_but_reports_lost_readiness() {
@@ -551,7 +534,7 @@ mod tests {
             json!({"error":"offline"}),
         );
         assert!(collect(&db, 102, &json!({})).unwrap().is_none());
-        assert!(pending(&db, 102).unwrap().is_none());
+        assert!(pending(&db).unwrap().is_empty());
         add(
             &db,
             103,
@@ -562,9 +545,48 @@ mod tests {
         );
         collect(&db, 104, &json!({})).unwrap();
         let packet: Value =
-            serde_json::from_slice(&pending(&db, 104).unwrap().unwrap().payload).unwrap();
+            serde_json::from_slice(&pending(&db).unwrap().remove(0).payload).unwrap();
         assert_eq!(packet["triggerIds"], json!([3]));
     }
+    #[test]
+    fn manual_attachment_combines_batches_and_acknowledgement_preserves_new_cache() {
+        let db = database(std::path::Path::new(":memory:"));
+        add(&db, 1, "error", "app", "failed", json!({"error":"first"}));
+        collect(&db, 2, &json!({})).unwrap();
+        let snapshot = pending(&db).unwrap();
+        let bytes = combined_attachment(&snapshot).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let packet: Value =
+            serde_json::from_reader(archive.by_name("diagnostics.json").unwrap()).unwrap();
+        assert_eq!(packet["schemaVersion"], 2);
+        assert_eq!(packet["batches"][0]["triggerIds"], json!([1]));
+        add(
+            &db,
+            3,
+            "error",
+            "app",
+            "failed",
+            json!({"error":"new during send"}),
+        );
+        collect(&db, 2 + INTERVAL, &json!({})).unwrap();
+        let both = pending(&db).unwrap();
+        let bytes = combined_attachment(&both).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let packet: Value =
+            serde_json::from_reader(archive.by_name("diagnostics.json").unwrap()).unwrap();
+        assert_eq!(packet["batches"].as_array().unwrap().len(), 2);
+        acknowledge(&db, &[snapshot[0].id.clone()]).unwrap();
+        let remaining = pending(&db).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].id, snapshot[0].id);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM runtime_logs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
     #[test]
     fn zip_round_trips_full_payload() {
         let payload = br#"{"message":"original","logs":[1,2,3]}"#;
@@ -576,27 +598,6 @@ mod tests {
             .unwrap();
         assert_eq!(actual, payload);
     }
-    #[test]
-    fn reserves_send_interval_across_a_crash_and_limits_collection_frequency() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs.db");
-        let db = database(&path);
-        add(&db, 1, "error", "app", "failed", json!({"error":"first"}));
-        collect(&db, 2, &json!({})).unwrap();
-        let mail = pending(&db, 2).unwrap().unwrap();
-        reserve(&db, &mail.id, 2).unwrap();
-        add(&db, 3, "error", "app", "failed", json!({"error":"second"}));
-        assert!(collect(&db, 3, &json!({})).unwrap().is_none());
-        drop(db);
-        let db = database(&path);
-        assert!(pending(&db, 3).unwrap().is_none());
-        assert_eq!(pending(&db, 2 + INTERVAL).unwrap().unwrap().id, mail.id);
-        assert_eq!(
-            collect(&db, 2 + INTERVAL, &json!({})).unwrap().unwrap()["status"],
-            "queued"
-        );
-    }
-
     #[test]
     fn oversized_error_keeps_its_identity_and_explicitly_reports_missing_content() {
         let db = database(std::path::Path::new(":memory:"));
@@ -610,7 +611,7 @@ mod tests {
         );
         collect(&db, 2, &json!({})).unwrap();
         let packet: Value =
-            serde_json::from_slice(&pending(&db, 2).unwrap().unwrap().payload).unwrap();
+            serde_json::from_slice(&pending(&db).unwrap().remove(0).payload).unwrap();
         assert_eq!(packet["triggerIds"], json!([1]));
         assert_eq!(packet["coverage"]["omittedForSize"], 1);
         assert_eq!(packet["logs"][0]["event"], "huge.failure");
@@ -623,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_capacity_does_not_advance_cursor_and_expiration_is_visible() {
+    fn queue_capacity_preserves_cursor_and_cache_until_manual_report() {
         let db = database(std::path::Path::new(":memory:"));
         for n in 0..MAX_QUEUE {
             db.execute(
@@ -641,8 +642,12 @@ mod tests {
             .query_row("SELECT cursor FROM diagnostic_state", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cursor, 0);
-        let status = collect(&db, RETENTION + 1, &json!({})).unwrap().unwrap();
-        assert_eq!(status["expired"], MAX_QUEUE);
-        assert_eq!(status["status"], "queued");
+        assert_eq!(
+            collect(&db, 30 * 24 * 60 * 60 * 1000, &json!({}))
+                .unwrap()
+                .unwrap()["status"],
+            "queue_full"
+        );
+        assert_eq!(pending(&db).unwrap().len(), MAX_QUEUE as usize);
     }
 }

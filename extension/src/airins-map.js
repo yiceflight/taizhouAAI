@@ -17,9 +17,24 @@ export function trajectoryCrop(pixels, width, height, palette) {
   return {x,y,width:Math.min(width,right+px+1)-x,height:Math.min(height,bottom+py+1)-y};
 }
 
+// Airins' history page can remove the query string after it has mounted
+// the Vue route (and some builds add a trailing slash).  A missing query is
+// safe here because the tab is created by the report worker for this exact
+// mission immediately before capture; an explicit, different mission id is
+// still rejected so a stale page can never be used silently.
+export function airinsHistoryRouteMatches(url, missionId) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin !== 'https://aai.airins.cn' || parsed.pathname.replace(/\/+$/, '') !== '/sniff/HistoryCloud') return false;
+    const pageMissionId = parsed.searchParams.get('missionId');
+    return pageMissionId == null || pageMissionId === String(missionId);
+  } catch {
+    return false;
+  }
+}
+
 export async function airinsMap(job, crop) {
-  if (location.origin !== 'https://aai.airins.cn' || location.pathname !== '/sniff/HistoryCloud'
-      || new URL(location.href).searchParams.get('missionId') !== String(job.missionId)) throw new Error('轨迹图航次不匹配');
+  if (!airinsHistoryRouteMatches(location.href, job.missionId)) throw new Error('轨迹图航次不匹配');
   const visible = e => e && e.getClientRects().length && getComputedStyle(e).display !== 'none';
   const wait = async read => { for(let i=0;i<80;i++){const v=read();if(v)return v;await new Promise(r=>setTimeout(r,250));}throw new Error('可飞轨迹图未完成加载'); };
   const normal = s => s.replace(/₂/g,'2').replace(/₅/g,'5').replace(/\s/g,'');

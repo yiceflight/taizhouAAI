@@ -248,6 +248,7 @@ pub fn run() {
             environment::is_test_environment,
             runtime_log::get_runtime_logs,
             diagnostics::record_frontend_error,
+            diagnostics::report_diagnostics,
             runtime_log::export_runtime_logs,
             runtime_log::open_runtime_log_exports,
             open_chrome_extensions,

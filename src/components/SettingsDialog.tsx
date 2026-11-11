@@ -1,3 +1,4 @@
+import { DiagnosticReportSection } from './DiagnosticReportSection';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { EmailSettingsSection, type EmailSettingsHandle } from './EmailSettingsSection';
@@ -28,6 +29,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
   const [periods, setPeriods] = useState((settings.noFlyPeriods ?? defaultSettings.noFlyPeriods ?? []).map(period => ({ ...period })));
   const [windRules, setWindRules] = useState<WindRouteRule[]>((settings.windRouteRules ?? []).map(rule => ({ ...rule })));
   const [emailBusy, setEmailBusy] = useState(false);
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [emailResetKey, setEmailResetKey] = useState(0);
   const [saving, setSaving] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -37,7 +39,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
   const [syncingRoutes, setSyncingRoutes] = useState(false);
   const [routeError, setRouteError] = useState('');
   const [selectingRoute, setSelectingRoute] = useState(false);
-  const busy = saving || clearing || syncingRoutes || selectingRoute || emailBusy;
+  const busy = saving || clearing || syncingRoutes || selectingRoute || emailBusy || diagnosticBusy;
   const [error, setError] = useState('');
   const lock = useRef(false);
   const clearData = async () => {
@@ -171,7 +173,8 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
           {!periods.length && <p className="settings-help">未配置禁飞时间。</p>}
           <button type="button" className="secondary-button no-fly-add" disabled={periods.length >= 24} onClick={() => setPeriods(current => [...current, { start: '12:00', end: '13:00' }])}>＋ 添加时段</button>
         </fieldset>
-        <EmailSettingsSection ref={emailSection} key={emailResetKey} disabled={saving || clearing || syncingRoutes || selectingRoute} onBusyChange={setEmailBusy} />
+        <EmailSettingsSection ref={emailSection} key={emailResetKey} disabled={saving || clearing || syncingRoutes || selectingRoute || diagnosticBusy} onBusyChange={setEmailBusy} />
+        <DiagnosticReportSection disabled={busy} onBusyChange={setDiagnosticBusy} />
         <fieldset className="settings-section"><legend>AI 巡查分析</legend><div className="analysis-switches">{analyses.map(name => <div key={name} className="analysis-switch-row"><span>{name}巡查分析</span><button type="button" role="switch" aria-label={`${name}巡查分析`} aria-checked={name === '火点'} disabled className="settings-switch"><span /></button></div>)}</div></fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>数据管理</legend>
           <div className="task-clear-content">

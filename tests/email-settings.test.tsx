@@ -86,14 +86,26 @@ it('a credential save failure keeps the dialog open and blocks the remaining sav
 it('uses all saved recipients for sending and prevents duplicate submits', async () => {
   const sent = vi.fn();
   await act(async () => root.render(<ReportEmailDialog reportId="report-1" onClose={() => {}} onSent={sent} />));
-  expect(document.querySelectorAll('input')).toHaveLength(0);
+  expect(document.querySelectorAll('input')).toHaveLength(1);
   saved.recipients.forEach(address => expect(document.body.textContent).toContain(address));
   let finish!: (to: string) => void;
   ipc.invoke.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
   await submit(); await submit();
-  expect(ipc.invoke.mock.calls.filter(call => call[0] === 'send_flight_report_email')).toEqual([['send_flight_report_email', { reportId: 'report-1', expectedRecipients: saved.recipients, expectedUsername: saved.username }]]);
+  expect(ipc.invoke.mock.calls.filter(call => call[0] === 'send_flight_report_email')).toEqual([['send_flight_report_email', { reportId: 'report-1', recipients: saved.recipients, expectedRecipients: saved.recipients, expectedUsername: saved.username }]]);
   await act(async () => finish(saved.recipients.join('、')));
   expect(sent).toHaveBeenCalledWith(saved.recipients.join('、'));
+});
+it('edits recipients only for this send', async () => {
+  const sent = vi.fn();
+  await act(async () => root.render(<ReportEmailDialog reportId="report-1" onClose={() => {}} onSent={sent} />));
+  await remove(saved.recipients[1]);
+  await inputDraft('temporary@example.com');
+  await submit();
+  expect(ipc.invoke).toHaveBeenCalledWith('send_flight_report_email', {
+    reportId: 'report-1', recipients: ['chosen@example.com', 'temporary@example.com'],
+    expectedRecipients: saved.recipients, expectedUsername: saved.username,
+  });
+  expect(ipc.invoke).not.toHaveBeenCalledWith('save_email_settings', expect.anything());
 });
 it('requires recipients and links directly to settings', async () => {
   ipc.invoke.mockResolvedValue({ ...saved, recipients: [] });

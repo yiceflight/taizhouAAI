@@ -108,13 +108,7 @@ fn validate_address(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn updated_settings(
-    current: StoredEmailSettings,
-    recipients: Vec<String>,
-    username: String,
-    password: String,
-) -> Result<StoredEmailSettings, String> {
-    let username = username.trim().to_owned();
+fn normalize_recipients(recipients: Vec<String>) -> Result<Vec<String>, String> {
     let mut normalized = Vec::new();
     for recipient in recipients {
         let recipient = recipient.trim().to_owned();
@@ -126,6 +120,17 @@ fn updated_settings(
             normalized.push(recipient);
         }
     }
+    Ok(normalized)
+}
+
+fn updated_settings(
+    current: StoredEmailSettings,
+    recipients: Vec<String>,
+    username: String,
+    password: String,
+) -> Result<StoredEmailSettings, String> {
+    let username = username.trim().to_owned();
+    let normalized = normalize_recipients(recipients)?;
     validate_address(&username, "发信")?;
     if password.len() > 512 {
         return Err("SMTP 密码过长".into());
@@ -364,6 +369,7 @@ pub(crate) async fn send_diagnostic_email(app: &tauri::AppHandle, event_id: &str
 pub async fn send_flight_report_email(
     app: tauri::AppHandle,
     report_id: String,
+    recipients: Vec<String>,
     expected_recipients: Vec<String>,
     expected_username: String,
 ) -> Result<String, String> {
@@ -375,10 +381,11 @@ pub async fn send_flight_report_email(
     })
     .await
     .map_err(|_| "无法读取邮件配置")??;
-    let recipients = config.public().recipients;
-    if recipients != expected_recipients || config.username != expected_username {
+    let configured_recipients = config.public().recipients;
+    if configured_recipients != expected_recipients || config.username != expected_username {
         return Err("邮件设置已变更，请关闭发送窗口后重新打开确认".into());
     }
+    let recipients = normalize_recipients(recipients)?;
     if recipients.is_empty() {
         return Err("请先在设置中填写报告接收邮箱".into());
     }

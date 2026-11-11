@@ -6,6 +6,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { tabKey, type BrowserTab } from '../lib/workspace';
 import { DJI_MEDIA_URL, DJI_PLAN_URL, airinsMissionUrl, beijingTime, djiMediaFolderUrl, flightCharts, isTodayPatrolTask, localFlightDisplay, localFlightTimeDisplay, localFlightMission, flightMinuteTime, localFlightOriginLabel, missionOriginLabel, patrolTasks, visibleReportTasks, type DjiTask, type Mission, type PatrolTask, type CollectedFlight, type FlightSummary, type LocalFlightEvent } from '../lib/flightReport';
 import { currentWeatherText, rainfallText, type WeatherCheck } from '../lib/weather';
+import type { EmailSettings } from '../lib/email';
 
 const flightInputTime = (value?: number) => value ? new Date(value + 8 * 3600000).toISOString().slice(0, 19) : '';
 type ActualWindow = { start: number | null; end: number | null };
@@ -64,12 +65,36 @@ function taskRemarks(task: PatrolTask, appTask: boolean, status: { label: string
 
 function reportGenerationFailure(task: PatrolTask, error: unknown): string {
   const detail = String(error).replace(/^Error:\s*/, '');
+  if (/airinsHistoryRouteMatches\s+is not defined/.test(detail)) return localizedAutoStatus(detail);
+  if (/^ReferenceError:/.test(detail) || /^TypeError:/.test(detail)) return localizedAutoStatus(detail);
   if (detail.startsWith('司空媒体无照片：')) return `媒体上传已结束，无照片；${detail.replace('司空媒体无照片：', '')}。请重新加载新版浏览器插件后重试，支持生成异常数量为 0 的报告。`;
   if (task.djiTask?.mediaReady && /司空媒体解析失败|照片尚未上传|尚无 Immediate-Media/.test(detail)) return `媒体上传已结束，照片解析未完成：${/照片尚未上传|尚无 Immediate-Media/.test(detail) ? '未识别到照片目录或照片列表' : detail.replace(/^司空媒体解析失败[：:]?/, '')}。请核查媒体库后手动重试。`;
   if (task.djiTask?.status === '部分执行' && task.djiTask.mediaReady && /列表切换未完成|媒体库加载后重试/.test(detail)) {
     return '自动生成暂未完成，下轮重试：媒体已上传，司空媒体库页面切换未完成；请保持媒体库页面打开后重试';
   }
   return `自动生成暂未完成，下轮重试：${detail}`;
+}
+
+function localizedAutoStatus(value: string): string {
+  if (/airinsHistoryRouteMatches\s+is not defined/.test(value)) {
+    return '自动生成暂未完成，下轮重试：浏览器插件脚本未完整加载，请在 Chrome 扩展管理页重新加载 v0.7.63 或以上插件';
+  }
+  if (/ReferenceError:/.test(value) || /TypeError:/.test(value)) {
+    return '自动生成暂未完成，下轮重试：浏览器插件脚本执行失败，请重新加载 v0.7.63 或以上插件';
+  }
+  return value;
+}
+
+async function sendSavedReportEmail(reportId: string): Promise<string> {
+  const settings = await invoke<EmailSettings>('get_email_settings');
+  if (!settings.recipients.length) throw new Error('报告已生成，但尚未配置报告接收邮箱');
+  if (!settings.configured) throw new Error('报告已生成，但尚未配置 SMTP 密码');
+  return invoke<string>('send_flight_report_email', {
+    reportId,
+    recipients: settings.recipients,
+    expectedRecipients: settings.recipients,
+    expectedUsername: settings.username,
+  });
 }
 
 type Props = { onSettings?: () => void; onUnreadChange?: (unread: boolean) => void; tabs: BrowserTab[]; ready: boolean; mediaReady?: boolean; active?: boolean; onPrepare: () => void; openMedia: () => void; openAir: () => void; openLink?: (url: string) => void; flightEvent?: LocalFlightEvent | null; flightRecords?: LocalFlightEvent[]; tasksClearedAt?: number | null; dataResetKey?: number; };
@@ -274,7 +299,14 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
             reportRevision.current++;
             setReports(items => [report, ...items.filter(item => item.id !== report.id)]);
             mediaBlocked.current.delete(task.key);
-            setAutoStatus(state => ({ ...state, [task.key]: '' }));
+            if (!task.report) {
+              try {
+                const to = await sendSavedReportEmail(report.id);
+                if (revision === dataResetRef.current) setAutoStatus(state => ({ ...state, [task.key]: `报告已生成，邮件已提交至 ${to}` }));
+              } catch (e) {
+                if (revision === dataResetRef.current) setAutoStatus(state => ({ ...state, [task.key]: `报告已生成，但邮件发送失败：${String(e).replace(/^Error:\s*/, '')}` }));
+              }
+            }
           } catch (e) {
             if (revision === dataResetRef.current) {
               if (task.djiTask?.mediaReady && /司空媒体无照片：|司空媒体解析失败|照片尚未上传|尚无 Immediate-Media/.test(String(e))) mediaBlocked.current.set(task.key, mediaFingerprint(task));
@@ -449,6 +481,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
     const { key, mission, report, localEvent, djiTask } = task;
     const blockedMedia = mediaBlocked.current.get(key) === mediaFingerprint(task);
     const currentAutoStatus = mediaBlocked.current.has(key) && !blockedMedia ? '' : autoStatus[key];
+    const displayedAutoStatus = currentAutoStatus ? localizedAutoStatus(currentAutoStatus) : '';
     const noPhotos = blockedMedia && currentAutoStatus?.includes('媒体上传已结束，无照片');
     const window = actualWindow(task);
     const localState = localEvent ? localFlightDisplay(localEvent) : null;
@@ -467,11 +500,11 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
     const legacyObservedAt = localEvent ? Date.parse(`${localEvent.observedAt.replace(' ', 'T')}+08:00`) : NaN;
     return <tr className={`report-row${appTask ? ' task-row-app' : ''}`} key={key}>
       <td className="task-actual-time">{window?.start && window.end ? <strong>{taskClock(window.start)} 至 {taskClock(window.end)}</strong> : window?.start ? <><strong>{taskClock(window.start)}</strong><small>结束时间待确认</small></> : <><span className="muted">实际时间待确认</span>{localEvent && ['completed', 'flying', 'paused', 'flight_error'].includes(localEvent.status) && <small>实际飞行时间待补全</small>}</>}</td>
-      <td><span className={`task-status task-status-${status.tone}`}><i aria-hidden="true" />{status.label}</span>{djiTask?.status === '部分执行' && djiTask.partialReason && <small className="task-status-reason">{djiTask.partialReason}</small>}{djiTask?.actualTimeMissing && <small className="task-warning">司空未返回完整实际时间</small>}{currentAutoStatus && (!report || report.withoutAirData) && <small className={noPhotos ? undefined : 'task-warning'}>{currentAutoStatus}</small>}</td>
+      <td><span className={`task-status task-status-${status.tone}`}><i aria-hidden="true" />{status.label}</span>{djiTask?.status === '部分执行' && djiTask.partialReason && <small className="task-status-reason">{djiTask.partialReason}</small>}{djiTask?.actualTimeMissing && <small className="task-warning">司空未返回完整实际时间</small>}{displayedAutoStatus && !report && <small className={noPhotos ? undefined : 'task-warning'}>{displayedAutoStatus}</small>}</td>
       <td><span className="task-type">{localEvent?.source === 'auto' ? '自动任务' : localEvent ? '手飞任务' : taskTypeLabel(djiTask?.taskType)}</span><small>{origin}</small></td>
       <td className="task-plan"><strong>{planName}</strong><small>航线：{routeName}</small><span className="task-links">{!!mission?.missionId && link(airinsMissionUrl(mission), '可飞任务')}{djiTask ? link(djiMediaUrl, '司空媒体库') : mission?.missionId || report?.mediaUrl ? link(platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com'), djiTaskUrl ? '司空任务' : '司空平台') : localEvent && localState?.submitted && link(DJI_PLAN_URL, '司空计划')}</span></td>
       <td className="task-media">{djiTask?.noMedia ? <span className="muted">无媒体文件</span> : djiTask ? <>{noPhotos && <small>无照片</small>}<span className={`task-media-state ${djiTask.mediaReady ? 'success' : 'pending'}`}>{djiTask.mediaUploadedCount != null && djiTask.mediaExpectedCount != null ? `媒体文件（${djiTask.mediaUploadedCount}/${djiTask.mediaExpectedCount}）` : djiTask.mediaReady ? '媒体已上传（数量待核对）' : '媒体上传状态待核对'}</span></> : report ? <><span className="task-media-state success">媒体文件（{report.photoCount}/{report.photoCount}）</span><small>{report.photoCount} 张照片</small></> : <span className="muted">未上传</span>}</td>
-      <td className="task-remarks">{remarks.map((remark, index) => <small key={index} className={remark.includes('失败') || remark.includes('异常') ? 'task-warning' : undefined}>{remark}</small>)}{report && <small>已生成报告 · {report.photoCount} 张照片</small>}{legacyTime?.detail && <small>{legacyTime.detail}</small>}{localEvent && legacyTime?.label === '尚无飞行记录' && <small>{legacyTime.label}</small>}{Number.isFinite(legacyObservedAt) && <small>{origin === '本应用 · 自动巡查' ? '触发数据时间' : '任务发起时间'} {beijingTime(legacyObservedAt)}</small>}{localState?.action && <small>{localState.action}</small>}{localEvent?.error && <details className="task-receipt"><summary>查看原始回执</summary><p>{localEvent.error}</p></details>}{localEvent?.status === 'failed' && !localEvent.resolvedAt && <small>请在监测总览的巡查任务模块人工核验后重新发起。</small>}{localEvent?.resolvedAt && <small>结束处理时间 {beijingTime(localEvent.resolvedAt)}</small>}<span className="task-weather task-legacy-details">{localEvent?.weatherChecks?.length ? <RecordedWeather checks={localEvent.weatherChecks} /> : appTask ? '当时天气未记录' : '司空平台任务无需记录天气'}</span></td>
+      <td className="task-remarks">{remarks.map((remark, index) => <small key={index} className={remark.includes('失败') || remark.includes('异常') ? 'task-warning' : undefined}>{remark}</small>)}{report && <small>已生成报告 · {report.photoCount} 张照片</small>}{displayedAutoStatus && <small className={displayedAutoStatus.includes('失败') || displayedAutoStatus.includes('异常') ? 'task-warning' : undefined}>{displayedAutoStatus}</small>}{legacyTime?.detail && <small>{legacyTime.detail}</small>}{localEvent && legacyTime?.label === '尚无飞行记录' && <small>{legacyTime.label}</small>}{Number.isFinite(legacyObservedAt) && <small>{origin === '本应用 · 自动巡查' ? '触发数据时间' : '任务发起时间'} {beijingTime(legacyObservedAt)}</small>}{localState?.action && <small>{localState.action}</small>}{localEvent?.error && <details className="task-receipt"><summary>查看原始回执</summary><p>{localEvent.error}</p></details>}{localEvent?.status === 'failed' && !localEvent.resolvedAt && <small>请在监测总览的巡查任务模块人工核验后重新发起。</small>}{localEvent?.resolvedAt && <small>结束处理时间 {beijingTime(localEvent.resolvedAt)}</small>}<span className="task-weather task-legacy-details">{localEvent?.weatherChecks?.length ? <RecordedWeather checks={localEvent.weatherChecks} /> : appTask ? '当时天气未记录' : '司空平台任务无需记录天气'}</span></td>
       <td className="task-actions">{report ? <div className="task-action-list"><button className="secondary-button word-report-button" onClick={() => open(report)} title={report.issueCount != null ? `高温疑似问题 ${report.issueCount} 组 · 仅计含最高温度标签的照片组，同组辅助照片与最低温度标签不另计问题` : '问题数量待核对'}>打开 Word{(report.issueCount ?? 0) > 0 && <span className="report-issue-badge" aria-label={`${report.issueCount} 个问题`}>{report.issueCount}</span>}</button><div className="task-action-links"><button className="task-action-link" onClick={() => setEmailReport(report)}>重新发送邮件</button><button className="task-action-link" title="打开此报告所在文件夹并选中 Word 文件" onClick={() => open(report, true)}>打开文件夹</button><button className="task-action-link" disabled={busy || !mission || !ended} title={!mission ? '历史报告缺少任务资料，请先连接平台刷新任务' : undefined} onClick={() => startReport(task)}>重新生成报告</button></div></div> : djiTask && !djiTask.mediaReady ? <span className="muted">等待媒体上传结束</span> : mission && !ended ? <span className="muted">等待任务结束</span> : mission || localEvent?.status === 'completed' ? <button className="primary-button" disabled={busy} onClick={() => startReport(task)}>{blockedMedia ? '重新读取媒体' : '生成报告'}</button> : <span className="muted">{localState?.action ?? '—'}</span>}</td>
     </tr>;
   };

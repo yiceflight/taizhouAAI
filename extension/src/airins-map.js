@@ -34,7 +34,20 @@ export function airinsHistoryRouteMatches(url, missionId) {
 }
 
 export async function airinsMap(job, crop) {
-  if (!airinsHistoryRouteMatches(location.href, job.missionId)) throw new Error('轨迹图航次不匹配');
+  // Runtime.evaluate serializes this function and executes it in the page.
+  // Keep the route guard inside the serialized function; module-level helpers
+  // are not available in that isolated execution context.
+  const historyRouteMatches = (url, missionId) => {
+    try {
+      const parsed = new URL(url);
+      if (parsed.origin !== 'https://aai.airins.cn' || parsed.pathname.replace(/\/+$/, '') !== '/sniff/HistoryCloud') return false;
+      const pageMissionId = parsed.searchParams.get('missionId');
+      return pageMissionId == null || pageMissionId === String(missionId);
+    } catch {
+      return false;
+    }
+  };
+  if (!historyRouteMatches(location.href, job.missionId)) throw new Error('轨迹图航次不匹配');
   const visible = e => e && e.getClientRects().length && getComputedStyle(e).display !== 'none';
   const wait = async read => { for(let i=0;i<80;i++){const v=read();if(v)return v;await new Promise(r=>setTimeout(r,250));}throw new Error('可飞轨迹图未完成加载'); };
   const normal = s => s.replace(/₂/g,'2').replace(/₅/g,'5').replace(/\s/g,'');

@@ -603,6 +603,25 @@ describe('DJI scheduled flight automation', () => {
     expect(collected[0][1]).toEqual(expect.objectContaining({ request: expect.objectContaining({ mission: today.mission }) }));
     expect(document.body.textContent).toContain('生成报告');
   });
+  it('emails each automatically generated report and reports delivery errors on its task', async () => {
+    vi.useFakeTimers(); reports = []; missions = [];
+    const today = external();
+    const settings = { recipients: ['first@example.com', 'second@example.com'], username: 'report@dayialgo.com', configured: true };
+    const original = ipc.invoke.getMockImplementation()!;
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return { tasks: [today], skipped: 0, mediaTabId: 2 };
+      if (command === 'get_email_settings') return settings;
+      if (command === 'send_flight_report_email') throw new Error('SMTP 发送失败或结果未确认');
+      return original(command, args);
+    });
+    await act(async () => root.render(<FlightReportPanel tabs={tabs.slice(1)} ready={false} mediaReady active={false} onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(ipc.invoke).toHaveBeenCalledWith('send_flight_report_email', {
+      reportId: 'report-0', recipients: settings.recipients,
+      expectedRecipients: settings.recipients, expectedUsername: settings.username,
+    });
+    expect(document.querySelector('tbody tr')?.textContent).toContain('报告已生成，但邮件发送失败：SMTP 发送失败或结果未确认');
+  });
   it('synchronizes older Airins pages to associate historical DJI executions', async () => {
     vi.useFakeTimers(); reports = []; missions = [];
     const task = external(7 * 86400000);

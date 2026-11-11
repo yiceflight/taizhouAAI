@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {airinsHistoryRouteMatches, trajectoryCrop} from '../extension/src/airins-map.js';
+import {airinsHistoryRouteMatches, airinsMap, trajectoryCrop} from '../extension/src/airins-map.js';
 function fixture(width=1000,height=1000) {
  const pixels=new Uint8ClampedArray(width*height*4);
  const line=(x1,y1,x2,y2,color=[255,7,3])=>{for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++){pixels.set([...color,255],(y*width+x)*4);}};
@@ -23,4 +23,9 @@ test('history route accepts mounted pages that normalize the path or remove the 
  assert.equal(airinsHistoryRouteMatches('https://aai.airins.cn/sniff/HistoryCloud',42),true);
  assert.equal(airinsHistoryRouteMatches('https://aai.airins.cn/sniff/HistoryCloud?missionId=7',42),false);
  assert.equal(airinsHistoryRouteMatches('https://evil.test/sniff/HistoryCloud?missionId=42',42),false);
+});
+test('serialized map capture does not depend on module scope helpers',()=>{
+ const source=airinsMap.toString();
+ assert.match(source,/const historyRouteMatches/);
+ assert.doesNotMatch(source,/airinsHistoryRouteMatches\(/);
 });

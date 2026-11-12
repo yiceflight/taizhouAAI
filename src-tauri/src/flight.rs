@@ -12,6 +12,10 @@ use std::sync::{
 use tauri::Manager;
 
 pub const PLAN_URL: &str = "https://fh.dji.com/organization/b9fb201d-b230-433d-a1d5-e47736ca06f0/project/c7ea6bbc-110d-4dc9-ac75-4653ebbbca49#/plan";
+// When this client process started, in Unix milliseconds. A countdown armed
+// before it cannot have been kept by a running scheduler.
+static STARTED_AT: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| chrono::Utc::now().timestamp_millis());
 #[derive(Default)]
 pub struct Flight {
     busy: Arc<AtomicBool>,
@@ -38,6 +42,17 @@ pub struct Event {
     source: String,
     #[serde(default)]
     launch_at: Option<i64>,
+    // Automatic attempts for one source hour keep their own receipt. The count
+    // is persisted on the event so a client restart cannot refund attempts and
+    // the operator can see why the same hour stopped retrying.
+    #[serde(default)]
+    pub(crate) attempt: u32,
+    #[serde(default)]
+    pub(crate) retry_at: Option<i64>,
+    // The failed receipt this attempt superseded; released when this attempt
+    // actually starts, so the operator cannot retry the same failure again.
+    #[serde(default)]
+    retried_event_id: Option<String>,
     #[serde(default)]
     status_check_error: Option<String>,
     #[serde(default)]
@@ -87,6 +102,9 @@ pub struct View {
     routes: Vec<FlightRoute>,
     selected_route: Option<String>,
     routes_synced_at: Option<i64>,
+    // The client shows how much automatic recovery is left; it must not
+    // hard-code a limit that the scheduler owns.
+    attempt_limit: u32,
 }
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -301,6 +319,7 @@ pub fn view(db: &Connection) -> Result<View, String> {
         routes: read_routes(db)?,
         selected_route: selected_route(db)?,
         routes_synced_at: setting(db, "flight_routes_synced_at")?.and_then(|value| value.parse().ok()),
+        attempt_limit: AUTOMATIC_ATTEMPTS,
     })
 }
 // Keep receipts and duplicate-flight guards intact. Failed preparation can be
@@ -505,6 +524,9 @@ fn new_event(time: String, potassium: Option<f64>, preview: bool) -> Event {
         preview,
         source: if preview { "preview" } else { "auto" }.into(),
         launch_at: None,
+        attempt: 1,
+        retry_at: None,
+        retried_event_id: None,
         status_check_error: None,
         status_checked_at: None,
         weather_override_confirmed_at: None,
@@ -527,22 +549,27 @@ fn observe(
     };
     observe_with_weather(db, at, check)
 }
-fn observe_with_weather(
-    db: &mut Connection,
+// The newest fresh reading across every configured metric, plus whether it
+// exceeds its own threshold. Automatic retries re-evaluate this so a retry can
+// never launch for data that has since expired, turned normal or moved on.
+struct TriggerReading {
+    time: String,
+    k: Option<f64>,
+    pm25: Option<f64>,
+    exceeded: bool,
+}
+fn latest_trigger(
+    db: &Connection,
+    settings: &crate::settings::Settings,
     at: chrono::NaiveDateTime,
-    check: Option<WeatherCheck>,
-) -> Result<Option<Event>, String> {
-    let tx = db.transaction().map_err(|e| e.to_string())?;
-    let settings = crate::settings::read(&tx)?;
-    // Each configured metric has its own reporting clock. Never let a newer
-    // normal PM2.5 row hide a delayed, still-fresh potassium exceedance.
+) -> Result<Option<TriggerReading>, String> {
     let mut readings = Vec::new();
     for (field, enabled, threshold) in [
         ("potassium", settings.potassium_enabled, settings.potassium_threshold),
         ("pm25", settings.pm25_enabled, settings.pm25_threshold),
     ] {
         if !enabled { continue; }
-        let row: Option<(String, f64)> = tx.query_row(
+        let row: Option<(String, f64)> = db.query_row(
             &format!("SELECT observed_at,{field} FROM hourly_observations WHERE city_code='321200' AND {field} IS NOT NULL ORDER BY observed_at DESC LIMIT 1"), [],
             |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
         if let Some((time, value)) = row {
@@ -552,14 +579,31 @@ fn observe_with_weather(
             }
         }
     }
-    // Bind the task to the newest exceeding source hour, not the other
-    // metric's newer normal hour. Normal readings never consume an hour.
     readings.sort_by(|a, b| b.0.cmp(&a.0));
-    let Some(selected) = readings.iter().find(|r| r.3).or_else(|| readings.first()) else { return Ok(None); };
-    let time = selected.0.clone();
+    let Some(selected) = readings.iter().find(|r| r.3).or_else(|| readings.first()) else {
+        return Ok(None);
+    };
+    Ok(Some(TriggerReading {
+        time: selected.0.clone(),
+        k: readings.iter().find(|r| r.1 == "potassium" && r.0 == selected.0).map(|r| r.2),
+        pm25: readings.iter().find(|r| r.1 == "pm25" && r.0 == selected.0).map(|r| r.2),
+        exceeded: selected.3,
+    }))
+}
+fn observe_with_weather(
+    db: &mut Connection,
+    at: chrono::NaiveDateTime,
+    check: Option<WeatherCheck>,
+) -> Result<Option<Event>, String> {
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let settings = crate::settings::read(&tx)?;
+    // Each configured metric has its own reporting clock. Never let a newer
+    // normal PM2.5 row hide a delayed, still-fresh potassium exceedance.
+    // The task binds to the newest exceeding source hour, not the other
+    // metric's newer normal hour. Normal readings never consume an hour.
+    let Some(reading) = latest_trigger(&tx, &settings, at)? else { return Ok(None); };
     // Event values belong to the bound hour; do not mislabel mixed-hour data.
-    let k = readings.iter().find(|r| r.1 == "potassium" && r.0 == time).map(|r| r.2);
-    let pm25 = readings.iter().find(|r| r.1 == "pm25" && r.0 == time).map(|r| r.2);
+    let (time, k, pm25) = (reading.time.clone(), reading.k, reading.pm25);
     // Failed means no launch request was sent. All sources, including manual
     // and preview attempts, release their slot on the next valid source hour.
     // Keep the original receipt and handled-hour guards in the same transaction.
@@ -699,9 +743,8 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
     }) {
         Ok(route) => route,
         Err(error) => {
-            event.status = "failed".into();
-            event.error = Some(error.clone());
-            update_current(app, &event)?;
+            // A missing route or folder needs the operator, not another attempt.
+            fail(app, &mut event, error.clone(), false)?;
             return Err(error);
         }
     };
@@ -727,9 +770,9 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
             }
         });
     if let Err(error) = preparation {
-        event.status = "failed".into();
-        event.error = Some(error.clone());
-        update_current(app, &event)?;
+        // Preparation failures happen before any launch request exists, so a
+        // bounded retry with a fresh draft is safe and needs no platform check.
+        fail(app, &mut event, error.clone(), true)?;
         return Err(error);
     }
     if !auto_submit || needs_confirmation(&database(app)?, &event)? {
@@ -742,6 +785,12 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     if prevent_restricted_launch(app, &mut event)? {
         return Ok(());
+    }
+    // Nothing has been clicked yet, so a readiness loss still ends this attempt
+    // before any launch request exists.
+    if let Err(error) = crate::readiness::require_flight(app) {
+        fail(app, &mut event, error.clone(), true)?;
+        return Err(error);
     }
     // FlightHub decides whether to allow takeoff when the request is submitted.
     // Cancel can win while preparation awaits Chrome. The short gate is held only
@@ -756,12 +805,6 @@ async fn execute(app: &tauri::AppHandle, mut event: Event) -> Result<(), String>
         if let Some(reason) = restriction_reason(&db, &event, now())? {
             restrict(&db, &mut event, reason)?;
             return Ok(());
-        }
-        if let Err(error) = crate::readiness::require_flight(app) {
-            event.status = "failed".into();
-            event.error = Some(error.clone());
-            save(&db, &event)?;
-            return Err(error);
         }
         if needs_confirmation(&db, &event)? {
             event.status = "ready".into();
@@ -867,11 +910,36 @@ pub async fn after_sync(app: &tauri::AppHandle) -> Result<(), String> {
     );
     Ok(())
 }
-fn claim_due(db: &Connection, at: i64) -> Result<Option<Event>, String> {
+fn claim_due(db: &Connection, at: i64, started_at: i64) -> Result<Option<Event>, String> {
     let Some(mut event) = current(db)? else {
         return Ok(None);
     };
     if event.status != "countdown" {
+        // An automatic attempt that failed before any launch request can be
+        // retried for the same source hour. Nothing here can submit a flight:
+        // the retry only re-prepares a draft and passes the same readiness,
+        // no-fly and data-freshness gates the first attempt had to pass.
+        return claim_retry(db, event, at);
+    }
+    // A deadline armed before this process started was never kept by a running
+    // scheduler: the client was stopped, updated or suspended during the
+    // countdown. Submit only after a fresh preparation instead of taking off
+    // from a timer nobody was watching, and never silently lose the hour.
+    // Only automatic tasks are affected: a manual task is never armed by this
+    // process alone, so its countdown may legitimately predate the start.
+    if event.launch_at.is_some_and(|deadline| deadline < started_at) {
+        let settings = crate::settings::read(db)?;
+        if event.source == "auto" && !event.preview && automatic_retry_allowed(&settings, &event) {
+            event.launch_at = None;
+            event.retry_at = Some(at);
+            event.error = Some("客户端在起飞倒计时期间关闭或更新，已改为重新核对后执行。".into());
+            event.status = "failed".into();
+            eprintln!(
+                "Flight countdown interrupted during restart: {} ({}/{})",
+                event.name, event.attempt, AUTOMATIC_ATTEMPTS
+            );
+            return claim_retry(db, event, at);
+        }
         return Ok(None);
     }
     let local = chrono::DateTime::from_timestamp_millis(at)
@@ -888,8 +956,94 @@ fn claim_due(db: &Connection, at: i64) -> Result<Option<Event>, String> {
     }
     event.status = "preparing".into();
     event.launch_at = None;
+    event.retry_at = None;
+    // A retry supersedes the archived receipt that scheduled it, so the
+    // operator's "retry the failed task" action ends with this attempt.
+    event.retried_event_id = None;
     save(db, &event)?;
     Ok(Some(event))
+}
+// Bounded automatic recovery for one source hour. The limit is persisted on
+// the event, so restarts cannot refill it, and a cancelled or confirmed task
+// never reaches this path. It is also published to the client so the overview
+// and the runtime log can say how much recovery is left instead of guessing.
+pub(crate) const AUTOMATIC_ATTEMPTS: u32 = 3;
+const RETRY_DELAY_MS: i64 = 90_000;
+// A page that only needs to load is worth re-checking sooner than a failed
+// preparation, and it does not consume the bounded attempt count.
+const TRANSIENT_RETRY_MS: i64 = 60_000;
+fn automatic_retry_allowed(settings: &crate::settings::Settings, event: &Event) -> bool {
+    event.source == "auto"
+        && !event.preview
+        && !settings.require_manual_confirmation
+        && event.source_hour.is_some()
+        && event.attempt < AUTOMATIC_ATTEMPTS
+}
+fn claim_retry(
+    db: &Connection,
+    mut event: Event,
+    at: i64,
+) -> Result<Option<Event>, String> {
+    if event.status != "failed" || event.attempt == 0 || event.retry_at.is_none_or(|due| due > at) {
+        return Ok(None);
+    }
+    let local = chrono::DateTime::from_timestamp_millis(at)
+        .ok_or("起飞检查时间无效。")?
+        .naive_utc()
+        + Duration::hours(8);
+    let settings = crate::settings::read(db)?;
+    if let Some(reason) = restriction_reason(db, &event, local)? {
+        // The hour may have entered a no-fly window after the first attempt.
+        // Record it as skipped so the operator still sees why nothing flew.
+        restrict(db, &mut event, reason)?;
+        return Ok(None);
+    }
+    // A waiting retry is scheduled by the transient page state, so the
+    // bounded count of the source hour must not cancel it here.
+    let waiting = crate::readiness::transient_reason(
+        event.error.as_deref().unwrap_or_default(),
+    );
+    if !automatic_retry_allowed(&settings, &event)
+        && !(waiting && event.source == "auto" && !event.preview)
+    {
+        // A config change during the delay must not launch on the old intent.
+        if event.retry_at.is_some() {
+            event.retry_at = None;
+            save(db, &event)?;
+        }
+        return Ok(None);
+    }
+    let Some(reading) = latest_trigger(db, &settings, local)? else {
+        event.retry_at = None;
+        save(db, &event)?;
+        return Ok(None);
+    };
+    // The hour that triggered the task must still be the newest exceeding one.
+    // A newer normal hour, an expired window or an edited threshold all end it.
+    if !reading.exceeded || event.source_hour.as_deref() != Some(reading.time.as_str()) {
+        event.retry_at = None;
+        save(db, &event)?;
+        return Ok(None);
+    }
+    let mut retry = new_event(reading.time.clone(), reading.k, false);
+    retry.pm25 = reading.pm25;
+    // Keep one name per source hour so a second draft cannot be mistaken for
+    // the first one in the platform list.
+    retry.name = event.name.clone();
+    retry.source_hour = event.source_hour.clone();
+    retry.attempt = event.attempt + 1;
+    retry.retried_event_id = Some(event.id.clone());
+    retry.weather_checks.extend(event.weather_checks.iter().cloned());
+    retry.weather_override_confirmed_at = event.weather_override_confirmed_at;
+    retry.status = "preparing".into();
+    // Releasing the failed receipt, archiving it and installing the retry are
+    // one commit: a crash must not leave the hour neither handled nor retried.
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    archive(&tx, &event)?;
+    replace_current(&tx, &retry)?;
+    put(&tx, &format!("flight_handled:{}", reading.time), &retry.id)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(retry))
 }
 async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
     let _access = crate::data_reset::access(&app)?;
@@ -900,18 +1054,108 @@ async fn tick(app: &tauri::AppHandle) -> Result<(), String> {
     let _busy = Busy(state.busy.clone());
     let pending = {
         let _gate = state.gate.lock().unwrap();
-        claim_due(&database(app)?, chrono::Utc::now().timestamp_millis())?
+        claim_due(&database(app)?, chrono::Utc::now().timestamp_millis(), *STARTED_AT)?
     };
     if let Some(mut event) = pending {
-        if let Err(error) = crate::readiness::require_flight(app) {
-            event.status = "failed".into();
-            event.error = Some(format!("起飞前检查失败：{error}"));
-            update_current(app, &event)?;
+        // Waiting for a page to load is not a flight failure, so the log must
+        // not present it as one to the operator reading it later.
+        let waiting = event.retried_event_id.is_some()
+            && crate::readiness::transient_reason(event.error.as_deref().unwrap_or_default());
+        if event.retried_event_id.is_some() {
+            let interrupted = event.error.as_deref().is_some_and(|error| error.contains("倒计时期间关闭"));
+            let event_name = event.name.clone();
+            let source_hour = event.source_hour.clone();
+            let previous = event.retried_event_id.clone();
+            let attempt = event.attempt;
+            crate::runtime_log::record(
+                app,
+                if interrupted { "warning" } else { "info" },
+                "flight",
+                if interrupted { "flight.countdown_interrupted" } else { "flight.retry_started" },
+                if interrupted {
+                    "起飞倒计时因客户端关闭或更新中断，重新核对后执行"
+                } else if waiting {
+                    "司空页面尚未可用，等待页面恢复后重新核对"
+                } else {
+                    "同一超标小时未发送起飞请求，开始自动重试"
+                },
+                serde_json::json!({"name":event_name,"sourceHour":source_hour,"attempt":attempt,"previousId":previous,"limit":AUTOMATIC_ATTEMPTS}),
+            );
+        }
+        if let Err(error) = crate::readiness::verify_flight(app).await {
+            fail(&*app, &mut event, format!("起飞前检查失败：{error}"), true)?;
         } else {
-            execute(app, event).await?;
+            let attempt = event.attempt;
+            let name = event.name.clone();
+            let source_hour = event.source_hour.clone();
+            if let Err(error) = execute(app, event).await {
+                // A failed attempt used to live only in the task receipt. Keep
+                // one line per attempt so the log shows why an hour stopped
+                // after three tries instead of only the final state.
+                crate::runtime_log::record(
+                    app,
+                    if attempt >= AUTOMATIC_ATTEMPTS { "warning" } else { "info" },
+                    "flight",
+                    "flight.attempt_failed",
+                    if attempt >= AUTOMATIC_ATTEMPTS {
+                        "巡查任务起飞失败，自动重试次数已用完，等待人工核验"
+                    } else {
+                        "巡查任务起飞失败，将自动重试"
+                    },
+                    serde_json::json!({"name":name,"sourceHour":source_hour,"attempt":attempt,"limit":AUTOMATIC_ATTEMPTS,"error":error}),
+                );
+                return Err(error);
+            }
         }
     }
     Ok(())
+}
+// One place decides whether a failed pre-submission attempt may be retried.
+// Only automatic tasks retry, only before any launch request was sent, and
+// only for the still-current exceeding hour. Everything else keeps the
+// existing operator-driven flow.
+fn fail(
+    app: &tauri::AppHandle,
+    event: &mut Event,
+    message: String,
+    retryable: bool,
+) -> Result<(), String> {
+    let state = app.state::<Flight>();
+    let _gate = state.gate.lock().unwrap();
+    let db = database(app)?;
+    // The event may have been cancelled or replaced while waiting.
+    if !current(&db)?.is_some_and(|e| e.id == event.id && e.status == event.status) {
+        return Ok(());
+    }
+    event.status = "failed".into();
+    event.launch_at = None;
+    event.retry_at = None;
+    let mut receipt = message;
+    let settings = crate::settings::read(&db)?;
+    let retrying = retryable && automatic_retry_allowed(&settings, event);
+    if retrying {
+        // Saying whether another attempt exists is the difference between
+        // waiting a minute and sending the operator to the drone.
+        receipt = format!(
+            "{}；{} 秒后自动重试（第 {}/{} 次）。",
+            receipt,
+            RETRY_DELAY_MS / 1000,
+            event.attempt + 1,
+            AUTOMATIC_ATTEMPTS
+        );
+        event.retry_at = Some(chrono::Utc::now().timestamp_millis() + RETRY_DELAY_MS);
+    } else if retryable && event.source == "auto" && !event.preview && event.attempt >= AUTOMATIC_ATTEMPTS {
+        receipt = format!("{}；已达自动重试上限（{} 次），请人工核验。", receipt, AUTOMATIC_ATTEMPTS);
+    } else if retryable && event.source == "auto" && !event.preview && crate::readiness::transient_reason(&receipt) {
+        // Not a business refusal: the plugin or its business page is not
+        // usable yet. Waiting is the fix, so keep the automatic attempt alive
+        // instead of consuming the source hour. It never submits anything
+        // either: the retry still passes the same readiness and no-fly gates.
+        receipt = format!("{}；司空页面尚未可用，暂不占用自动重试次数。", receipt);
+        event.retry_at = Some(chrono::Utc::now().timestamp_millis() + TRANSIENT_RETRY_MS);
+    }
+    event.error = Some(receipt);
+    save(&db, event)
 }
 fn apply_observation(db: &Connection, id: &str, name: &str, status: &str) -> Result<(), String> {
     let Some(mut event) = current(db)? else {
@@ -1372,6 +1616,9 @@ fn begin_manual_with_weather(
         return Err("请先处理当前巡飞任务。".into());
     }
     let mut event = new_event(now().format("%Y-%m-%d %H:%M:%S").to_string(), None, preview);
+    // A manual (re)launch supersedes any scheduled automatic retry.
+    event.attempt = 0;
+    event.retry_at = None;
     event.source_hour = tx.query_row(
         "SELECT observed_at FROM hourly_observations WHERE city_code='321200' AND (potassium IS NOT NULL OR pm25 IS NOT NULL) ORDER BY observed_at DESC LIMIT 1",
         [], |row| row.get(0),
@@ -2289,10 +2536,10 @@ mod tests {
             .and_utc()
             .timestamp_millis();
         assert!(event.launch_at.unwrap() > at);
-        assert!(claim_due(&db, at).unwrap().is_none());
+        assert!(claim_due(&db, at, 0).unwrap().is_none());
         assert_eq!(current(&db).unwrap().unwrap().status, "restricted");
         assert_eq!(setting(&db, "flight_episode").unwrap().as_deref(), Some(""));
-        assert!(claim_due(&db, at + 3 * 3600000).unwrap().is_none());
+        assert!(claim_due(&db, at + 3 * 3600000, 0).unwrap().is_none());
         assert_eq!(view(&db).unwrap().records[0].id, event.id);
     }
     #[test]
@@ -2418,6 +2665,107 @@ mod tests {
             Some(next.id.as_str())
         );
         assert!(observe(&mut db, at, true).unwrap().is_none());
+    }
+    fn retryable_failure(db: &mut Connection) -> Event {
+        let failed = failed_automatic(db);
+        let mut event = failed;
+        event.error = Some("司空填写超时；计划填写回执不匹配；未发送起飞请求。".into());
+        // The first automatic attempt is number one; failures keep the count.
+        event.attempt = 1;
+        // Every retry re-reads the trigger, so the source hour must look fresh
+        // in the same local format the monitor stores it in.
+        use chrono::Timelike;
+        let fresh = (now() - Duration::minutes(now().minute() as i64 + 1))
+            .with_minute(0).unwrap().with_second(0).unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        reading(db, &fresh, Some(0.54));
+        event.source_hour = Some(fresh.clone());
+        event.error = Some("司空填写超时；计划填写回执不匹配；未发送起飞请求。".into());
+        event.retry_at = Some(chrono::Utc::now().timestamp_millis());
+        save(db, &event).unwrap();
+        event
+    }
+    #[test]
+    fn automatic_failure_before_sending_retries_the_same_hour_with_a_bounded_count() {
+        let mut db = db();
+        let failed = retryable_failure(&mut db);
+        let at = chrono::Utc::now().timestamp_millis();
+        let first = claim_due(&db, at, 0).unwrap().unwrap();
+        assert_ne!(first.id, failed.id);
+        assert_eq!(first.status, "preparing");
+        assert_eq!(first.attempt, 2);
+        assert_eq!(first.source_hour, failed.source_hour);
+        assert_eq!(first.name, failed.name);
+        assert_eq!(first.retried_event_id.as_deref(), Some(failed.id.as_str()));
+        // The released attempt keeps its receipt, the hour keeps one owner.
+        assert!(setting(&db, &format!("flight_history:{}", failed.id)).unwrap().is_some());
+        assert!(current(&db).unwrap().is_none_or(|e| e.id == first.id));
+        // The retry is a new attempt, not a new hour: it must not re-trigger a
+        // second evaluation for the same source hour.
+        assert!(observe(&mut db, now(), true).unwrap().is_none());
+
+        // A second failure within the same hour retries again...
+        let mut second = current(&db).unwrap().unwrap();
+        second.status = "failed".into();
+        second.retry_at = Some(at);
+        save(&db, &second).unwrap();
+        let third = claim_due(&db, at, 0).unwrap().unwrap();
+        assert_eq!(third.attempt, 3);
+        // ...until the persisted limit is reached.
+        let mut third = third;
+        third.status = "failed".into();
+        third.retry_at = Some(at);
+        save(&db, &third).unwrap();
+        assert!(claim_due(&db, at, 0).unwrap().is_none());
+        assert_eq!(current(&db).unwrap().unwrap().attempt, 3);
+    }
+    #[test]
+    fn retries_stop_when_the_hour_is_no_longer_the_exceeding_one() {
+        // A newer, normal hour ends the same-hour retry: the trigger no longer
+        // applies and the operator must see the failure instead.
+        let mut db = db();
+        let failed = retryable_failure(&mut db);
+        let at = chrono::Utc::now().timestamp_millis();
+        // Raising the threshold makes the same stored hour no longer exceed it.
+        let mut settings = crate::settings::read(&db).unwrap();
+        settings.potassium_threshold = 0.9;
+        crate::settings::save_and_reconcile(&db, &settings, now()).unwrap();
+        assert!(claim_due(&db, at, 0).unwrap().is_none());
+        assert_eq!(current(&db).unwrap().unwrap().id, failed.id);
+        assert!(current(&db).unwrap().unwrap().retry_at.is_none());
+    }
+    #[test]
+    fn a_failure_that_may_have_been_sent_is_never_automatically_retried() {
+        let mut db = db();
+        let mut event = failed_automatic(&mut db);
+        event.error = Some("提交回执不确定，请到司空核查；不会自动重试。".into());
+        event.status = "uncertain".into();
+        save(&db, &event).unwrap();
+        let at = chrono::Utc::now().timestamp_millis();
+        assert!(claim_due(&db, at, 0).unwrap().is_none());
+        // Manual mode never retries automatically either.
+        let mut manual = super::tests::db();
+        let mut failed = retryable_failure(&mut manual);
+        configure(&manual, 0.5, 5, true);
+        failed.attempt = 1;
+        save(&manual, &failed).unwrap();
+        assert!(claim_due(&manual, at, 0).unwrap().is_none());
+    }
+    #[test]
+    fn a_countdown_interrupted_by_a_restart_is_rechecked_instead_of_fired_or_lost() {
+        let mut db = db();
+        configure(&db, 0.5, 5, false);
+        let time = "2026-10-08 19:00:00";
+        reading(&db, time, Some(0.54));
+        let mut event = observe(&mut db, parse(time).unwrap(), true).unwrap().unwrap();
+        let deadline = event.launch_at.unwrap();
+        // Claimed by a process that started after the deadline was armed.
+        let claimed = claim_due(&db, deadline, deadline + 30 * 60 * 1000).unwrap().unwrap();
+        assert_ne!(claimed.id, event.id);
+        assert_eq!(claimed.source_hour, event.source_hour);
+        assert_eq!(claimed.status, "preparing");
+        assert_eq!(claimed.attempt, 2);
     }
     #[test]
     fn automatic_mode_recovers_same_hour_failure_from_old_review_overlay() {
@@ -2695,10 +3043,10 @@ mod tests {
         let event = observe(&mut db, t, true).unwrap().unwrap();
         let due = (t - Duration::hours(8)).and_utc().timestamp_millis() + 300000;
         assert_eq!(event.launch_at, Some(due));
-        assert!(claim_due(&db, due - 1).unwrap().is_none());
+        assert!(claim_due(&db, due - 1, 0).unwrap().is_none());
         assert!(cancel(&db, "stale-id").is_err());
         cancel(&db, &event.id).unwrap();
-        assert!(claim_due(&db, due + 1000).unwrap().is_none());
+        assert!(claim_due(&db, due + 1000, 0).unwrap().is_none());
         assert!(observe(&mut db, t, true).unwrap().is_none());
         // Cancellation must not block an intentional manual flight even without K+.
         let manual = begin_manual(&db, false).unwrap();
@@ -2807,9 +3155,9 @@ mod tests {
         reading(&db, "2026-09-22 09:00:00", Some(2.6));
         let event = observe(&mut db, t, true).unwrap().unwrap();
         let due = event.launch_at.unwrap();
-        let mut claimed = claim_due(&db, due).unwrap().unwrap();
+        let mut claimed = claim_due(&db, due, 0).unwrap().unwrap();
         assert_eq!(claimed.status, "preparing");
-        assert!(claim_due(&db, due).unwrap().is_none());
+        assert!(claim_due(&db, due, 0).unwrap().is_none());
         assert!(!needs_confirmation(&db, &claimed).unwrap());
         configure(&db, 2.5, 1440, true);
         assert!(needs_confirmation(&db, &claimed).unwrap());
@@ -2831,16 +3179,16 @@ mod tests {
         let event = observe(&mut db, t, true).unwrap().unwrap();
         assert_eq!(event.launch_at, Some(now));
         assert_eq!(view(&db).unwrap().delay_minutes, 0);
-        let claimed = claim_due(&db, now).unwrap().unwrap();
+        let claimed = claim_due(&db, now, 0).unwrap().unwrap();
         assert!(needs_confirmation(&db, &claimed).unwrap());
         let mut pending = claimed;
         pending.status = "countdown".into();
         pending.launch_at = Some(now + 300000);
         save(&db, &pending).unwrap();
         configure(&db, 1.0, 5, false);
-        assert!(claim_due(&db, now).unwrap().is_none());
+        assert!(claim_due(&db, now, 0).unwrap().is_none());
         configure(&db, 1.0, 5, true);
-        assert!(claim_due(&db, now).unwrap().is_some());
+        assert!(claim_due(&db, now, 0).unwrap().is_some());
     }
     #[test]
     fn restart_never_replays_a_deadline_or_an_ambiguous_submission() {
@@ -2857,7 +3205,7 @@ mod tests {
             save(&db, &event).unwrap();
             recover(&db).unwrap();
             assert_eq!(current(&db).unwrap().unwrap().status, after);
-            assert!(claim_due(&db, i64::MAX).unwrap().is_none());
+            assert!(claim_due(&db, i64::MAX, 0).unwrap().is_none());
         }
     }
     #[test]
@@ -3547,7 +3895,7 @@ mod tests {
         reading(&db,"2026-10-27 11:00:00",Some(0.5));
         assert!(observe(&mut db,parse("2026-10-27 11:00:00").unwrap(),true).unwrap().is_none());
         assert_eq!(current(&db).unwrap().unwrap().launch_at,event.launch_at);
-        assert_eq!(claim_due(&db,event.launch_at.unwrap()).unwrap().unwrap().id,event.id);
+        assert_eq!(claim_due(&db,event.launch_at.unwrap(),0).unwrap().unwrap().id,event.id);
     }
 
 }

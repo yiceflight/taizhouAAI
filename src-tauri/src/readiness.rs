@@ -221,6 +221,41 @@ fn evaluate(
         sites,
     }
 }
+// The 司空 page was verified within this window, so a scheduler tick may use
+// that result instead of paying for another pass on every attempt.
+const FRESH_CHECK: Duration = Duration::from_secs(45);
+// Returns the current 司空 state, re-verifying it when the last check is too
+// old to decide a launch. Only the 司空 site is checked: it alone gates a
+// takeoff, and re-reading all three sites would slow every attempt.
+pub async fn verify_flight(app: &tauri::AppHandle) -> Result<(), String> {
+    let bridge = app.state::<Bridge>();
+    let snapshot = bridge.status();
+    let fresh = {
+        let state = app.state::<Readiness>();
+        let cache = state.sites.lock().unwrap();
+        cache.iter().find(|cached| cached.health.id == "dji").is_some_and(|cached| {
+            cached.at.elapsed() < FRESH_CHECK
+                && cached.health.state == "ready"
+                && snapshot.tabs.iter().any(|tab| {
+                    Some(&tab.session) == cached.health.session.as_ref()
+                        && Some(tab.tab.id) == cached.health.tab_id
+                        && tab.tab.status == "complete"
+                })
+        })
+    };
+    if !fresh {
+        check_site(app, &snapshot, SITES[1]).await;
+    }
+    require_flight(app)
+}
+// Whether a refused launch needs a person. A message that only asks for a
+// login or a usable page is waiting work, so the automatic attempt is retried
+// instead of consuming the source hour.
+pub fn transient_reason(message: &str) -> bool {
+    ["请先", "登录", "加载", "超时", "网络", "刷新", "未打开", "页面"]
+        .iter()
+        .any(|hint| message.contains(hint))
+}
 pub fn require_ready(app: &tauri::AppHandle) -> Result<(), String> {
     let state = view(app);
     if !state.plugin_ready {

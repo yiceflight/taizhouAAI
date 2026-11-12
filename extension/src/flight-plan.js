@@ -161,17 +161,34 @@ export function readFlightSubmissionIssue(expectedUrl, expectedName) {
 }
 
 // Fixed project/recipe only. Preview always leaves the final confirmation intact.
-export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, readSubmissionIssue) {
-  const deadline = Date.now() + 55000;
+// Errors carry whether the sole submit click may have happened (`sent`), so a
+// caller can tell "nothing was submitted" from "the plan might exist".
+const stepError = (message, sent = false) => Object.assign(new Error(message), { sent });
+export { stepError };
+// The function is serialised into the page, so helpers it closes over cannot
+// resolve to the extension's module scope. They travel as an explicit
+// parameter instead of through globals the page does not have.
+export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, readSubmissionIssue, helpers = {}) {
+  const stepError = helpers.stepError || ((message, sent = false) => Object.assign(new Error(message), { sent }));
+  // Declared here, not on the function object, so the call site only needs
+  // the function itself after serialisation.
+  let clicked = false;
+  // Every wait shares one budget inside a step. Splitting the slow FlightHub
+  // page into steps keeps one sluggish panel from consuming the whole run: a
+  // timeout now names the step instead of ending as an unexplained failure.
+  let deadline = Date.now() + 20000;
+  let step = '准备司空计划页';
+  const begin = (label, ms) => { step = label; deadline = Date.now() + ms; };
   const check = () => {
     if (![expectedUrl, `${expectedUrl}/create-plan`].includes(location.href)) throw new Error('司空页面不匹配，请登录后重试');
-    if (Date.now() >= deadline) throw new Error('司空填写超时；已停止，请检查页面');
+    if (Date.now() >= deadline) throw stepError(`${step}超时；已停止，请检查页面`);
   };
+  try {
   check();
   if (submit) {
     if (typeof readSubmissionIssue !== 'function') throw new Error('司空提交提示读取不可用，未点击确定');
     const issue = readSubmissionIssue(expectedUrl);
-    if (issue) throw new Error(issue);
+    if (issue) throw stepError(issue, false);
   }
   if (submit && !/^((?:钾离子超标巡查|PM2\.5超标巡查)-\d{8}-\d{2}|手动巡查-\d{8}-\d{2}-[a-f0-9]{8})$/.test(name)) throw new Error('演练或未知计划禁止提交');
   const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
@@ -207,6 +224,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   const checked = e => e.matches('input') ? e.checked : e.getAttribute('aria-checked') === 'true' ? true : e.getAttribute('aria-checked') === 'false' ? false : null;
   const toggle = (e, value, label) => { const state = checked(e); if (state === null) throw new Error(`无法核对${label}状态`); if (state !== value) click(e); };
   const nameInputs = () => all('input[placeholder="请输入计划名称"]');
+  begin('打开计划表单', 20000);
   if (!nameInputs().length) {
     if (submit) throw new Error('原计划表单已关闭，未提交');
     await wait(() => leaves('新建计划').length === 1, '新建计划入口'); choose('新建计划');
@@ -217,6 +235,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   let form = nameInput.parentElement;
   while (form && !(leaves('任务类型', form).length && leaves('媒体存储位置', form).length)) form = form.parentElement;
   if (!form || form === document.body || form === document.documentElement) throw new Error('未能限定新建计划表单范围');
+  begin('选择任务类型', 10000);
   if (!submit) choose('普通任务', form);
   // FlightHub creates a route copy when selecting it; its suffix is variable.
   // Match the configured prefix, keeping the library and selected form separate.
@@ -242,6 +261,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   };
   if (!routeSelected() || (!submit && recipe.folderPath?.length)) {
     if (submit) throw new Error('指定航线已变化，未提交');
+    begin('选择执行航线', 30000);
     const originalOpen = globalThis.XMLHttpRequest?.prototype.open;
     const originalFetch = globalThis.fetch;
     const observe = (url, result) => {
@@ -345,11 +365,13 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   };
   if (!deviceCards(form).length) {
     if (submit) throw new Error('指定机场已变化，未提交');
+    begin('选择设备', 20000);
     choose('选择设备', form);
     await wait(() => deviceCards(document).filter(e => !form.contains(e)).length, '指定设备');
     click(unique(deviceCards(document).filter(e => !form.contains(e)), '泰州环境监测 Dock 3'));
     await wait(() => deviceCards(form).length === 1, '选中设备');
   }
+  begin('填写任务参数', 15000);
   if (!submit) for (const label of ['多模态识别', '自动断点续飞', '智能规划最佳返航路线']) toggle(field(label, '[role="switch"],input[type="checkbox"]', form), false, label);
   if (!submit) for (const label of [recipe.precision, recipe.strategy, recipe.lostLink]) choose(label, form);
   const height = field('最低返航高度（相对机场）', 'input', form);
@@ -362,6 +384,7 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   if (!submit) setInput(finalNameInput, name);
   // Verify after reactive updates. Selected button styles alone are not enough to
   // infer a submitted task: success here always means an unsubmitted form only.
+  begin('核对填写结果', 12000);
   await new Promise(resolve => setTimeout(resolve, 300)); check();
   const selected = label => {
     const leaf = unique(leaves(label, form), label);
@@ -393,18 +416,27 @@ export async function fillFlightPlan(recipe, name, expectedUrl, submit = false, 
   const button = confirmation.closest('button,[role="button"]');
   if (!button || text(button) !== '确定' || button.disabled || button.getAttribute('aria-disabled') === 'true') throw new Error('最终确定按钮不可用，未提交');
   // This is the sole flight mutation. Never click a follow-up dialog or retry.
+  // If Chrome tears the page down during the click, the caller must not be
+  // told nothing was sent: the flag is set immediately before the mutation.
+  if (clicked) throw stepError('已点击计划确定，禁止重复提交', true);
+  clicked = true;
   button.click();
   const receiptDeadline = Date.now() + 8000;
   while (Date.now() < receiptDeadline) {
     const issue = readSubmissionIssue(expectedUrl);
-    if (issue) throw new Error(issue);
+    if (issue) throw stepError(issue, true);
     if (location.href === expectedUrl && !nameInputs().length) {
       // The same name appears in both the active-device card and plan list.
       // Only the unique plan row is a receipt; a device card alone is not.
       const rows = all('tr,[role="row"]').filter(row => leaves(name, row).length > 0);
-      if (rows.length === 1) return { status: 'submitted', submitted: true, name, url: location.href };
+      if (rows.length === 1) return { status: 'submitted', submitted: true, name, url: location.href, clicked: true };
     }
     await new Promise(resolve => setTimeout(resolve, 200));
   }
-  throw new Error('已点击计划确定，但未收到可核对的计划列表回执');
+  throw stepError('已点击计划确定，但未收到可核对的计划列表回执', true);
+  } catch (error) {
+    // Only this function knows whether the confirmation was clicked.
+    if (error && typeof error === 'object' && !error.sent) error.sent = clicked;
+    throw error;
+  }
 }

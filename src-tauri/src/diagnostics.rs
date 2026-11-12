@@ -417,14 +417,25 @@ pub(crate) fn attachment(payload: &[u8]) -> Result<Vec<u8>, String> {
 
 #[tauri::command]
 pub fn record_frontend_error(app: tauri::AppHandle, kind: String, details: Value) {
-    crate::runtime_log::record(
-        &app,
-        "error",
-        "frontend",
-        "frontend.exception",
-        &kind,
-        details,
-    );
+    // The kind is a machine identifier such as report.auto_failed; the log
+    // list in the client shows this line to the operator, so it must be prose.
+    let message = match kind.as_str() {
+        "report.auto_failed" => "报告未能自动生成",
+        "report.manual_failed" => "报告未能生成",
+        "window.error" => "界面运行出错",
+        "unhandledrejection" => "界面出现未处理的异常",
+        "react.uncaught" => "界面组件运行出错",
+        "react.caught" => "界面组件错误已被捕获",
+        "react.recoverable" => "界面组件可恢复错误",
+        _ => "界面记录了一条异常",
+    };
+    let mut details = details;
+    if let Some(object) = details.as_object_mut() {
+        // Keep the identifier next to the readable line instead of replacing
+        // it: diagnoses still need to tell the two report paths apart.
+        object.insert("kind".into(), Value::String(kind.clone()));
+    }
+    crate::runtime_log::record(&app, "error", "frontend", "frontend.exception", message, details);
 }
 
 fn system_version() -> String {

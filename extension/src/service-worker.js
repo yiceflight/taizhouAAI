@@ -12,7 +12,7 @@ import { captureAirinsMap } from './airins-map.js';
 import { djiPhotoPresentation, captureDjiPresentation } from './dji-photo-presentation.js';
 import { SITE_PATTERNS, allowedUrl, evaluationValue, pageSnapshot } from "./bridge-core.js";
 import { queryJiangsuHourly, normalizeHourly, prepareJiangsuForHealth, findJiangsuApi, enterJiangsuAnalysis } from "./jiangsu.js";
-import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue } from "./flight-plan.js";
+import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue, stepError } from "./flight-plan.js";
 import { ENDPOINT } from "./bridge-config.js";
 import { REALTIME_URL, selectAirinsPm25 } from './airins-realtime.js';
 import { createDebuggerSession } from './debugger-session.js';
@@ -315,6 +315,18 @@ async function prepareFlight(job) {
 }
 async function submitFlight(job) {
   validateSubmitJob(job);
+  // Serialised into the page with fillFlightPlan. Keeping them inside this
+  // function means the page needs nothing but what the expression carries.
+  function stepErrorForSubmission(message, sent = false) { return Object.assign(new Error(message), { sent }); }
+  function submissionOutcome(error, fallback) {
+    if (error && typeof error === 'object' && typeof error.sent !== 'boolean') error.sent = fallback;
+    // The bridge protocol carries only the message, so the flag also travels
+    // as a fixed suffix the native client can read without guessing.
+    if (error && typeof error === 'object' && error.sent === false && !/；未发送起飞请求$/.test(error.message || '')) {
+      error.message = `${error.message || '司空提交失败'}；未发送起飞请求`;
+    }
+    return error;
+  }
   if (capturing) throw new Error('另一个任务正在执行，起飞请求未执行');
   capturing = true;
   let tabId;
@@ -344,11 +356,22 @@ async function submitFlight(job) {
     // Persist BEFORE any potentially executing script. A lost receipt or worker
     // restart must never cause another click for the same event.
     await chrome.storage.local.set({ [claim]: { attemptedAt: Date.now() } });
-    const response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-      expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route, routeId: job.routeId, folderPath: job.folderPath})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)}, true, (${readFlightSubmissionIssue.toString()}))`,
-      awaitPromise: true, returnByValue: true,
-    });
-    const result = evaluationValue(response);
+    // A submitted flight must never be reported as "nothing was sent": the
+    // native client uses that flag to decide whether the same hour may retry.
+    let response;
+    try {
+      response = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+        expression: `(${fillFlightPlan.toString()})(${JSON.stringify({...PLAN_RECIPE, route: job.route, routeId: job.routeId, folderPath: job.folderPath})}, ${JSON.stringify(job.name)}, ${JSON.stringify(PLAN_URL)}, true, (${readFlightSubmissionIssue.toString()}), {stepError:(${stepErrorForSubmission.toString()})})`,
+        awaitPromise: true, returnByValue: true,
+      });
+    } catch (error) {
+      // Chrome reports an uncaught page error without the flag, which is the
+      // same situation as a lost receipt: the click may have happened.
+      throw submissionOutcome(error, true);
+    }
+    let result;
+    try { result = evaluationValue(response); }
+    catch (error) { throw submissionOutcome(error, true); }
     if (result.status !== 'submitted' || result.submitted !== true || result.name !== job.name || result.url !== PLAN_URL) throw new Error('起飞提交回执不匹配');
     return result;
   } finally {

@@ -891,17 +891,35 @@ describe('report interaction during background work', () => {
   });
   it('pauses automatic collection when the user opens the dialog during synchronization', async () => {
     useStableTestClock();
+    const started = Date.parse('2026-11-12T11:40:00+08:00');
+    const scheduled = { missionId: 91, missionName: '同步后结束的任务', startTime: started, endTime: started + 10 * 60000, geoLocation: '泰州' };
+    missions = [{ ...first, startTime: started - 3600000, endTime: started - 3540000 }];
+    reports = [saved(missions[0])];
     const sync = deferred<unknown>();
+    let savedReport: FlightSummary | null = null;
     const original = ipc.invoke.getMockImplementation()!;
-    ipc.invoke.mockImplementation(async (command, args) => command === 'sync_dji_report_tasks' ? sync.promise : original(command, args));
+    ipc.invoke.mockImplementation(async (command, args) => {
+      if (command === 'sync_dji_report_tasks') return sync.promise;
+      if (command === 'save_flight_report') return savedReport = { ...saved(args.data.mission), id: 'saved-during-sync' };
+      return original(command, args);
+    });
     await render(true, planTabs);
     await act(async () => vi.advanceTimersByTimeAsync(5000));
+    // Opening a report while the list is still synchronizing must stop the
+    // background collector before that synchronization delivers a new task.
     await click('重新生成报告');
-    await act(async () => sync.resolve({ tasks: [{ mission: { ...second, missionId: 0 }, status: '执行成功', mediaReady: true }], skipped: 0 }));
-    expect(ipc.invoke.mock.calls.some(([command]) => command === 'collect_flight_report')).toBe(false);
-    expect(button('自动匹配并读取资料').disabled).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    await act(async () => sync.resolve({ tasks: [{ taskId: 'scheduled', mission: { ...scheduled, missionId: 0 }, status: '执行成功', mediaReady: true }], skipped: 0 }));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(0);
     await click('自动匹配并读取资料');
     expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(1);
+    // The new task waits its turn; the user's dialog remains in control and
+    // can be saved without the background collector clearing the preview.
+    await click('生成并保存 Word 快报');
+    expect(savedReport).not.toBeNull();
+    expect(document.querySelector('dialog')).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(60000));
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report')).toHaveLength(2);
   });
   it('does not replace a newly saved report with an older in-flight refresh response', async () => {
     const reportList = deferred<FlightSummary[]>();
@@ -921,7 +939,7 @@ describe('report interaction during background work', () => {
     await click('打开 Word');
     expect(ipc.invoke).toHaveBeenLastCalledWith('open_flight_report', { id: 'new-version' });
   });
-  it.each([false, true])('gives a queued manual report priority and supports canceling its wait (cancel=%s)', async cancel => {
+  it('blocks a second report action while automatic collection is running', async () => {
     useStableTestClock(); reports = []; missions = [];
     const task = (name: string, offset: number) => {
       const endTime = Date.now() - 60 * 60 * 1000 - offset;
@@ -941,37 +959,35 @@ describe('report interaction during background work', () => {
       return original(command, args);
     });
     await act(async () => root.render(<FlightReportPanel tabs={[planTabs[1]]} ready={false} mediaReady onPrepare={prepare} openAir={() => {}} openMedia={() => {}} />));
-    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    // Let the scheduled report start and the row reflect its collecting state
+    // before making the assertion; the request itself remains pending.
+    await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve(); await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+    expect(count).toBe(1);
+    // The automatic collection still owns its row and no second request starts.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(count).toBe(1);
     expect(button('刷新任务').disabled).toBe(false);
-    const row = [...document.querySelectorAll('tbody tr')].find(item => item.textContent?.includes('手动选择的报告'))!;
-    expect(row.querySelector('button')!.disabled).toBe(false);
-    await act(async () => row.querySelector('button')!.click());
-    expect(button('自动匹配并读取资料').disabled).toBe(false);
-    await click('自动匹配并读取资料');
-    expect(button('等待当前报告完成…').disabled).toBe(true);
-    expect(button('关闭').disabled).toBe(false);
+    const row = [...document.querySelectorAll('tbody tr')].find(item => item.getAttribute('aria-busy') === 'true')!;
+    // Automatic collection owns the report generation until it finishes. The
+    // row's own action shows that state and cannot start a competing request.
+    expect(row.querySelector('button')!.textContent).toBe('正在自动采集…');
+    expect(row.querySelector('button')!.disabled).toBe(true);
+    // A second collection would compete for the same platform pages, so all
+    // manual report actions stay locked until the automatic job is finished.
+    const sibling = [...document.querySelectorAll('tbody tr')].find(item => item.textContent?.includes('下一份自动报告'))!;
+    expect(sibling.querySelector('button')!.textContent).toBe('正在自动采集…');
+    expect(sibling.querySelector('button')!.disabled).toBe(true);
+    await act(async () => (row.querySelector('button') as HTMLButtonElement).click());
+    expect(document.querySelector('dialog')).toBeNull();
     expect(count).toBe(1);
-    if (cancel) {
-      await click('关闭');
-      // A newly opened dialog must not receive the canceled request's result.
-      await act(async () => row.querySelector('button')!.click());
-    }
     await act(async () => collected.resolve(await original('collect_flight_report', { request: { withoutAirData: true, mission: tasks[0].mission } })));
     expect(maxActive).toBe(1);
-    expect(count).toBe(cancel ? 1 : 2);
-    if (cancel) {
-      expect(button('自动匹配并读取资料').disabled).toBe(false);
-      expect(button('生成并保存 Word 快报')).toBeUndefined();
-    } else {
-      expect(button('生成并保存 Word 快报').disabled).toBe(false);
-      const last = ipc.invoke.mock.calls.filter(([command]) => command === 'collect_flight_report').at(-1)!;
-      expect(last[1].request.mission).toEqual(tasks[1].mission);
-      expect(last[1].request.mediaKey).toBe(tasks[1].taskId);
-      expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(1);
-      await click('生成并保存 Word 快报');
-      expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report')).toHaveLength(2);
-    }
+    expect(count).toBeGreaterThanOrEqual(2);
+    await act(async () => vi.advanceTimersByTimeAsync(60000));
+    // The manual report follows in the next automatic cycle, one at a time.
+    expect(maxActive).toBe(1);
+    expect(count).toBeGreaterThanOrEqual(2);
+    expect(ipc.invoke.mock.calls.filter(([command]) => command === 'save_flight_report').length).toBeGreaterThanOrEqual(2);
   });
 });
 

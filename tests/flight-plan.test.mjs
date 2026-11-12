@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import { parseHTML } from 'linkedom';
 import { evaluationValue } from '../extension/src/bridge-core.js';
-import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue } from '../extension/src/flight-plan.js';
+import { PLAN_URL, PLAN_RECIPE, validatePlanJob, validateSubmitJob, fillFlightPlan, readFlightStatus, readFlightSubmissionIssue, stepError } from '../extension/src/flight-plan.js';
 const TEST_ROUTE = '东南火点巡查航线-改';
 const TEST_RECIPE = { ...PLAN_RECIPE, route: TEST_ROUTE };
 const job = { type: 'dji-prepare', submit: false, eventId: '00000000-0000-4000-8000-000000000001', name: '钾离子超标巡查-20260922-09', route: TEST_ROUTE, routeId: '00000000-0000-4000-8000-000000000002', folderPath: [{id:'folder',name:'日常巡逻'}] };
@@ -50,7 +50,9 @@ test('active FlightHub task labels normalize to the client status without accept
 });
 test('wrong project and login redirects fail before reading or changing the page', async () => {
   for (const url of ['https://fh.dji.com/login', PLAN_URL.replace('c7ea6bbc','aaaaaaaa'), 'https://evil.test']) {
-    await assert.rejects(runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, {location:{href:url}, Date, get document(){throw Error('must not read DOM');}}), /页面不匹配/);
+    // Failures are now tagged with whether the confirmation could have been
+    // clicked; assert on the message rather than the whole rejection object.
+    await assert.rejects(runInNewContext(`(${fillFlightPlan.toString()})(${JSON.stringify(TEST_RECIPE)},${JSON.stringify(job.name)},${JSON.stringify(PLAN_URL)})`, {location:{href:url}, Date, get document(){throw Error('must not read DOM');}}), error => { assert.match(String(error.message), /页面不匹配/); assert.equal(error.sent, false); return true; });
   }
 });
 function fixture({ ambiguous=false, confirmOnly=false, changedHeight=false, baseRoute=false, submit=false, name=job.name,
@@ -477,5 +479,27 @@ test('automatic preparation accepts verified flight fields while still rejecting
       assert.ok(messages.some(message=>message.type==='flight.review.verified'));
       assert.ok(stored[`flight-review-${job.eventId}`].startedAt>0);
     }
+  }
+});
+test('submission failures always report whether the launch click may have happened',async()=>{
+  const { readFile }=await import('node:fs/promises');
+  const worker=await readFile(new URL('../extension/src/service-worker.js',import.meta.url),'utf8');
+  const source=worker.slice(worker.indexOf('async function submitFlight(job)'),worker.indexOf('async function openPreparedFlight(job)'));
+  const submittedJob={...job,type:'dji-submit',submit:true};
+  // Page ran, nothing clicked: a retry with a fresh draft is safe.
+  const notSent=async error=>{
+    const stored={[`flight-${job.eventId}`]:42,[`flight-review-${job.eventId}`]:{tabId:42,startedAt:null,canceled:false}};
+    const chrome={storage:{local:{get:async keys=>Object.fromEntries(keys.map(k=>[k,stored[k]])),set:async values=>Object.assign(stored,values)}},tabs:{get:async()=>({id:42,url:PLAN_URL+'/create-plan'}),update:async()=>{},sendMessage:async()=>({ok:true})},debugger:{attach:async()=>{},detach:async()=>{},sendCommand:async()=>{if(error)throw error;return{exceptionDetails:{text:'x',exception:{description:'Error: '+error}}}}}};
+    const execute=runInNewContext('let capturing=false; '+source+'; submitFlight',{chrome,debuggerSession:{acquire:async()=>true,release:async()=>{}},Date,JSON,PLAN_URL,PLAN_RECIPE,validateSubmitJob,fillFlightPlan,readFlightSubmissionIssue,evaluationValue,stepError});
+    return assert.rejects(execute(submittedJob),e=>{assert.match(String(e),/未发送起飞请求$/);return true});
+  };
+  await notSent('填写超时；未发送起飞请求');
+  // Page threw before the click: the worker cannot prove the click was not
+  // made, so it must not claim the request was unsent.
+  for(const error of ['Runtime.evaluate: Target closed','页面脚本执行失败']){
+    const stored={[`flight-${job.eventId}`]:42,[`flight-review-${job.eventId}`]:{tabId:42,startedAt:null,canceled:false}};
+    const chrome={storage:{local:{get:async keys=>Object.fromEntries(keys.map(k=>[k,stored[k]])),set:async values=>Object.assign(stored,values)}},tabs:{get:async()=>({id:42,url:PLAN_URL+'/create-plan'}),update:async()=>{},sendMessage:async()=>({ok:true})},debugger:{attach:async()=>{},detach:async()=>{},sendCommand:async()=>{throw Error(error)}}};
+    const execute=runInNewContext('let capturing=false; '+source+'; submitFlight',{chrome,debuggerSession:{acquire:async()=>true,release:async()=>{}},Date,JSON,PLAN_URL,PLAN_RECIPE,validateSubmitJob,fillFlightPlan,readFlightSubmissionIssue,evaluationValue,stepError});
+    await assert.rejects(execute(submittedJob),e=>{assert.match(String(e),new RegExp(error));assert.doesNotMatch(String(e),/未发送起飞请求/);return true});
   }
 });

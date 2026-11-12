@@ -7,7 +7,8 @@ import { defaultSettings, type FlightRoute, type WindRouteRule, type WorkspaceSe
 import { windDirections, windDirectionForRule } from '../lib/windDirections';
 type RoutesView = { routes: FlightRoute[]; selected?: string | null; syncedAt?: number | null };
 
-type Props = { settings: WorkspaceSettings; flightReady?: boolean; routes?: FlightRoute[]; selectedRoute?: string; routesSyncedAt?: number | null; onClose: () => void; onSaved: () => Promise<void>; onRoutesChanged?: () => Promise<void>; onDataCleared?: () => Promise<void> };
+type Props = { settings: WorkspaceSettings; flightReady?: boolean; routes?: FlightRoute[]; selectedRoute?: string; routesSyncedAt?: number | null; diagnosticTabs?: DiagnosticTag[]; diagnosticVersion?: string; onClose: () => void; onSaved: () => Promise<void>; onRoutesChanged?: () => Promise<void>; onDataCleared?: () => Promise<void> };
+type DiagnosticTag = { id: number; url: string; status: string; session: string };
 const analyses = ['火点', '工地', '裸土', '扬尘', '河道', '人为干扰'];
 
 function RouteRefreshIcon({ spinning = false }: { spinning?: boolean }) {
@@ -19,7 +20,7 @@ function RouteRefreshIcon({ spinning = false }: { spinning?: boolean }) {
   </svg>;
 }
 
-export function SettingsDialog({ settings, flightReady = false, routes: availableRoutes = [], selectedRoute = '', routesSyncedAt = null, onClose, onSaved, onRoutesChanged, onDataCleared }: Props) {
+export function SettingsDialog({ settings, flightReady = false, routes: availableRoutes = [], selectedRoute = '', routesSyncedAt = null, diagnosticTabs = [], diagnosticVersion, onClose, onSaved, onRoutesChanged, onDataCleared }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const emailSection = useRef<EmailSettingsHandle>(null);
   const [potassium, setPotassium] = useState(settings.potassiumEnabled === false ? '' : Number.isInteger(settings.potassiumThreshold) ? settings.potassiumThreshold.toFixed(1) : String(settings.potassiumThreshold));
@@ -174,7 +175,7 @@ export function SettingsDialog({ settings, flightReady = false, routes: availabl
           <button type="button" className="secondary-button no-fly-add" disabled={periods.length >= 24} onClick={() => setPeriods(current => [...current, { start: '12:00', end: '13:00' }])}>＋ 添加时段</button>
         </fieldset>
         <EmailSettingsSection ref={emailSection} key={emailResetKey} disabled={saving || clearing || syncingRoutes || selectingRoute || diagnosticBusy} onBusyChange={setEmailBusy} />
-        <DiagnosticReportSection disabled={busy} onBusyChange={setDiagnosticBusy} />
+        <DiagnosticReportSection disabled={busy} onBusyChange={setDiagnosticBusy} tabs={diagnosticTabs} version={diagnosticVersion} />
         <fieldset className="settings-section"><legend>AI 巡查分析</legend><div className="analysis-switches">{analyses.map(name => <div key={name} className="analysis-switch-row"><span>{name}巡查分析</span><button type="button" role="switch" aria-label={`${name}巡查分析`} aria-checked={name === '火点'} disabled className="settings-switch"><span /></button></div>)}</div></fieldset>
         <fieldset disabled={busy} className="settings-section"><legend>数据管理</legend>
           <div className="task-clear-content">

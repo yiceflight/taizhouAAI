@@ -7,6 +7,7 @@ import { tabKey, type BrowserTab } from '../lib/workspace';
 import { DJI_MEDIA_URL, DJI_PLAN_URL, airinsMissionUrl, beijingTime, djiMediaFolderUrl, flightCharts, isTodayPatrolTask, localFlightDisplay, localFlightTimeDisplay, localFlightMission, flightMinuteTime, localFlightOriginLabel, missionOriginLabel, patrolTasks, visibleReportTasks, type DjiTask, type Mission, type PatrolTask, type CollectedFlight, type FlightSummary, type LocalFlightEvent } from '../lib/flightReport';
 import { currentWeatherText, rainfallText, type WeatherCheck } from '../lib/weather';
 import type { EmailSettings } from '../lib/email';
+import { recordFrontendError, reportFailureDetail } from '../lib/diagnostics';
 
 const flightInputTime = (value?: number) => value ? new Date(value + 8 * 3600000).toISOString().slice(0, 19) : '';
 type ActualWindow = { start: number | null; end: number | null };
@@ -77,10 +78,10 @@ function reportGenerationFailure(task: PatrolTask, error: unknown): string {
 
 function localizedAutoStatus(value: string): string {
   if (/airinsHistoryRouteMatches\s+is not defined/.test(value)) {
-    return '自动生成暂未完成，下轮重试：浏览器插件脚本未完整加载，请在 Chrome 扩展管理页重新加载 v0.7.63 或以上插件';
+    return '自动生成暂未完成，下轮重试：浏览器插件脚本未完整加载，请在 Chrome 扩展管理页重新加载 v0.7.66 或以上插件';
   }
   if (/ReferenceError:/.test(value) || /TypeError:/.test(value)) {
-    return '自动生成暂未完成，下轮重试：浏览器插件脚本执行失败，请重新加载 v0.7.63 或以上插件';
+    return '自动生成暂未完成，下轮重试：浏览器插件脚本执行失败，请重新加载 v0.7.66 或以上插件';
   }
   return value;
 }
@@ -97,8 +98,8 @@ async function sendSavedReportEmail(reportId: string): Promise<string> {
   });
 }
 
-type Props = { onSettings?: () => void; onUnreadChange?: (unread: boolean) => void; tabs: BrowserTab[]; ready: boolean; mediaReady?: boolean; active?: boolean; onPrepare: () => void; openMedia: () => void; openAir: () => void; openLink?: (url: string) => void; flightEvent?: LocalFlightEvent | null; flightRecords?: LocalFlightEvent[]; tasksClearedAt?: number | null; dataResetKey?: number; };
-export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, mediaReady = ready, active = true, onPrepare, openMedia, openAir, openLink, flightEvent, flightRecords, tasksClearedAt, dataResetKey = 0 }: Props) {
+type Props = { onSettings?: () => void; onUnreadChange?: (unread: boolean) => void; onReportIssue?: () => void; tabs: BrowserTab[]; ready: boolean; mediaReady?: boolean; active?: boolean; onPrepare: () => void; openMedia: () => void; openAir: () => void; openLink?: (url: string) => void; flightEvent?: LocalFlightEvent | null; flightRecords?: LocalFlightEvent[]; tasksClearedAt?: number | null; dataResetKey?: number; };
+export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, tabs, ready, mediaReady = ready, active = true, onPrepare, openMedia, openAir, openLink, flightEvent, flightRecords, tasksClearedAt, dataResetKey = 0 }: Props) {
   const dataResetRef = useRef(dataResetKey);
   const [emailReport, setEmailReport] = useState<FlightSummary | null>(null);
   const [selected, setSelected] = useState<Mission | null>(null);
@@ -309,6 +310,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
             }
           } catch (e) {
             if (revision === dataResetRef.current) {
+            recordFrontendError('report.auto_failed', e, reportFailureDetail(task, e));
               if (task.djiTask?.mediaReady && /司空媒体无照片：|司空媒体解析失败|照片尚未上传|尚无 Immediate-Media/.test(String(e))) mediaBlocked.current.set(task.key, mediaFingerprint(task));
               setAutoStatus(state => ({ ...state, [task.key]: reportGenerationFailure(task, e) }));
             }
@@ -401,6 +403,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
       try {
         data = await invoke<CollectedFlight>('collect_flight_report', { request: { djiSession: selectedDji.session, djiTabId: selectedDji.id, mediaKey: matchedDjiTask?.taskId ?? `mission-${mission.startTime}-${mission.endTime}`, ...(matchedDjiTask?.noMedia && matchedDjiTask.mediaReady ? { noMedia: true } : {}), localEventId, ...(skipAir ? { withoutAirData: true } : { sniffSession: selectedAir!.session, sniffTabId: selectedAir!.id }), mission } });
       } catch (e) {
+        recordFrontendError('report.manual_failed', e, reportFailureDetail(task ?? { key: `mission-${mission.startTime}-${mission.endTime}`, mission, djiTask: matchedDjiTask ?? undefined }, e));
         if (current() && task && task.djiTask?.mediaReady && /司空媒体无照片：|司空媒体解析失败|照片尚未上传|尚无 Immediate-Media/.test(String(e))) {
           mediaBlocked.current.set(task.key, mediaFingerprint(task));
           const message = reportGenerationFailure(task, e);
@@ -500,7 +503,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, tabs, ready, med
     const legacyObservedAt = localEvent ? Date.parse(`${localEvent.observedAt.replace(' ', 'T')}+08:00`) : NaN;
     return <tr className={`report-row${appTask ? ' task-row-app' : ''}`} key={key}>
       <td className="task-actual-time">{window?.start && window.end ? <strong>{taskClock(window.start)} 至 {taskClock(window.end)}</strong> : window?.start ? <><strong>{taskClock(window.start)}</strong><small>结束时间待确认</small></> : <><span className="muted">实际时间待确认</span>{localEvent && ['completed', 'flying', 'paused', 'flight_error'].includes(localEvent.status) && <small>实际飞行时间待补全</small>}</>}</td>
-      <td><span className={`task-status task-status-${status.tone}`}><i aria-hidden="true" />{status.label}</span>{djiTask?.status === '部分执行' && djiTask.partialReason && <small className="task-status-reason">{djiTask.partialReason}</small>}{djiTask?.actualTimeMissing && <small className="task-warning">司空未返回完整实际时间</small>}{displayedAutoStatus && !report && <small className={noPhotos ? undefined : 'task-warning'}>{displayedAutoStatus}</small>}</td>
+      <td><span className={`task-status task-status-${status.tone}`}><i aria-hidden="true" />{status.label}</span>{djiTask?.status === '部分执行' && djiTask.partialReason && <small className="task-status-reason">{djiTask.partialReason}</small>}{djiTask?.actualTimeMissing && <small className="task-warning">司空未返回完整实际时间</small>}{displayedAutoStatus && !report && <small className={noPhotos ? undefined : 'task-warning'}>{displayedAutoStatus}{onReportIssue && /自动生成暂未完成|媒体上传已结束|未能生成/.test(displayedAutoStatus) && <button type="button" className="task-action-link" onClick={onReportIssue}>上报此问题</button>}</small>}</td>
       <td><span className="task-type">{localEvent?.source === 'auto' ? '自动任务' : localEvent ? '手飞任务' : taskTypeLabel(djiTask?.taskType)}</span><small>{origin}</small></td>
       <td className="task-plan"><strong>{planName}</strong><small>航线：{routeName}</small><span className="task-links">{!!mission?.missionId && link(airinsMissionUrl(mission), '可飞任务')}{djiTask ? link(djiMediaUrl, '司空媒体库') : mission?.missionId || report?.mediaUrl ? link(platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com'), djiTaskUrl ? '司空任务' : '司空平台') : localEvent && localState?.submitted && link(DJI_PLAN_URL, '司空计划')}</span></td>
       <td className="task-media">{djiTask?.noMedia ? <span className="muted">无媒体文件</span> : djiTask ? <>{noPhotos && <small>无照片</small>}<span className={`task-media-state ${djiTask.mediaReady ? 'success' : 'pending'}`}>{djiTask.mediaUploadedCount != null && djiTask.mediaExpectedCount != null ? `媒体文件（${djiTask.mediaUploadedCount}/${djiTask.mediaExpectedCount}）` : djiTask.mediaReady ? '媒体已上传（数量待核对）' : '媒体上传状态待核对'}</span></> : report ? <><span className="task-media-state success">媒体文件（{report.photoCount}/{report.photoCount}）</span><small>{report.photoCount} 张照片</small></> : <span className="muted">未上传</span>}</td>

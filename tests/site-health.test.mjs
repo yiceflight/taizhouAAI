@@ -381,3 +381,27 @@ test('blank-page reload never touches a plan draft, a saved flight tab or a busy
     assert.equal(reloads,0,label);
   }
 });
+
+test('waking a white Airins page reloads it while visible and reports the recovered result', async () => {
+  for (const flag of ['discarded','frozen']) {
+    const f=wakeFixture({[flag]:true}); let reloads=0,reads=0;
+    f.chrome.tabs.reload=async()=>{reloads++;};
+    const result=await captureHealth(f.chrome,async()=>{
+      reads++;
+      // First read is the leftover white document, the reloaded one is healthy.
+      return reloads ? {state:'ready'} : {state:'error',reason:'blank_page'};
+    },1,f.timing);
+    assert.equal(reloads,1,flag);
+    assert.equal(result.state,'ready',flag);
+    assert.ok(reads>=2);
+    assert.deepEqual(f.activations,[1,2]);
+  }
+});
+
+test('the checked page is opted out of automatic discarding without being activated', async () => {
+  const f=wakeFixture({autoDiscardable:true}); const updates=[];
+  f.chrome.tabs.update=async(id,update)=>{updates.push([id,update]);Object.assign(f.tabs.get(id),update);return {...f.tabs.get(id)};};
+  for (let pass=0;pass<2;pass++) assert.equal((await captureHealth(f.chrome,async()=>({state:'ready'}),1,f.timing)).state,'ready');
+  assert.deepEqual(updates,[[1,{autoDiscardable:false}]]);
+  assert.equal(f.tabs.get(2).active,true);
+});

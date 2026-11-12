@@ -37,6 +37,9 @@ export function createTaskTabManager(chrome, { now = Date.now, pause = ms => new
       tab = await chrome.tabs.create({ url: PLAN_URL, active: false });
       await chrome.storage.local.set({ [key]: tab.id });
     }
+    // Chrome's memory saver can discard this hidden page. A discarded tab
+    // stays "unloaded" until something loads it again, so do that here.
+    if (tab.discarded) await chrome.tabs.reload(tab.id).catch(() => {});
     const deadline = now() + 20000;
     while (now() < deadline) {
       const current = await chrome.tabs.get(tab.id).catch(() => null);
@@ -44,7 +47,11 @@ export function createTaskTabManager(chrome, { now = Date.now, pause = ms => new
       const target = current.pendingUrl || current.url;
       if (loginPage(target)) throw new Error('司空登录已失效，请在 Chrome 完成登录后刷新任务');
       if (target && target !== 'about:blank' && target !== PLAN_URL) throw new Error('任务同步页面已跳转，请刷新任务，系统会自动恢复专用页面');
-      if (current.status === 'complete' && current.url === PLAN_URL && !current.pendingUrl) return current;
+      if (current.status === 'complete' && current.url === PLAN_URL && !current.pendingUrl) {
+        // The App reads this page all day; opt it out of automatic discarding.
+        if (current.autoDiscardable === true) await chrome.tabs.update(current.id, { autoDiscardable: false }).catch(() => {});
+        return current;
+      }
       await pause(200);
     }
     throw new Error('司空任务列表加载超时，请检查网络后刷新任务');

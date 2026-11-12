@@ -41,6 +41,7 @@ export async function openDjiWeather(chrome, capture) {
     const current = await chrome.tabs.get(tab.id);
     if (current.status === 'complete') {
       if (current.url !== WEATHER_URL) throw new Error('请在 Chrome 登录司空并打开泰州项目后刷新天气');
+      if (current.autoDiscardable === true) await chrome.tabs.update(current.id, { autoDiscardable: false }).catch(() => {});
       return capture(tab.id, { type: 'dji-weather' });
     }
     const target = current.pendingUrl || current.url;

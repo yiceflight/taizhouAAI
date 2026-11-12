@@ -14,7 +14,7 @@ function fixture(post, capture, now = Date.now) {
     createReadScheduler,
     prioritizeHealthJobs: jobs => jobs, post, capture, Date: { now },
   });
-  vm.runInContext('let polling = false, rerunRequested = false, keepingAlive = false, keepAliveSupported = false;\n' + loop + '\nconst readScheduler = createReadScheduler(executeJob, () => void heartbeat());', context);
+  vm.runInContext('let polling = false, rerunRequested = false, keepingAlive = false, keepAliveSupported = false, lastClientContact = 0;\n' + loop + '\nconst readScheduler = createReadScheduler(executeJob, () => void heartbeat());', context);
   return () => vm.runInContext('heartbeat()', context);
 }
 

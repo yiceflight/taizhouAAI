@@ -33,6 +33,9 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
   const original = await chrome.tabs.get(tabId);
   const origin = new URL(original.url).origin;
   if (!['http://61.155.4.60:18080', 'https://fh.dji.com', 'https://aai.airins.cn'].includes(origin)) throw Error('非授权网站');
+  // The readiness check keeps returning to this page. Opt it out of Chrome's
+  // automatic discarding so it is not asleep, and white, at the next pass.
+  if (original.autoDiscardable === true) await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
   const samePage = async () => {
     if (Number.isFinite(timing.deadline) && now() >= timing.deadline) throw Error('本轮验证已超时，请重新验证');
     const tab = await chrome.tabs.get(tabId);
@@ -116,6 +119,19 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
     activationTail = new Promise(resolve => { release = resolve; });
     await previous;
     let active, activated = false;
+    // An activated page can stay white with status "complete". On a slow PC
+    // its script may be skipped once the tab goes back to the background.
+    // Reload it in place while it is visible before handing focus back.
+    const recoverVisible = async (result, settle) => {
+      if (!activated) return result;
+      if (!(result.state === 'error' && (result.reason === 'blank_page' || result.reason === 'renderer_timeout'))) return result;
+      if (!await reload()) return result;
+      // A reloaded SPA can report a finished document before its router draws.
+      // Let it render while the tab is visible rather than handing focus back
+      // to a white page that only recovers after a manual refresh.
+      if (settle) await pause(3000);
+      return recoverBlank(await read());
+    };
     try {
       const tab = await samePage();
       [active] = await chrome.tabs.query({active:true,windowId:tab.windowId});
@@ -128,14 +144,14 @@ export async function captureHealth(chrome, capture, tabId, timing = {}) {
         const current = await samePage();
         if (current.status === 'complete' && !current.discarded && !current.frozen) break;
         if (now() >= deadline) {
-          if (await reload()) return await recoverBlank(await read());
+          if (await reload()) return await recoverVisible(await read(), true);
           throw Error('页面唤醒超时，请打开网站检查白屏或登录状态');
         }
       }
       // Allow the visible SPA a render turn before reading its login/API state.
-      await pause(750);
+      await pause(1500);
       await samePage();
-      return await recoverBlank(await read());
+      return recoverVisible(await read(), true);
     } finally {
       try {
         if (activated && active && active.id !== tabId) {

@@ -8,6 +8,15 @@
 
 设置页面提供手动上报按钮，说明收件地址、原文日志与清理策略。运行日志中的 `diagnostic.queue`、`diagnostic.accepted` 可用于核查队列和投递状态。`accepted` 仅表示 SMTP 接收，不能据此宣称 Gmail 已收件；垃圾邮件分类、退信及服务商限制需另行核实。
 
+## 手动上报的附加内容（0.2.28 起）
+
+点击“异常上报”时还会附带两类只有用户电脑才有的证据，均写入运行日志后随同一批附件发送：
+
+- `environment.client`：主窗口 `innerWidth/innerHeight`、`outerWidth/outerHeight`、`devicePixelRatio`、屏幕尺寸与是否最大化、User-Agent；浏览器插件版本、托管标签页总数与清单（最多 100 个：id、保留路由但去掉参数的 URL、加载状态、会话），用于判断遗留页面的来源。不含 Cookie、浏览器存储或网页正文。
+- 手动上报附带的 `mode: "manual"` 批次：最近 30 分钟（最多 2000 条）的运行日志与各状态快照，覆盖成功采集、就绪变化等不会单独触发缓存的关键记录；手动批次不推进游标，自动收集仍会覆盖同一时间段。
+
+报告采集失败会先写入 `frontend.exception`（`report.auto_failed` / `report.manual_failed`），`details.reason` 为结构化原因码（`airins_chart_clipped`、`extension_script_incomplete`、`media_not_ready` 等），并带上当次的窗口尺寸与司空媒体计数。巡查任务中自动生成失败的行提供“上报此问题”入口，点击后进入设置页上报。
+
 ## 捕获内容
 
 - 已记录的 `error` 级别业务错误，包括同步、插件任务、巡查和报告失败。

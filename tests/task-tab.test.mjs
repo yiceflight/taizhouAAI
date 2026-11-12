@@ -54,6 +54,20 @@ test('login redirect retries the same tab and recovers after login elsewhere', a
   assert.equal((await acquire()).id, tab.id); assert.equal(f.created.length, 1);
 });
 
+test('a discarded task page is loaded again and opted out of automatic discarding', async () => {
+  const f = fixture(), acquire = createTaskTabManager(f.chrome, f.options);
+  const tab = await acquire();
+  Object.assign(tab, { discarded: true, status: 'unloaded', autoDiscardable: true });
+  const reloads = [];
+  f.chrome.tabs.reload = async id => { reloads.push(id); Object.assign(tab, { discarded: false, status: 'complete' }); };
+  assert.equal((await acquire()).id, tab.id);
+  assert.deepEqual(reloads, [tab.id]);
+  assert.equal(tab.autoDiscardable, false);
+  assert.equal(f.created.length, 1);
+  await acquire();
+  assert.deepEqual(reloads, [tab.id]); assert.deepEqual(f.updated, [tab.id]);
+});
+
 test('waits for SPA table loading and accepts a loaded empty list', async () => {
   let time = 0, loading = true;
   const context = vm.createContext({

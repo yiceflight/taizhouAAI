@@ -52,7 +52,7 @@ export async function airinsChart(job) {
   return {clip, signature};
 }
 
-export async function captureAirinsChart(debuggerApi, tabId, air) {
+export async function captureAirinsChart(debuggerApi, tabId, air, getTabs = () => globalThis.chrome?.tabs) {
   const times = air.points.map(p => p.time), values = air.points.map(p => p.pm25).filter(v => Number.isFinite(v));
   if (!values.length) throw new Error('可飞 PM2.5 无有效数值，无法核对图表');
   const expected = {missionId: air.missionId, startTime: Math.min(...times), endTime: Math.max(...times), pointCount: times.length,
@@ -72,10 +72,42 @@ export async function captureAirinsChart(debuggerApi, tabId, air) {
     if (response.exceptionDetails || !response.result?.value) throw new Error(response.exceptionDetails?.exception?.description || '可飞图表读取失败');
     return response.result.value;
   };
+  const collapse = async () => {
+    const response = await command('Runtime.evaluate', {
+      expression: `(() => { const b = document.querySelector('button.charts-show-control-btn'); if (!b || !b.getClientRects().length) return false; b.click(); return true; })()`,
+      returnByValue: true,
+    });
+    return response?.result?.value === true;
+  };
+  // Chrome can suspend painting in a hidden tab. The platform's expanded
+  // chart is only painted while the renderer is visible, so a background tab
+  // leaves an unpainted panel even though CDP can evaluate and screenshot it.
+  // This tab was created by the extension for this read; briefly activate it
+  // so the operator's work tab is never navigated, then restore their tab.
+  // Worker-side tab updates are bounded: a suspended Chrome service can leave
+  // an awaited call hanging and would otherwise consume the whole capture.
+  const tabsCall = promise => Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), 2500))]).catch(() => null);
+  let previous;
+  const focus = async () => {
+    const tabsApi = getTabs?.();
+    if (!tabsApi) return;
+    const tab = await tabsCall(tabsApi.get(tabId));
+    if (!tab) return;
+    const current = await tabsCall(tabsApi.query({active:true,windowId:tab.windowId}));
+    previous = (current || []).find(old => old.id !== tabId) || previous;
+    if (!tab.active) await tabsCall(tabsApi.update(tabId, {active:true}));
+  };
+  const restore = async () => {
+    const tabsApi = getTabs?.();
+    if (!tabsApi || !previous) return;
+    const old = await tabsCall(tabsApi.get(previous.id));
+    if (old) await tabsCall(tabsApi.update(old.id, {active:true}));
+  };
+  await focus();
   await command('Emulation.setFocusEmulationEnabled', {enabled:true});
   try {
     await inspect('prepare');
-    let plan, last, stable = 0, error;
+    let plan, last, stable = 0, error, lastError, reopen = 0;
     for (let i = 0; i < 24 && Date.now() < deadline; i++) {
       await new Promise(resolve => setTimeout(resolve, 250));
       try {
@@ -83,9 +115,24 @@ export async function captureAirinsChart(debuggerApi, tabId, air) {
         stable = next.signature === last ? stable + 1 : 0;
         last = next.signature;
         if (stable >= 2) { plan = next; break; }
-      } catch (e) { error = e; stable = 0; }
+      } catch (e) {
+        // The panel can be clipped by a small window. Collapse it once and
+        // let the platform reopen it at its own (scaled) size. Reopening is
+        // bounded so a slow PC is not spent reopening a panel that never fits.
+        if (/显示区域不完整|截图尺寸不符/.test(e?.message || '') && reopen < 2) {
+          reopen++;
+          await collapse().catch(() => {});
+          await inspect('prepare').catch(() => {});
+        }
+        error = e; lastError = e; stable = 0;
+      }
     }
-    if (!plan) throw error || new Error('可飞曲线尚未稳定');
+    if (!plan) {
+      const smallWindow = /显示区域不完整|截图尺寸不符/.test(lastError?.message || '');
+      throw smallWindow
+        ? new Error('可飞曲线显示区域超出窗口，本机窗口过小；请最大化 Chrome 窗口后重试')
+        : lastError || error || new Error('可飞曲线尚未稳定');
+    }
     const {data} = await command('Page.captureScreenshot', {format:'png', fromSurface:true, captureBeyondViewport:true, clip:plan.clip});
     if (!data || data.length > 16000000) throw new Error('可飞曲线截图为空或超过12 MB');
     const header = Uint8Array.from(atob(data.slice(0,32)), c => c.charCodeAt(0));
@@ -95,5 +142,9 @@ export async function captureAirinsChart(debuggerApi, tabId, air) {
     if (width < 500 || height < 150 || width * height > 20000000 || Math.abs(width - height * plan.clip.width / plan.clip.height) > 3) throw new Error('可飞截图尺寸不符');
     if ((await inspect('inspect')).signature !== plan.signature) throw new Error('可飞曲线在截图期间发生变化');
     return {...expected, method:'airins-page-screenshot', sourceChannel:'ad_9', capturedAt:Date.now(), width, height, dataUrl:`data:image/png;base64,${data}`};
-  } finally { await command('Emulation.setFocusEmulationEnabled', {enabled:false}, true).catch(() => {}); }
+  } finally {
+    await collapse().catch(() => {});
+    await command('Emulation.setFocusEmulationEnabled', {enabled:false}, true).catch(() => {});
+    await restore();
+  }
 }

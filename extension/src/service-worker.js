@@ -17,6 +17,7 @@ import { ENDPOINT } from "./bridge-config.js";
 import { REALTIME_URL, selectAirinsPm25 } from './airins-realtime.js';
 import { createDebuggerSession } from './debugger-session.js';
 import { evaluateBackgroundRead } from './background-read.js';
+import { createTabJanitor, SWEEP_ALARM, SWEEP_MINUTES } from './tab-janitor.js';
 const sessionReady = (async () => {
   const saved = await chrome.storage.local.get("bridgeSession");
   if (saved.bridgeSession) return saved.bridgeSession;
@@ -30,6 +31,15 @@ let keepingAlive = false;
 let keepAliveSupported = false;
 let capturing = false;
 let activeReportCaptures = 0;
+// Pages that live only for one job and are closed by that job.
+const transientTabs = new Set();
+let lastClientContact = 0;
+const tabJanitor = createTabJanitor(chrome, {
+  busy: () => capturing,
+  connected: () => Date.now() - lastClientContact < 90000,
+  transient: () => [...transientTabs],
+  exists: id => globalThis.chrome.tabs.get(id).then(() => true, () => false),
+});
 const readScheduler = createReadScheduler(executeJob, () => void heartbeat());
 const taskTabFor = createTaskTabManager(chrome);
 const monitorTabFor = createTaskTabManager(chrome, { key: 'flight-monitor-tab' });
@@ -62,10 +72,14 @@ async function reportTabFor(job) {
   if (Number.isInteger(existing)) {
     const tab = await chrome.tabs.get(existing).catch(() => null);
     if (tab?.url?.startsWith('https://fh.dji.com/') && tab.url.includes('#/media')) {
-      await waitTab(tab.id);
-      reportTabs.set(key, existing);
-      await chrome.storage.local.set({ [savedKey]: { tabId: existing, lastUsedAt: Date.now() } });
-      return { key, tab };
+      // A discarded or wedged media page never reaches "complete". Replace it
+      // below instead of failing every retry on the same dead page.
+      const loaded = await waitTab(tab.id).then(() => true, () => false);
+      if (loaded) {
+        reportTabs.set(key, existing);
+        await chrome.storage.local.set({ [savedKey]: { tabId: existing, lastUsedAt: Date.now() } });
+        return { key, tab };
+      }
     }
     // The persisted id belongs to a report tab that was navigated away from
     // the media page. It is still ours, so remove it instead of accumulating
@@ -147,35 +161,6 @@ async function cleanupExpiredReportTabs() {
   }
 }
 
-// Tabs created by older workers can outlive their storage record when Chrome
-// updates/restarts the extension.  Keep only the tabs that are still owned by
-// a live operation and close known background pages that are otherwise
-// impossible to distinguish from the report/plan pages left by the worker.
-async function cleanupOrphanTabs() {
-  const all = await chrome.storage.local.get(null).catch(() => ({}));
-  const keep = new Set();
-  for (const [key, value] of Object.entries(all)) {
-    if (key === 'weatherTabId' || key === 'flight-task-sync-tab' || key === 'flight-monitor-tab'
-      || /^flight-[a-f0-9-]{36}$/.test(key)) {
-      if (Number.isInteger(value)) keep.add(value);
-    }
-    if (key.startsWith(REPORT_TAB_PREFIX)) {
-      const id = Number.isInteger(value) ? value : value?.tabId;
-      if (Number.isInteger(id)) keep.add(id);
-    }
-  }
-  const tabs = await chrome.tabs.query({}).catch(() => []);
-  const isOwnedBackgroundPage = url => {
-    if (!url) return false;
-    return (url.startsWith(`${PLAN_URL}/create-plan`) || url === PLAN_URL
-      || (url.startsWith('https://fh.dji.com/') && url.includes('#/media'))
-      || url.startsWith(WEATHER_URL)
-      || /^https:\/\/aai\.airins\.cn\/sniff\/HistoryCloud\?missionId=/.test(url));
-  };
-  await Promise.all(tabs.filter(tab => !keep.has(tab.id) && isOwnedBackgroundPage(tab.url))
-    .map(tab => chrome.tabs.remove(tab.id).catch(() => {})));
-}
-
 async function capture(tabId, job) {
   if (job?.type === 'flight-dji-list' && job.closeOnly === true) return closeCachedReportTab(job);
   if (job?.type === 'site-health') return captureHealth(chrome, captureOnce, tabId, {progress:job.healthProgress, deadline:job.expiresAt, canReload: () => !capturing});
@@ -190,14 +175,17 @@ async function captureOnce(tabId, job) {
   let targetTabId = tabId;
   let mediaKey = null;
   let completed = false;
+  let previousTab = null;
   let attached = false;
   let airChartTab = null;
   try {
     if (job?.type === 'flight-airins' && job.captureChart) {
       if (!Number.isSafeInteger(job.missionId) || job.missionId <= 0) throw new Error('可飞任务编号无效');
       airChartTab = await chrome.tabs.create({url: `https://aai.airins.cn/sniff/HistoryCloud?missionId=${job.missionId}`, active:false});
+      transientTabs.add(airChartTab.id);
       targetTabId = airChartTab.id;
       await waitTab(targetTabId);
+      [previousTab] = await chrome.tabs.query({active:true,windowId:airChartTab.windowId}).catch(() => []);
     }
     if (parallelReport) {
       const owned = await reportTabFor(job);
@@ -219,8 +207,16 @@ async function captureOnce(tabId, job) {
     if (["site-health", "dji-weather"].includes(job?.type)) return data;
     if (flight) {
       if (airChartTab) {
-        data.chart = await captureAirinsChart(chrome.debugger, targetTabId, data);
-        data.chart.map = await captureAirinsMap(chrome.debugger, targetTabId, data.missionId);
+        const tabsCall = promise => Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), 2500))]).catch(() => null);
+        try {
+          // A hidden Chrome tab does not paint the expanded chart. Activate
+          // only the page this job created, then restore the operator's tab.
+          if (!previousTab || previousTab.id !== targetTabId) await tabsCall(chrome.tabs.update(targetTabId, {active:true}));
+          data.chart = await captureAirinsChart(chrome.debugger, targetTabId, data);
+          data.chart.map = await captureAirinsMap(chrome.debugger, targetTabId, data.missionId);
+        } finally {
+          if (previousTab && previousTab.id !== targetTabId) await tabsCall(chrome.tabs.update(previousTab.id, {active:true}));
+        }
         if ((await chrome.tabs.get(targetTabId)).url !== data.url) throw new Error('可飞截图期间页面发生跳转');
       }
       if (job.type === 'flight-dji-image' && !data.dataUrl) throw new Error('未取得照片原图，请关闭照片预览后重试；若持续失败，请更新司空适配器');
@@ -240,7 +236,12 @@ async function captureOnce(tabId, job) {
     return data;
   } finally {
     try { await debuggerSession.release(targetTabId, attached); }
-    finally { if (airChartTab) await chrome.tabs.remove(airChartTab.id).catch(() => {}); }
+    finally {
+      if (airChartTab) {
+        await chrome.tabs.remove(airChartTab.id).catch(() => {});
+        transientTabs.delete(airChartTab.id);
+      }
+    }
     if (parallelReport && (!completed || job.closeAfter)) await closeReportTab(mediaKey, targetTabId);
     if (!parallelReport && !independentRead) capturing = false;
     if (parallelReport) activeReportCaptures = Math.max(0, activeReportCaptures - 1);
@@ -465,6 +466,22 @@ async function syncDjiRoutes() {
   }
   throw lastError || new Error('司空航线同步失败，请重新验证司空登录状态');
 }
+// "打开网站" used to add one more page per click. Bring the page the App
+// already manages to the front and refresh it, so a white page is repaired
+// instead of being left behind next to a new copy.
+async function openBusinessSite(url) {
+  if (!allowedUrl(url)) throw new Error('不支持的业务网站');
+  const reserved = new Set([...transientTabs, ...reportTabs.values()]);
+  const existing = (await chrome.tabs.query({ url: SITE_PATTERNS }))
+    .find(tab => !reserved.has(tab.id) && !tab.pendingUrl && tab.url === url);
+  let tab;
+  if (existing) {
+    tab = await chrome.tabs.update(existing.id, { active: true });
+    if (!capturing) await chrome.tabs.reload(existing.id).catch(() => {});
+  } else tab = await chrome.tabs.create({ url, active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+  return { opened: true };
+}
 async function bridgeTabs() {
   return (await chrome.tabs.query({ url: SITE_PATTERNS })).filter(tab => allowedUrl(tab.url)).slice(0, 100)
     .map(({ id, title, url, status }) => ({ id, title: (title || '').slice(0, 1000), url, status }));
@@ -489,14 +506,15 @@ async function executeJob(job) {
   };
   const healthCapture = (tabId, innerJob) => capture(tabId, {...innerJob, healthProgress, expiresAt:job.expiresAt});
   try {
-    if (job.type === 'open-business-site') {
-      if (!allowedUrl(job.url)) throw new Error('不支持的业务网站');
-      const tab = await chrome.tabs.create({ url: job.url, active: true });
-      await chrome.windows.update(tab.windowId, { focused: true });
-      result = { data: { opened: true } };
-    } else result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, healthCapture, {}, enterJiangsuBusiness) : await capture(job.tabId, {...job, healthProgress}) };
+    if (typeof job.eventId === 'string') await tabJanitor.touchFlight(job.eventId);
+    if (job.type === 'dji-status') await tabJanitor.touchMonitor();
+    if (job.type === 'open-business-site') result = { data: await openBusinessSite(job.url) };
+    else result = { data: job.type === "dji-tasks" ? await syncDjiTasks(job) : job.type === "dji-routes" ? await syncDjiRoutes(job) : job.type === "dji-weather" ? await openDjiWeather(chrome, capture) : job.type === "dji-submit" ? await submitFlight(job) : job.type === "dji-open-prepared" ? await openPreparedFlight(job) : job.type === "dji-status" ? await watchFlight(job) : job.type === "dji-prepare" ? await prepareFlight(job) : job.type === "airins-realtime" ? await openAirinsRealtime(job) : job.type === 'airins-health-open' ? await openAirinsForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'dji-health-open' ? await openDjiForHealth(chrome, healthCapture, {progress:healthProgress}) : job.type === 'jiangsu-health' ? await prepareJiangsuForHealth(chrome, healthCapture, {}, enterJiangsuBusiness) : await capture(job.tabId, {...job, healthProgress}) };
   } catch (error) {
     result = { error: (error.message || String(error)).split("\n")[0].slice(0, 300) };
+    // A white or frozen FlightHub page fails every read the same way. Refresh
+    // the App's own page now so the client's next retry meets a fresh one.
+    if (job.type === 'dji-tasks' || job.type === 'dji-status') await tabJanitor.recover(job.type, result.error).catch(() => {});
   }
   try { await post("complete", { id: job.id, ...result }); } catch { /* Never replay a job. */ }
   return result;
@@ -509,6 +527,7 @@ async function heartbeat() {
     const tabs = await bridgeTabs();
     await debuggerSession.maintain(tabs);
     const response = await post("heartbeat", { version: chrome.runtime.getManifest().version, tabs, singleJob: true, parallelReports: true, parallelReads: true, busy: readScheduler.busy() });
+    lastClientContact = Date.now();
     if (response.parallelReadsSupported) {
       readScheduler.dispatch(response.jobs || []);
       await chrome.action.setBadgeText({ text: '' });
@@ -541,10 +560,21 @@ async function heartbeat() {
     }
   }
 }
-function start() { void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 }); void cleanupExpiredReportTabs(); void cleanupOrphanTabs(); void heartbeat(); }
+function start() {
+  void chrome.alarms.create("desktop-heartbeat", { periodInMinutes: 0.5 });
+  // Close finished and leftover background pages at worker start and every
+  // few minutes afterwards, so a slow Windows Chrome never accumulates them.
+  void cleanupExpiredReportTabs().then(() => tabJanitor.sweep({ startup: true })).catch(() => {});
+  void chrome.alarms.clear("airins-chart-sweep");
+  void chrome.alarms.create(SWEEP_ALARM, { periodInMinutes: SWEEP_MINUTES });
+  void heartbeat();
+}
 chrome.runtime.onInstalled.addListener(start);
 chrome.runtime.onStartup.addListener(start);
-chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === "desktop-heartbeat") void heartbeat(); });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "desktop-heartbeat") void heartbeat();
+  if (alarm.name === SWEEP_ALARM) void cleanupExpiredReportTabs().then(() => tabJanitor.sweep()).catch(() => {});
+});
 chrome.tabs.onUpdated.addListener((_id, change) => { if (change.status || change.url) void heartbeat(); });
 chrome.tabs.onRemoved.addListener((tabId) => {
   void (async () => {

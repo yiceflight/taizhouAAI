@@ -1004,7 +1004,10 @@ fn claim_retry(
         event.error.as_deref().unwrap_or_default(),
     );
     if !automatic_retry_allowed(&settings, &event)
-        && !(waiting && event.source == "auto" && !event.preview)
+        && !(waiting
+            && event.source == "auto"
+            && !event.preview
+            && !settings.require_manual_confirmation)
     {
         // A config change during the delay must not launch on the old intent.
         if event.retry_at.is_some() {

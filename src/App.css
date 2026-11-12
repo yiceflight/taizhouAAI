@@ -110,6 +110,7 @@ h1 { font-size: 18px; font-weight: 650; line-height: 1.4; }
 .notice.success { border-color: #bdd8c6; background: #eff7f1; color: #2d6545; }
 .notice > strong { display: block; margin-bottom: 4px; }
 .notice .secondary-button { margin-top: 8px; }
+.diagnostic-report-notice { margin-top: 14px; }
 .health-list { border-top: 1px solid #e2eae4; }
 .health-row { display: grid; grid-template-columns: 28px minmax(0,1fr) auto auto; align-items: center; gap: 13px; padding: 18px 0; border-bottom: 1px solid #e2eae4; }
 .site-number { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: #edf2ee; color: #5f7568; font-size: 12px; }

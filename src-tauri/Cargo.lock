@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "taizhou-aai"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "axum",
  "base64 0.22.1",

@@ -56,12 +56,14 @@ pub fn validate(air: &AirData) -> Result<(), String> {
         return Err("可飞 PM2.5 截图尺寸不匹配".into());
     }
     if let Some(map) = &chart.map {
-        if map.method != "airins-export-crop-v1" || map.mission_id != air.mission_id || map.source_channel != "ad_9"
+        if !["airins-export-crop-v1", "airins-export-full-v1"].contains(&map.method.as_str()) || map.mission_id != air.mission_id || map.source_channel != "ad_9"
             || map.captured_at < chart.end_time || map.padding_ratio != 0.1 || map.legend_labels.len() != 2
             || map.legend_labels.iter().any(|s| s.parse::<f64>().ok().is_none_or(|n| !n.is_finite()))
             || map.crop.x < 0 || map.crop.y < 0 || map.crop.width < 1 || map.crop.height < 1
             || map.crop.x.checked_add(map.crop.width).is_none_or(|n| n > map.original_width)
             || map.crop.y.checked_add(map.crop.height).is_none_or(|n| n > map.original_height)
+            || (map.method == "airins-export-full-v1"
+                && (map.crop.x != 0 || map.crop.y != 0 || map.crop.width != map.original_width || map.crop.height != map.original_height))
         { return Err("可飞浓度轨迹图与航次或裁剪规则不匹配".into()); }
         for (url, width, height) in [(&map.data_url, map.width, map.height), (&map.original_data_url, map.original_width, map.original_height)] {
             if width < 200 || height < 200 || width > 10000 || height > 10000 || width * height > 20000000 {
@@ -125,7 +127,7 @@ mod tests {
         let mut data = sample();
         let chart = data.air.chart.as_mut().unwrap();
         chart.map = Some(AirMap {
-            method: "airins-export-crop-v1".into(), mission_id: chart.mission_id, source_channel: "ad_9".into(),
+            method: "airins-export-full-v1".into(), mission_id: chart.mission_id, source_channel: "ad_9".into(),
             captured_at: chart.captured_at, width: chart.width, height: chart.height,
             original_width: chart.width, original_height: chart.height,
             crop: MapCrop {x:0,y:0,width:chart.width,height:chart.height}, padding_ratio:0.1,

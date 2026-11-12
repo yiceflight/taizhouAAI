@@ -129,7 +129,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, t
   const [syncing, setSyncing] = useState(false);
   const syncLock = useRef(false), automaticLock = useRef(false);
   const [syncMessage, setSyncMessage] = useState(''), [syncError, setSyncError] = useState('');
-  const [autoGenerating, setAutoGenerating] = useState('');
+  const [autoGenerating, setAutoGenerating] = useState<{ key: string; name: string } | null>(null);
   const automaticJob = useRef<Promise<void> | null>(null);
   const manualActive = useRef(false), builderRequest = useRef(0);
   const manualRequest = useRef<number | null>(null);
@@ -274,7 +274,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, t
         if (selectedRef.current || lock.current || revision !== dataResetRef.current) break;
         attempts.current.set(task.key, Date.now());
         setAutoStatus(state => ({ ...state, [task.key]: task.report ? '正在自动补齐可飞数据…' : '正在自动采集并生成报告…' }));
-        setAutoGenerating(task.mission!.missionName);
+        setAutoGenerating({ key: task.key, name: task.mission!.missionName });
         const job = (async () => {
           try {
             const actual = task.djiTask?.mission ?? (task.localEvent ? localFlightMission(task.localEvent) : null);
@@ -307,7 +307,7 @@ export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, t
               if (task.djiTask?.mediaReady && /司空媒体无照片：|司空媒体解析失败|照片尚未上传|尚无 Immediate-Media/.test(String(e))) mediaBlocked.current.set(task.key, mediaFingerprint(task));
               setAutoStatus(state => ({ ...state, [task.key]: reportGenerationFailure(task, e) }));
             }
-          } finally { setAutoGenerating(''); }
+          } finally { setAutoGenerating(null); }
         })();
         automaticJob.current = job;
         try { await job; } finally { automaticJob.current = null; }
@@ -487,7 +487,9 @@ export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, t
     const status = executionStatus(task);
     const ended = !!mission?.endTime && mission.endTime <= Date.now() - 60000;
     const planName = mission?.missionName ?? localEvent?.name ?? report?.title ?? '未命名任务';
-    const collecting = !!autoGenerating;
+    const collecting = autoGenerating?.key === key;
+    const anotherCollecting = !!autoGenerating && !collecting;
+    const actionLocked = collecting || anotherCollecting;
     const djiTaskUrl = report?.mediaUrl;
     const djiMediaUrl = djiTask
       ? djiTask.mediaFolderId == null ? platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com') : djiMediaFolderUrl(djiTask.mediaFolderId)
@@ -503,13 +505,13 @@ export function FlightReportPanel({ onSettings, onUnreadChange, onReportIssue, t
       <td className="task-plan"><strong>{planName}</strong><small>航线：{routeName}</small><span className="task-links">{!!mission?.missionId && link(airinsMissionUrl(mission), '可飞任务')}{djiTask ? link(djiMediaUrl, '司空媒体库') : mission?.missionId || report?.mediaUrl ? link(platformUrl(djiTaskUrl, DJI_MEDIA_URL, 'https://fh.dji.com'), djiTaskUrl ? '司空任务' : '司空平台') : localEvent && localState?.submitted && link(DJI_PLAN_URL, '司空计划')}</span></td>
       <td className="task-media">{djiTask?.noMedia ? <span className="muted">无媒体文件</span> : djiTask ? <>{noPhotos && <small>无照片</small>}<span className={`task-media-state ${djiTask.mediaReady ? 'success' : 'pending'}`}>{djiTask.mediaUploadedCount != null && djiTask.mediaExpectedCount != null ? `媒体文件（${djiTask.mediaUploadedCount}/${djiTask.mediaExpectedCount}）` : djiTask.mediaReady ? '媒体已上传（数量待核对）' : '媒体上传状态待核对'}</span></> : report ? <><span className="task-media-state success">媒体文件（{report.photoCount}/{report.photoCount}）</span><small>{report.photoCount} 张照片</small></> : <span className="muted">未上传</span>}</td>
       <td className="task-remarks">{remarks.map((remark, index) => <small key={index} className={remark.includes('失败') || remark.includes('异常') ? 'task-warning' : undefined}>{remark}</small>)}{report && <small>已生成报告 · {report.photoCount} 张照片</small>}{displayedAutoStatus && <small className={displayedAutoStatus.includes('失败') || displayedAutoStatus.includes('异常') ? 'task-warning' : undefined}>{displayedAutoStatus}</small>}{legacyTime?.detail && <small>{legacyTime.detail}</small>}{localEvent && legacyTime?.label === '尚无飞行记录' && <small>{legacyTime.label}</small>}{Number.isFinite(legacyObservedAt) && <small>{origin === '本应用 · 自动巡查' ? '触发数据时间' : '任务发起时间'} {beijingTime(legacyObservedAt)}</small>}{localState?.action && <small>{localState.action}</small>}{localEvent?.error && <details className="task-receipt"><summary>查看原始回执</summary><p>{localEvent.error}</p></details>}{localEvent?.status === 'failed' && !localEvent.resolvedAt && <small>请在监测总览的巡查任务模块人工核验后重新发起。</small>}{localEvent?.resolvedAt && <small>结束处理时间 {beijingTime(localEvent.resolvedAt)}</small>}<span className="task-weather task-legacy-details">{localEvent?.weatherChecks?.length ? <RecordedWeather checks={localEvent.weatherChecks} /> : appTask ? '当时天气未记录' : '司空平台任务无需记录天气'}</span></td>
-      <td className="task-actions">{report ? <div className="task-action-list"><button className="secondary-button word-report-button" onClick={() => open(report)} title={report.issueCount != null ? `高温疑似问题 ${report.issueCount} 组 · 仅计含最高温度标签的照片组，同组辅助照片与最低温度标签不另计问题` : '问题数量待核对'}>打开 Word{(report.issueCount ?? 0) > 0 && <span className="report-issue-badge" aria-label={`${report.issueCount} 个问题`}>{report.issueCount}</span>}</button><div className="task-action-links"><button className="task-action-link" onClick={() => setEmailReport(report)}>重新发送邮件</button><button className="task-action-link" title="打开此报告所在文件夹并选中 Word 文件" onClick={() => open(report, true)}>打开文件夹</button><button className="task-action-link" disabled={busy || collecting || !mission || !ended} title={collecting ? '正在自动采集此任务，请等待采集完成' : !mission ? '历史报告缺少任务资料，请先连接平台刷新任务' : undefined} onClick={() => startReport(task)}>重新生成报告</button></div></div> : djiTask && !djiTask.mediaReady ? <span className="muted">等待媒体上传结束</span> : mission && !ended ? <span className="muted">等待任务结束</span> : mission || localEvent?.status === 'completed' ? <button className="primary-button" disabled={busy || collecting} title={collecting ? '正在自动采集此任务，请等待采集完成' : undefined} onClick={() => startReport(task)}>{collecting ? '正在自动采集…' : blockedMedia ? '重新读取媒体' : '生成报告'}</button> : <span className="muted">{localState?.action ?? '—'}</span>}</td>
+      <td className="task-actions">{report ? <div className="task-action-list"><button className="secondary-button word-report-button" onClick={() => open(report)} title={report.issueCount != null ? `高温疑似问题 ${report.issueCount} 组 · 仅计含最高温度标签的照片组，同组辅助照片与最低温度标签不另计问题` : '问题数量待核对'}>打开 Word{(report.issueCount ?? 0) > 0 && <span className="report-issue-badge" aria-label={`${report.issueCount} 个问题`}>{report.issueCount}</span>}</button><div className="task-action-links"><button className="task-action-link" onClick={() => setEmailReport(report)}>重新发送邮件</button><button className="task-action-link" title="打开此报告所在文件夹并选中 Word 文件" onClick={() => open(report, true)}>打开文件夹</button><button className="task-action-link" disabled={busy || actionLocked || !mission || !ended} title={collecting ? '正在自动采集此任务，请等待采集完成' : anotherCollecting ? '另一任务正在自动采集，请等待采集完成' : !mission ? '历史报告缺少任务资料，请先连接平台刷新任务' : undefined} onClick={() => startReport(task)}>重新生成报告</button></div></div> : djiTask && !djiTask.mediaReady ? <span className="muted">等待媒体上传结束</span> : mission && !ended ? <span className="muted">等待任务结束</span> : mission || localEvent?.status === 'completed' ? <button className="primary-button" disabled={busy || actionLocked} title={collecting ? '正在自动采集此任务，请等待采集完成' : anotherCollecting ? '另一任务正在自动采集，请等待采集完成' : undefined} onClick={() => startReport(task)}>{collecting ? '正在自动采集…' : blockedMedia ? '重新读取媒体' : '生成报告'}</button> : <span className="muted">{localState?.action ?? '—'}</span>}</td>
     </tr>;
   };
   return <div className="report-center">
     <div className="page-heading"><div><span className="eyebrow">无人机巡飞</span><h2>巡查任务</h2><p>同步本应用及司空平台任务；仅北京时间今天的任务会在媒体上传完成后自动生成 Word 快报，历史任务请手动生成。</p></div><button className="secondary-button" disabled={syncing || missionLoading} onClick={() => mediaReady && selectedDji ? void syncTasks() : ready ? load() : onPrepare()}>{syncing || missionLoading ? '正在读取…' : mediaReady || ready ? '刷新任务' : '重新检查环境'}</button></div>
     {!ready ? <p className="notice">可查看本机已保存的任务与报告；重新检查环境后可读取更多任务；无可飞数据时可单独连接司空生成报告。</p> : !air.length ? <div className="notice"><p>打开可飞历史任务页面后读取巡查任务。</p><button className="secondary-button" onClick={openAir}>打开可飞历史任务 ↗</button></div> : null}
-    {!selected && <>{syncMessage && <p role="status" className="notice">{syncMessage}</p>}{syncError && <p role="alert" className="notice warning">{syncError}</p>}{autoGenerating && <p role="status" className="notice">正在后台采集“{autoGenerating}”并生成报告，可继续查看任务或打开已有报告。</p>}{message && <p role="status" className="notice">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}</>}
+    {!selected && <>{syncMessage && <p role="status" className="notice">{syncMessage}</p>}{syncError && <p role="alert" className="notice warning">{syncError}</p>}{autoGenerating && <p role="status" className="notice">正在后台采集“{autoGenerating.name}”并生成报告，可继续查看任务或打开已有报告。</p>}{message && <p role="status" className="notice">{message}</p>}{error && <p role="alert" className="notice warning">{error}</p>}</>}
     <section className="history-card"><div className="section-heading"><h3>任务列表</h3><span className="muted">{tasks.length} 个任务 · {tasks.filter(t => t.report).length} 份报告</span></div>
       {!tasks.length ? <div className="empty-state"><h3>{syncing || missionLoading ? '正在读取巡查任务' : loaded ? '暂无巡查任务' : '暂无已保存的任务'}</h3><p>{loaded ? '今天的任务会在飞行结束且媒体上传完成后自动生成报告，历史任务请在对应行手动生成。' : '连接司空平台后自动同步任务，已保存的报告会显示在对应任务中。'}</p></div> : <div className="report-table-wrap"><div className="task-groups">{visibleTaskGroups.map(group => <section className="task-date-group" key={group.date}><div className="task-date-row">{group.date}{group.date === taskDate(Date.now()) && <span>今天</span>}</div><div className="task-group-scroll"><table className="report-table task-table"><thead><tr><th>实际执行时间</th><th>执行状态</th><th>类型</th><th>计划名称 / 航线名称</th><th>媒体文件</th><th>备注</th><th>操作</th></tr></thead><tbody>{group.tasks.map(renderTaskRow)}</tbody></table></div></section>)}</div></div>}
       <div className="task-pagination" aria-label="任务分页">

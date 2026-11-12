@@ -1,22 +1,3 @@
-// Crop the platform's exported raster, without redrawing or interpolating readings.
-export function trajectoryCrop(pixels, width, height, palette) {
-  if (width < 200 || height < 200 || width * height > 20000000 || pixels.length !== width * height * 4 || !palette.length) throw new Error('轨迹图像尺寸或色标无效');
-  let left = width, top = height, right = -1, bottom = -1, count = 0;
-  // Keep every matching pixel: separate route legs must not be discarded as noise.
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    const i = (y * width + x) * 4, r = pixels[i], g = pixels[i+1], b = pixels[i+2];
-    if (pixels[i+3] < 200 || Math.max(r,g,b) < 190 || Math.max(r,g,b)-Math.min(r,g,b) < 100) continue;
-    if (!palette.some(c => Math.abs(r-c[0]) <= 12 && Math.abs(g-c[1]) <= 12 && Math.abs(b-c[2]) <= 12)) continue;
-    left = Math.min(left,x); right = Math.max(right,x); top = Math.min(top,y); bottom = Math.max(bottom,y); count++;
-  }
-  if (count < 100 || right-left < 30 || bottom-top < 30) throw new Error('未可靠识别完整浓度轨迹，请调整地图后重试');
-  if (left < 4 || top < 4 || right >= width-4 || bottom >= height-4) throw new Error('浓度轨迹触及地图边缘，可能不完整，请缩小地图后重试');
-  const px = Math.max(48, Math.ceil((right-left+1)*0.1));
-  const py = Math.max(48, Math.ceil((bottom-top+1)*0.1));
-  const x = Math.max(0,left-px), y = Math.max(0,top-py);
-  return {x,y,width:Math.min(width,right+px+1)-x,height:Math.min(height,bottom+py+1)-y};
-}
-
 // Airins' history page can remove the query string after it has mounted
 // the Vue route (and some builds add a trailing slash).  A missing query is
 // safe here because the tab is created by the report worker for this exact
@@ -33,7 +14,7 @@ export function airinsHistoryRouteMatches(url, missionId) {
   }
 }
 
-export async function airinsMap(job, crop) {
+export async function airinsMap(job) {
   // Runtime.evaluate serializes this function and executes it in the page.
   // Keep the route guard inside the serialized function; module-level helpers
   // are not available in that isolated execution context.
@@ -73,61 +54,34 @@ export async function airinsMap(job, crop) {
       if (!map?.width || !map.height) return false;
       const current = map.toDataURL('image/png');
       stable = current === previous ? stable + 1 : 0; previous = current;
-      return stable >= 3;
+      return stable >= 5;
     });
   };
   const closePreview = async () => {
     document.querySelector('.image-preview-close')?.dispatchEvent(new MouseEvent('click',{bubbles:true}));
-    // Let the modal teardown finish before the next zoom or export. Without
+    // Let the modal teardown finish before the next export. Without
     // this small yield some platform builds leave the old image node visible.
     await new Promise(resolve => setTimeout(resolve, 250));
   };
-  const zoomOut = async (steps) => {
-    // Airins has shipped several map-control DOMs. Prefer its own zoom-out
-    // control, then fall back to the Mapbox canvas wheel handler. This keeps
-    // the recovery inside the page and avoids asking the operator to resize
-    // the map by hand.
-    const controls = ['.mapboxgl-ctrl-zoom-out','button[aria-label="Zoom out"]','button[title*="缩小"]','button[aria-label*="缩小"]'];
-    let clicked = 0;
-    for (const selector of controls) {
-      const button = [...document.querySelectorAll(selector)].find(visible);
-      if (!button) continue;
-      for (let i = 0; i < steps; i++) { button.click(); clicked++; await new Promise(resolve => setTimeout(resolve, 180)); }
-      break;
-    }
-    if (!clicked) {
-      const map = document.querySelector('canvas.mapboxgl-canvas');
-      if (!map) throw new Error('未找到浓度地图缩放控件');
-      for (let i = 0; i < steps; i++) {
-        map.dispatchEvent(new WheelEvent('wheel', {bubbles:true,cancelable:true,deltaY:800,deltaMode:0}));
-        await new Promise(resolve => setTimeout(resolve, 180));
-      }
-    }
-    await waitMapStable();
-  };
   const exportMap = async (attempt) => {
     await waitMapStable();
+    // The map canvas can be stable while the WebGL trajectory layer is still
+    // arriving after a parameter switch. Give that layer one paint interval
+    // before opening the platform export modal.
+    await new Promise(resolve => setTimeout(resolve, 500));
     document.querySelector('button.image-preview-control')?.click();
     try {
       const img = await wait(()=>{const e=document.querySelector('.image-preview-content img');return visible(e)&&e.complete&&e.naturalWidth>0&&e;});
       const source = img.src;
       if (!source.startsWith('data:image/png;base64,')) throw new Error('平台导出图像格式无效');
-      const canvas = document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
-      if(canvas.width*canvas.height>20000000)throw new Error('平台地图图像过大');
-      const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0);
-      const rect=crop(ctx.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,palette);
-      const out=document.createElement('canvas');out.width=Math.max(600,rect.width);out.height=Math.round(rect.height*out.width/rect.width)+100;
-      const c=out.getContext('2d');c.fillStyle='white';c.fillRect(0,0,out.width,out.height);
-      c.drawImage(canvas,rect.x,rect.y,rect.width,rect.height,0,0,out.width,out.height-100);
-      // Reproduce the actual platform legend (including its bounds), not a new scale.
-      const bar=c.createLinearGradient(160,0,out.width-50,0);
-      palette.slice().reverse().forEach((rgb,i)=>bar.addColorStop(i/(palette.length-1),`rgb(${rgb.join(',')})`));
-      c.fillStyle=bar;c.fillRect(160,out.height-70,out.width-210,14);
-      c.fillStyle='#222';c.font='20px sans-serif';c.fillText('PM2.5 (µg/m³)',16,out.height-55);
-      c.fillText(labels[0],160,out.height-28);c.textAlign='right';c.fillText(labels[1],out.width-50,out.height-28);
-      return {method:'airins-export-crop-v1',missionId:job.missionId,sourceChannel:'ad_9',capturedAt:Date.now(),width:out.width,height:out.height,
-        crop:rect,originalWidth:canvas.width,originalHeight:canvas.height,paddingRatio:0.1,recoveryAttempt:attempt,legendLabels:labels,
-        dataUrl:out.toDataURL('image/png'),originalDataUrl:source};
+      if(img.naturalWidth*img.naturalHeight>20000000)throw new Error('平台地图图像过大');
+      // The platform export already contains the complete rendered route. Do
+      // not infer its extent from PNG colours: basemap pixels can share the
+      // same palette and make a valid export look clipped (or make a partial
+      // export look valid). Preserve the authoritative platform image as-is.
+      return {method:'airins-export-full-v1',missionId:job.missionId,sourceChannel:'ad_9',capturedAt:Date.now(),width:img.naturalWidth,height:img.naturalHeight,
+        crop:{x:0,y:0,width:img.naturalWidth,height:img.naturalHeight},originalWidth:img.naturalWidth,originalHeight:img.naturalHeight,paddingRatio:0.1,recoveryAttempt:attempt,legendLabels:labels,
+        dataUrl:source,originalDataUrl:source};
     } finally {
       // Also clean up malformed, oversized, and timeout failures before the
       // next automatic attempt so a stale preview cannot be captured again.
@@ -139,9 +93,11 @@ export async function airinsMap(job, crop) {
     try { return await exportMap(attempt); }
     catch (error) {
       lastError = error;
-      const message = error?.message || String(error);
-      if (!/浓度轨迹触及地图边缘|未可靠识别完整浓度轨迹/.test(message) || attempt === 3) throw error;
-      await zoomOut(attempt + 1);
+      if (attempt === 3) throw error;
+      // A transient export/modal failure can still be retried, but route
+      // completeness is now guaranteed by the platform export itself.
+      await new Promise(resolve => setTimeout(resolve, 900 + attempt * 600));
+      await waitMapStable();
     }
   }
   throw lastError || new Error('浓度轨迹图导出失败');
@@ -149,7 +105,7 @@ export async function airinsMap(job, crop) {
 
 export async function captureAirinsMap(debuggerApi, tabId, missionId) {
   const response=await debuggerApi.sendCommand({tabId},'Runtime.evaluate',{
-    expression:`(${airinsMap.toString()})(${JSON.stringify({missionId})},(${trajectoryCrop.toString()}))`,awaitPromise:true,returnByValue:true});
+    expression:`(${airinsMap.toString()})(${JSON.stringify({missionId})})`,awaitPromise:true,returnByValue:true});
   if(response.exceptionDetails || !response.result?.value)throw new Error(response.exceptionDetails?.exception?.description || '浓度轨迹图导出失败');
   return response.result.value;
 }

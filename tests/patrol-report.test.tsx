@@ -972,10 +972,12 @@ describe('report interaction during background work', () => {
     // row's own action shows that state and cannot start a competing request.
     expect(row.querySelector('button')!.textContent).toBe('正在自动采集…');
     expect(row.querySelector('button')!.disabled).toBe(true);
-    // A second collection would compete for the same platform pages, so all
-    // manual report actions stay locked until the automatic job is finished.
+    // A second collection would compete for the same platform pages, so the
+    // other task stays locked, while retaining its own action label so the
+    // active row is unambiguous.
     const sibling = [...document.querySelectorAll('tbody tr')].find(item => item.textContent?.includes('下一份自动报告'))!;
-    expect(sibling.querySelector('button')!.textContent).toBe('正在自动采集…');
+    expect(sibling.getAttribute('aria-busy')).toBeNull();
+    expect(sibling.querySelector('button')!.textContent).toBe('生成报告');
     expect(sibling.querySelector('button')!.disabled).toBe(true);
     await act(async () => (row.querySelector('button') as HTMLButtonElement).click());
     expect(document.querySelector('dialog')).toBeNull();
